@@ -41,7 +41,6 @@ namespace fs = std::filesystem;
 #include <mutex>
 #include <thread>
 #include "platform/gui.h"            // GuiAction (GUI_MUSIC_MUTE etc.)
-#include "platform/openswordigo_host.h"
 #include "android/asset_manager.h"
 extern "C" void asset_manager_init_arm32(const char* base_path);
 extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp — drains guest deferred-free list (leak guard)
@@ -72,8 +71,6 @@ extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp �
 #include "platform/srt_overlay.h"
 #include "platform/save_editor.h"
 #include "platform/swordfare_gui.h"  /* Swordfare: ImGui-based in-game overlay */
-#include "game/research/recovery_catalog.h" /* Memory Research embedded DB */
-#include "game/research/instance_registry.h"  /* Memory Research instance tracker */
 #include "platform/loading_screen.h" /* Boot loading screen (hiro POD + progress) */
 #include "platform/crash_dialog.h"   /* Sleek fatal-crash reporting window */
 #include "platform/launcher_config.h"
@@ -797,7 +794,7 @@ uint64_t g_sre_profile_addr = 0;
 // Global Swordigo ABI version: 12 for 1.4.12, 13 for 1.4.13
 extern "C" int swordi_abi = 12;
 
-// Memory research live root pointers (defined in emulator.cpp)
+// Live hero/scene pointers used by the mod tools (defined in emulator.cpp)
 extern uint32_t g_game_scene_controller;
 extern uint32_t g_hero_obj;
 extern uint32_t g_hero_char_ctrl_comp;
@@ -892,9 +889,8 @@ static bool should_block_keyboard() {
     if (ImGui::GetCurrentContext() == nullptr) return false;
     ImGuiIO& io = ImGui::GetIO();
     return io.WantCaptureKeyboard || 
-           g_swordfare_gui.is_mod_overlay_visible() || 
-           g_swordfare_gui.is_research_overlay_visible() ||
-           g_swordfare_gui.is_visible() || 
+           g_swordfare_gui.is_mod_overlay_visible() ||
+           g_swordfare_gui.is_visible() ||
            g_swordfare_gui.is_lua_console_open();
 }
 
@@ -2163,17 +2159,6 @@ void load_and_boot() {
             }
 
             g_swordfare_gui.update_console_backend();
-            // Update Memory Research live root pointers every frame
-            if (g_swordfare_gui.is_research_ready()) {
-                swordfare::research::InstanceRegistry::instance().tick();
-                swordfare::research::LiveRoots rr;
-                rr.gsc_va       = g_game_scene_controller;
-                rr.hero_va      = g_hero_obj;
-                rr.health_va    = g_hero_health_comp;
-                rr.mana_va      = g_hero_mana_comp;
-                rr.char_ctrl_va = g_hero_char_ctrl_comp;
-                g_swordfare_gui.update_research_roots(rr);
-            }
             // --- Death recovery: execv restart after ~3s ---
             // The death state machine is tied to Android's ad system and can't be
             // replicated (same issue as PS Vita port). Restart the process cleanly.
@@ -2545,8 +2530,6 @@ void load_and_boot() {
                 g_swordfare_gui.draw_lua_script_editor();
                 g_swordfare_gui.draw_lua_script_manager();
                 g_swordfare_gui.draw_mod_overlay(g_save_dir);
-                g_swordfare_gui.draw_research_overlay();
-                g_swordfare_gui.draw_research_hud();
                 g_swordfare_gui.draw_graphics_options_modal(g_postfx);
                 g_swordfare_gui.end_frame();
             }
@@ -3267,25 +3250,22 @@ void load_and_boot() {
 extern "C" void advance_guest_virtual_clock(float dt);
 
 // ===========================================================================
-// ARM64 live-root discovery for the Memory Research inspector
+// ARM64 hero/scene pointer discovery for the mod tools
 // ---------------------------------------------------------------------------
 // The ARM32 backends (emulator.cpp, emulator_dynarmic32.cpp) fill the
-// g_game_scene_controller / g_hero_* observer globals from code hooks.  The
-// ARM64 JIT installs no equivalent hooks, so on a SRE13 ARM64 session every
-// root in the Live Inspector read "not yet observed".
+// g_game_scene_controller / g_hero_* globals from code hooks.  The ARM64 JIT
+// installs no equivalent hooks, so on a SRE13 ARM64 session the mod tools
+// (god mode, infinite mana, movement tweaks) would have no hero to act on.
 //
 // libsre13 already hooks Caver::GameSceneController::Update and exports the
 // live controller through its gsc_get() accessor.  Rather than duplicating that
 // hook, we ask SRE for the pointer (a trivially-returning call, throttled) and
 // then read the hero component pointers straight out of guest memory at the
-// documented ARM64 offsets — the same offsets the embedded recovery catalog
-// publishes for struct 'GameSceneController'.
+// ARM64 offsets below.
 // ===========================================================================
 static uint64_t s_gsc_get_fn = 0;   // libsre13 gsc_get() VA (0 = unavailable)
 
 // Component offsets inside Caver::GameSceneController (ARM64, v1.4.13).
-// Source: docs/sre13/GameSceneController.md and the embedded recovery catalog
-// (struct_fields rows for struct_id = 'GameSceneController').
 static constexpr uint32_t kGscOffHero     = 0xD8;   // SceneObject*
 static constexpr uint32_t kGscOffCharCtrl = 0xE0;   // CharControllerComponent*
 static constexpr uint32_t kGscOffHealth   = 0xF0;   // HealthComponent*
@@ -3300,20 +3280,20 @@ static uint32_t read_guest_ptr32(uint64_t va) {
 }
 
 // Resolve libsre13's gsc_get() once, after the SRE module is loaded.
-static void resolve_arm64_research_symbols() {
+static void resolve_arm64_hero_roots() {
     s_gsc_get_fn = 0;
     if (swordi_abi >= 13 && g_loader_64)
         s_gsc_get_fn = g_loader_64->get_symbol_vaddr(&g_sre_mod, "gsc_get");
     if (s_gsc_get_fn)
-        std::cout << "[Research] ARM64 roots: SRE gsc_get() resolved at 0x"
+        std::cout << "[Roots] ARM64: SRE gsc_get() resolved at 0x"
                   << std::hex << s_gsc_get_fn << std::dec << std::endl;
     else
-        std::cout << "[Research] ARM64 roots: gsc_get() unavailable — the Live "
-                     "Inspector will report roots as unobserved" << std::endl;
+        std::cout << "[Roots] ARM64: gsc_get() unavailable — mod tools have no "
+                     "hero pointers" << std::endl;
 }
 
 // Called once per frame from the ARM64 loop (after the frame was run).
-static void update_arm64_research_roots() {
+static void update_arm64_hero_roots() {
     if (!g_emulator_64 || !g_guest_memory) return;
 
     // Poll for the controller while we have none (1 s), then re-validate every
@@ -3328,7 +3308,7 @@ static void update_arm64_research_roots() {
             if (gsc >= 0x10000 && gsc + 0x200 < GUEST_MEM_SIZE) {
                 g_game_scene_controller = static_cast<uint32_t>(gsc);
                 if (first)
-                    std::cout << "[Research] ARM64 roots: GameSceneController @ 0x"
+                    std::cout << "[Roots] ARM64: GameSceneController @ 0x"
                               << std::hex << g_game_scene_controller << std::dec
                               << " (SRE gsc_get)" << std::endl;
             } else {
@@ -5204,67 +5184,8 @@ void load_and_boot_arm64() {
                     std::cout << "[SRE] Scene Shifter initialized in GUI" << std::endl;
                 }
 
-                // ── Memory Research Tab ────────────────────────────────────
-                // Init after the RecoveryCatalog is ready (called in main()
-                // before load_and_boot_arm64) and g_guest_memory is valid.
-                resolve_arm64_research_symbols();
-                g_swordfare_gui.init_research_tab(g_guest_memory, GUEST_MEM_SIZE);
-                // Tell the research engine where the loaded images live.  Without
-                // this every hit reports "unmapped": true, but useless, because a
-                // runtime address with no static home cannot carry identity.
-                if (g_main_mod_64.base_addr) {
-                    g_swordfare_gui.set_research_module(
-                        "libswordigo.so", g_main_mod_64.base_addr, 0,
-                        g_main_mod_64.mem_size ? g_main_mod_64.mem_size : 0x800000,
-                        "sre13-1.4.13-arm64");
-                    // The image is unstripped (~17.7k dynamic symbols), so hand
-                    // over its symbol table.  This is EVIDENCE for describing a
-                    // static site ("Caver::Update+0x18"), never part of any
-                    // identity: the researcher's handle stays a short, stable
-                    // g_VAR_#### that a rebuild cannot invalidate.
-                    if (g_main_mod_64.dynsym && g_main_mod_64.dynstr &&
-                        g_main_mod_64.num_dynsym > 0) {
-                        g_swordfare_gui.set_research_module_symbols(
-                            "libswordigo.so", g_main_mod_64.dynsym,
-                            (size_t)g_main_mod_64.num_dynsym, g_main_mod_64.dynstr,
-                            g_main_mod_64.dynstr_size, true);
-                    }
-                    // Section headers + the loader's copy of the section-name
-                    // table.  A symbol table has a hole below its lowest symbol,
-                    // and that hole is exactly where a module-scoped scan floods
-                    // (measured: 8 of 12 hits for a common value landed inside
-                    // .dynsym / .rela.plt).  Sections name those blocks, and mark
-                    // them so a scan can skip them.
-                    if (g_main_mod_64.shdr && g_main_mod_64.ehdr &&
-                        g_main_mod_64.ehdr->e_shnum > 0) {
-                        g_swordfare_gui.set_research_module_sections(
-                            "libswordigo.so", g_main_mod_64.shdr,
-                            (size_t)g_main_mod_64.ehdr->e_shnum,
-                            g_main_mod_64.shstrtab.data(), g_main_mod_64.shstrtab.size(),
-                            true);
-                    }
-                }
-                for (so_module_arm64* m : g_mod_libraries_64) {
-                    if (!m || !m->base_addr || !m->ehdr) continue;
-                    g_swordfare_gui.set_research_module(
-                        "libswordigo_dep.so", m->base_addr, 0,
-                        m->mem_size ? m->mem_size : 0x100000, "sre13-1.4.13-arm64");
-                    if (m->dynsym && m->dynstr && m->num_dynsym > 0) {
-                        // Keyed by the image's own soname so the dependency
-                        // modules do not all overwrite one symbol bucket.
-                        const std::string depkey =
-                            m->soname.empty() ? std::string("libswordigo_dep.so") : m->soname;
-                        g_swordfare_gui.set_research_module_symbols(
-                            depkey, m->dynsym, (size_t)m->num_dynsym, m->dynstr,
-                            m->dynstr_size, true);
-                        if (m->shdr && m->ehdr && m->ehdr->e_shnum > 0) {
-                            g_swordfare_gui.set_research_module_sections(
-                                depkey, m->shdr, (size_t)m->ehdr->e_shnum,
-                                m->shstrtab.data(), m->shstrtab.size(), true);
-                        }
-                    }
-                }
-                std::cout << "[Research] Memory Research tab initialized" << std::endl;
+                // Hero/scene pointers for the mod tools (see update_arm64_hero_roots).
+                resolve_arm64_hero_roots();
 
                 // Mirror the shifter VAs for the engine-pod "Run scene" command
                 // (ruby sends target+spawn over stdin; the same tick performs
@@ -7033,31 +6954,10 @@ void load_and_boot_arm64() {
                 }
             }
             g_swordfare_gui.update_console_backend();
-            // Update Memory Research live root pointers every frame
-            if (g_swordfare_gui.is_research_ready()) {
-                swordfare::research::InstanceRegistry::instance().tick();
-                swordfare::research::LiveRoots rr;
-                rr.gsc_va       = g_game_scene_controller;
-                rr.hero_va      = g_hero_obj;
-                rr.health_va    = g_hero_health_comp;
-                rr.mana_va      = g_hero_mana_comp;
-                rr.char_ctrl_va = g_hero_char_ctrl_comp;
-                g_swordfare_gui.update_research_roots(rr);
-            }
 
-            update_arm64_research_roots();
+            update_arm64_hero_roots();
 
-            // ── Live memory engine tick ────────────────────────────────────
-            // Runs on the EMULATED frame, not on the render frame, so frozen
-            // values are re-applied and tracked objects re-resolved on the
-            // guest's own tick.  A wall-clock thread doing this would race the
-            // game's own writes to the same addresses.
-            if (g_swordfare_gui.is_research_ready() && g_guest_memory) {
-                static uint64_t s_research_frame = 0;
-                g_swordfare_gui.tick_research(++s_research_frame,
-                                              g_guest_memory, GUEST_MEM_SIZE);
-            }
-            // ── Auto Console Test (debug) ──────────────────────────────────
+            // ── Auto Console Test (debug)──────────────────────────────────
             // SWORDIGO_AUTO_CONSOLE=1  submits two console commands headlessly
             // and reports status/result after each (reproduces the
             // "only the first console command works" bug). Waits for the game
@@ -8045,8 +7945,6 @@ void load_and_boot_arm64() {
                 g_swordfare_gui.draw_lua_script_editor();
                 g_swordfare_gui.draw_lua_script_manager();
                 g_swordfare_gui.draw_mod_overlay(g_save_dir);
-                g_swordfare_gui.draw_research_overlay();
-                g_swordfare_gui.draw_research_hud();
                 g_swordfare_gui.draw_graphics_options_modal(g_postfx);
                 g_swordfare_gui.end_frame();
             }
@@ -8957,9 +8855,6 @@ int main(int argc, char* argv[]) {
     // Check for --headless flag
     bool headless = false;
     bool check_data_only = false;
-    bool use_openswordigo = false;
-    std::string openswordigo_scene = "town_part1.scene";
-    std::string openswordigo_library;
     std::string cli_mod;
 #ifdef HEADLESS_DEFAULT
     headless = true;
@@ -8999,13 +8894,6 @@ int main(int argc, char* argv[]) {
                 "  --guest-smoke   Test 4 GiB mapping and load/relocate both guest SREs.\n"
                 "See WINDOWS_CLIENT.md for setup, controls, saves and logs.\n";
             return 0;
-        }
-        if (strcmp(argv[i], "--openswordigo") == 0) use_openswordigo = true;
-        if (strcmp(argv[i], "--openswordigo-scene") == 0 && i + 1 < argc) {
-            openswordigo_scene = argv[++i];
-        }
-        if (strcmp(argv[i], "--openswordigo-lib") == 0 && i + 1 < argc) {
-            openswordigo_library = argv[++i];
         }
 #ifdef VULKAN_BACKEND
         if (strcmp(argv[i], "--vulkan") == 0) g_graphics_api = GraphicsAPI::VULKAN;
@@ -9182,7 +9070,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Show unified launcher GUI (graphics API + binary selection)
     // ========================================================================
-    if (!headless && !use_openswordigo) {
+    if (!headless) {
         bool skip_launcher = false;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--vulkan") == 0 || strcmp(argv[i], "--no-launcher") == 0 ||
@@ -9368,9 +9256,7 @@ int main(int argc, char* argv[]) {
                       << " | render: " << GAME_W << "x" << GAME_H
                       << " | aspect: " << std::fixed << std::setprecision(3)
                       << ((float)GAME_W / GAME_H) << std::endl;
-            // OpenSwordigo owns its own ImGui context for the in-engine menu
-            // (see openswordigo_plugin.cpp) — don't double-init the host GUI.
-            if (!use_openswordigo) {
+            {
                 if (g_graphics_api == GraphicsAPI::OPENGL) {
                     g_swordfare_gui.init(display.get_window(), SDL_GL_GetCurrentContext());
 #ifdef VULKAN_BACKEND
@@ -9404,37 +9290,6 @@ int main(int argc, char* argv[]) {
         if (headless) std::cout << "[Main] Running in headless mode" << std::endl;
     }
 
-    if (use_openswordigo) {
-        if (headless) {
-            std::cerr << "[OpenSwordigo/Host] --headless is not supported yet" << std::endl;
-            return 2;
-        }
-        if (!g_display_active) {
-            std::cerr << "[OpenSwordigo/Host] Display initialization failed" << std::endl;
-            return 1;
-        }
-
-        if (openswordigo_library.empty()) {
-            const std::string installed = get_data_path("OpenSwordigo/libopenswordigo.so");
-            if (fs::exists(installed)) {
-                openswordigo_library = installed;
-            } else if (fs::exists("./OpenSwordigo/build/bin/libopenswordigo.so")) {
-                openswordigo_library = "./OpenSwordigo/build/bin/libopenswordigo.so";
-            } else {
-                openswordigo_library = "./bin/libs/libopenswordigo.so";
-            }
-        }
-
-        OpenSwordigoLaunchOptions options;
-        options.library_path = openswordigo_library;
-        options.assets_root = get_data_path(g_instance_assets_dir + "/resources");
-        options.scene = openswordigo_scene;
-        const int result = run_openswordigo(display, options);
-        std::cout.flush();
-        std::cerr.flush();
-        std::quick_exit(result);
-    }
-
     // ========================================================================
     // Binary fallback (only if launcher was skipped via CLI flags)
     // ========================================================================
@@ -9454,18 +9309,6 @@ int main(int argc, char* argv[]) {
     }
 
     init_all();
-
-    // ── Memory Research Catalog — init embedded SQLite3 DB ─────────────────
-    // Called immediately after init_all() (which allocates g_guest_memory).
-    // get_data_path("") gives the writable user data root for user_research.db.
-    {
-        std::string user_data_root = get_data_path("");
-        // Trim trailing separator
-        while (!user_data_root.empty() &&
-               (user_data_root.back() == '/' || user_data_root.back() == '\\'))
-            user_data_root.pop_back();
-        swordfare::research::RecoveryCatalog::instance().init(user_data_root);
-    }
 
     // Detect architecture from binary ELF header
     {

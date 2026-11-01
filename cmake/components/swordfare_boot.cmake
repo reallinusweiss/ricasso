@@ -11,7 +11,6 @@ add_executable(swordfare_boot
     ${SRC_DIR}/platform/pod_ipc.cpp
     ${SRC_DIR}/platform/loading_screen.cpp
     ${SRC_DIR}/platform/crash_dialog.cpp
-    ${SRC_DIR}/platform/openswordigo_host.cpp
     ${SRC_DIR}/platform/gui.cpp
     ${SRC_DIR}/platform/input_config.cpp
     ${SRC_DIR}/platform/binary_selector.cpp

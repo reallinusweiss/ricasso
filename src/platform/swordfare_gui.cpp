@@ -916,23 +916,6 @@ bool SwordfareGUI::process_event(const SDL_Event& event) {
         return true;
     }
 
-    // [Insert] opens the standalone Memory Research console (moved out of the
-    // F11 toolbox). [Tab] cannot be used here: it is the game's "Open" virtual
-    // key and is also forwarded to the guest FWKeyboard, so it stays reserved.
-    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-        event.key.key == SDLK_INSERT) {
-        toggle_research_overlay();
-        return true;
-    }
-    // Escape closes the research console, but not while a text field inside it
-    // has keyboard focus (otherwise it would swallow typed input).
-    if (m_research_overlay_visible && event.type == SDL_EVENT_KEY_DOWN &&
-        !event.key.repeat && event.key.key == SDLK_ESCAPE &&
-        !ImGui::GetIO().WantTextInput) {
-        m_research_overlay_visible = false;
-        return true;
-    }
-
     // Function keys remain application-level shortcuts even while a menu has
     // keyboard focus, so every overlay can always be closed with its hotkey.
     if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
@@ -1975,53 +1958,6 @@ void SwordfareGUI::draw_buttons(void* guest_buttons_ptr, void* guest_overlays_pt
 }
 
 
-// ---------------------------------------------------------------------------
-// Memory Research console (standalone overlay, [Insert])
-// ---------------------------------------------------------------------------
-void SwordfareGUI::draw_research_overlay() {
-    if (!m_initialized || !m_research_overlay_visible) return;
-    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
-
-    // ── Xpera shell ──────────────────────────────────────────────────────
-    xpera::WindowSpec spec;
-    spec.mode       = xpera::WindowMode::Fullscreen;
-    spec.eyebrow    = "RESEARCH";
-    spec.title      = "Memory Research";
-    spec.subtitle   = "Live guest-memory console \u2014 catalog, decoder, watchpoints, DB";
-    spec.close_hint = "Insert";
-
-    bool open = true;
-    if (xpera::begin_window("##xpera_research", spec, &open)) {
-        if (!m_research_tab || !m_research_tab->is_ready()) {
-            ImGui::Spacing();
-            xpera::accent_rule();
-            ImGui::Spacing();
-            ImGui::TextColored(xpera::palette.warning,
-                ICON_FA_TRIANGLE_EXCLAMATION "  Memory Research is not initialised.");
-            ImGui::Spacing();
-            ImGui::TextWrapped(
-                "The embedded recovery catalog is only loaded by the ARM64 + SRE boot path. "
-                "Launch with SRE enabled (not --no-sre, not --openswordigo, not ARM32) and the "
-                "catalog will be available here.");
-        } else {
-            m_research_tab->draw();
-        }
-    }
-    xpera::end_window();
-
-    if (!open) m_research_overlay_visible = false;
-}
-
-void SwordfareGUI::draw_research_hud() {
-    if (!m_initialized || !m_research_tab) return;
-    if (!m_research_tab->hud_enabled()) return;
-    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
-
-    // "full screen" in the bar returns to the console, on the section the bar was
-    // operating on.  Closing the console does not close the bar.
-    if (m_research_tab->draw_hud()) m_research_overlay_visible = true;
-}
-
 void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
     if (!m_initialized || !m_mod_overlay_visible) return;
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
@@ -2058,21 +1994,6 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
         if (xpera::nav_item(ICON_FA_DISPLAY "  Scene & Display", nullptr, m_overlay_tab == 1)) m_overlay_tab = 1;
         if (xpera::nav_item(ICON_FA_MAP "  Scene Shifter", nullptr, m_overlay_tab == 2)) m_overlay_tab = 2;
         if (xpera::nav_item(ICON_FA_TERMINAL "  Diagnostics", nullptr, m_overlay_tab == 3)) m_overlay_tab = 3;
-        ImGui::Spacing();
-        xpera::divider();
-        ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Text, xpera::palette.text_lo);
-        ImGui::TextUnformatted("RESEARCH");
-        ImGui::PopStyleColor();
-        ImGui::PushStyleColor(ImGuiCol_Text, xpera::palette.text_mid);
-        ImGui::TextWrapped("Live guest memory console (own window).");
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        if (xpera::toolbar_button(ICON_FA_FLASK "  Open  [Insert]", false, ImVec2(-1, 32))) {
-            m_research_overlay_visible = true;
-            m_mod_overlay_visible = false;
-            m_f11_overlay_active = false;
-        }
         ImGui::EndChild();
 
         ImGui::SameLine(0.0f, 16.0f);
@@ -2089,7 +2010,6 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                     if (p[0]) cur_scene = p;
                 }
                 const bool sre_ok      = m_scene_shifter_ready || m_console_ready;
-                const bool catalog_ok  = is_research_ready();
                 const bool shifter_ok  = m_scene_shifter_ready;
                 const bool console_ok  = m_console_ready;
 
@@ -2125,7 +2045,6 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                     ImGui::Spacing();
                 };
                 status_card(ICON_FA_BOLT,     "SRE runtime",      sre_ok,     "Java / native bridge + guest hooks");
-                status_card(ICON_FA_FLASK,    "Recovery catalog", catalog_ok, "Embedded struct / field database");
                 status_card(ICON_FA_MAP,      "Scene shifter",    shifter_ok, "Guest scene list + gateway dispatch");
                 status_card(ICON_FA_TERMINAL, "Lua console",      console_ok, "ImGui-native REPL and TCP server");
 
@@ -2156,11 +2075,6 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                 ImGui::Spacing();
 
                 const float bw = (col_r > 40.0f) ? col_r - 8.0f : col_r;
-                if (ImGui::Button(ICON_FA_FLASK "  Memory Research   [Insert]", ImVec2(bw, 34))) {
-                    m_research_overlay_visible = true;
-                    m_mod_overlay_visible = false;
-                    m_f11_overlay_active = false;
-                }
                 if (ImGui::Button(ICON_FA_MAP "  Scene Shifter",           ImVec2(bw, 30))) m_overlay_forced_tab = 2;
                 if (ImGui::Button(ICON_FA_GEAR "  Render & Display",        ImVec2(bw, 30))) m_overlay_forced_tab = 1;
                 if (ImGui::Button(ICON_FA_TERMINAL "  Diagnostics & Logs",  ImVec2(bw, 30))) m_overlay_forced_tab = 3;
@@ -2183,7 +2097,6 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                     {"F10",      "Toggle on-screen controls"},
                     {"F11",      "Scene & Display toolbox"},
                     {"F12",      "Fullscreen toggle"},
-                    {"Insert",   "Memory Research console"},
                     {"\u0060",   "Lua console"},
                 };
                 if (ImGui::BeginTable("##home_keys", 2, ImGuiTableFlags_SizingFixedFit)) {
@@ -3190,13 +3103,6 @@ bool SwordfareGUI::is_input_blocked(float mx, float my) {
 
     // 1. The control-center toolbox or graphics options modal owns the display
     if (m_mod_overlay_visible || m_graphics_options_visible) return true;
-
-    // 1b. The standalone Memory Research console is inset by 18px.
-    if (m_research_overlay_visible) {
-        const float inset = 18.0f;
-        if (mx >= inset && mx <= win_w - inset && my >= inset && my <= win_h - inset)
-            return true;
-    }
 
     if (!m_last_buttons_ptr || m_buttons_globally_hidden) return false;
 
@@ -5153,72 +5059,4 @@ void SwordfareGUI::tcp_server_loop() {
             m_tcp_client_fd.store(-1);
         }
     }
-}
-
-// =============================================================================
-// Memory Research Tab — SwordfareGUI bridge methods
-// =============================================================================
-
-void SwordfareGUI::init_research_tab(const uint8_t* guest_memory,
-                                      uint64_t       guest_mem_size) {
-    if (!m_research_tab)
-        m_research_tab = std::make_unique<swordfare::research::MemoryResearchTab>();
-    // Tool typography, not the game's display face.  Passed in rather than
-    // looked up so the console has no dependency on this class's internals.
-    swordfare::research::MemoryResearchTab::ConsoleFonts fonts;
-    fonts.body = m_font_ui ? m_font_ui : m_font_main;
-    fonts.mono = m_font_mono;
-    m_research_tab->set_fonts(fonts);
-    m_research_tab->init(guest_memory, guest_mem_size);
-}
-
-void SwordfareGUI::update_research_roots(const swordfare::research::LiveRoots& roots) {
-    if (m_research_tab) m_research_tab->update_roots(roots);
-}
-
-bool SwordfareGUI::is_research_ready() const {
-    return m_research_tab && m_research_tab->is_ready();
-}
-
-void SwordfareGUI::tick_research(uint64_t frame, uint8_t* guest_memory,
-                                 uint64_t guest_mem_size) {
-    if (m_research_tab) m_research_tab->tick(frame, guest_memory, guest_mem_size);
-}
-
-void SwordfareGUI::set_research_module(const std::string& name, uint64_t base_va,
-                                       uint64_t rva_begin, uint64_t rva_end,
-                                       const std::string& build_id) {
-    if (!m_research_tab) return;
-    swordfare::research::ModuleExtent e;
-    e.name      = name;
-    e.base_va   = base_va;
-    e.rva_begin = rva_begin;
-    e.rva_end   = rva_end;
-    e.build_id  = build_id;
-    m_research_tab->register_module(e);
-}
-
-void SwordfareGUI::set_research_module_symbols(const std::string& name,
-                                               const void* symtab, size_t count,
-                                               const char* strtab, size_t strtab_size,
-                                               bool is_64) {
-    if (!m_research_tab) return;
-    const bool ok = m_research_tab->register_module_symbols(name, symtab, count,
-                                                           strtab, strtab_size, is_64);
-    std::cout << "[Research] symbols for " << name << ": "
-              << (ok ? "indexed" : "none available")
-              << " (" << count << " dynsym entries)" << std::endl;
-}
-
-void SwordfareGUI::set_research_module_sections(const std::string& name,
-                                                const void* shdrs, size_t count,
-                                                const char* names, size_t names_size,
-                                                bool is_64) {
-    if (!m_research_tab) return;
-    const bool ok = m_research_tab->register_module_sections(name, shdrs, count,
-                                                            names, names_size, is_64);
-    std::cout << "[Research] sections for " << name << ": "
-              << (ok ? "indexed" : "none available")
-              << " (" << count << " shdr entries, names "
-              << (names && names_size ? "kept" : "absent") << ")" << std::endl;
 }

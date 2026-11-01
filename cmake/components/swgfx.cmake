@@ -11,8 +11,7 @@ swordigo_library(swgfx
     ${SRC_DIR}/platform/ffmpeg_dyn.cpp
     ${SRC_DIR}/platform/srt_overlay.cpp
     ${SRC_DIR}/graphics/TextureAwareMapper.cpp
-    ${SRC_DIR}/graphics/LightManager.cpp
-    ${SRC_DIR}/tools/scene_v3_db.cpp)
+    ${SRC_DIR}/graphics/LightManager.cpp)
 target_link_libraries(swgfx PRIVATE swcore swgui SDL3::SDL3 OpenGL::GL ${CMAKE_DL_LIBS} ${SWORDIGO_LIBM})
 if (SWORDIGO_USE_FFMPEG)
     target_compile_definitions(swgfx PRIVATE "SWORDIGO_USE_FFMPEG=1")

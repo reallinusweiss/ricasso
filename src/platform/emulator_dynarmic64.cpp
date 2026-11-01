@@ -18,7 +18,6 @@
 #include <chrono>
 #include <iomanip>
 #include <thread>   // std::this_thread::yield() for LEGACY spinloop cooperative yield
-#include "game/research/mem_watchpoint.h"
 
 extern uint8_t* g_guest_memory;
 /* MAGIC_LR: sentinel return address (0xE0000000). When the JIT hits this PC,
@@ -421,20 +420,12 @@ public:
     }
 
     void MemoryWrite32(Dynarmic::A64::VAddr vaddr, std::uint32_t value) override {
-        if (vaddr + 4 <= mem_size) {
-            std::memcpy(memory + vaddr, &value, 4);
-            swordfare::research::wp_on_write(vaddr, value, 4,
-                emu->get_jit() ? emu->get_jit()->GetPC() : 0);
-        }
+        if (vaddr + 4 <= mem_size) std::memcpy(memory + vaddr, &value, 4);
         else if (vaddr < 0x0000800000000000ULL) HandleMemoryFault(vaddr, "MemoryWrite32");
     }
 
     void MemoryWrite64(Dynarmic::A64::VAddr vaddr, std::uint64_t value) override {
-        if (vaddr + 8 <= mem_size) {
-            std::memcpy(memory + vaddr, &value, 8);
-            swordfare::research::wp_on_write(vaddr, value, 8,
-                emu->get_jit() ? emu->get_jit()->GetPC() : 0);
-        }
+        if (vaddr + 8 <= mem_size) std::memcpy(memory + vaddr, &value, 8);
         else if (vaddr < 0x0000800000000000ULL) HandleMemoryFault(vaddr, "MemoryWrite64");
     }
 

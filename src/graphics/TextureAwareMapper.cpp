@@ -1,5 +1,4 @@
 #include "TextureAwareMapper.h"
-#include "tools/scene_v3_db.h"
 #include <iostream>
 #include <algorithm>
 #include <cctype>
@@ -128,11 +127,9 @@ void TextureAwareMapper::SetBiome(BiomeType type) {
     m_activeBiome.ambientOcclusionBoost = 1.0f;
     m_activeBiome.baseRoughnessOffset   = 0.0f;
 
-    // Rain and wind have NO authoritative source - scene_v3_biomes.json contains
-    // no weather field at all (grep for "rain" only matches
-    // common.terrain_seed_default, and "wind" appears nowhere). They stay zero
-    // rather than being invented, exactly like the windSpeed values that had to
-    // be struck from BiomeMaterialTypes.h.
+    // Rain and wind have no authoritative source in the game data. They stay
+    // zero rather than being invented, exactly like the windSpeed values that
+    // had to be struck from BiomeMaterialTypes.h.
     m_activeBiome.rainIntensity   = 0.0f;
     m_activeBiome.windSpeed       = 0.0f;
     m_activeBiome.windDirection[0] = 1.0f;
@@ -158,22 +155,7 @@ void TextureAwareMapper::SetBiomeFromSceneName(const std::string& sceneName) {
     if (dot != std::string::npos && dot > 0) base = base.substr(0, dot);
     const std::string s = to_lower(base);
 
-    // 2. Query runtime database portal_dests from scene_v3_biomes.json
-    const auto& db = sgen::v3::v3_biome_db();
-    for (size_t bi = 0; bi < db.size(); ++bi) {
-        const auto& spec = db[bi];
-        for (const auto& dest : spec.portal_dests) {
-            std::string dest_lower = to_lower(dest);
-            if (!dest_lower.empty() && s == dest_lower) {
-                SetBiome((BiomeType)bi);
-                std::cout << "[TextureAwareMapper] '" << sceneName << "' -> "
-                          << m_activeBiome.name << " (matched portal_dest: " << dest << ")" << std::endl;
-                return;
-            }
-        }
-    }
-
-    // 3. Match authentic level prefixes derived from decoded game scenes
+    // 2. Match level name prefixes
     int resolvedId = -1;
     if (s.find("cave") != std::string::npos || s.find("crypt") != std::string::npos) {
         resolvedId = 5; // Cave

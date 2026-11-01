@@ -18,11 +18,7 @@ swordigo_library(swemu
     # lives in jni_bridge_arm64.cpp. File left on disk, just not compiled.
     ${SRC_DIR}/platform/rgc.cpp
     ${SRC_DIR}/android/asset_manager.c
-    ${SRC_DIR}/android/asset_manager_arm32.c
-    # Memory Research watchpoint system — compiled here because the Dynarmic
-    # MemoryWrite callbacks (emulator_dynarmic*.cpp) call wp_on_write(), which
-    # must resolve in the same translation unit group to avoid unresolved symbols.
-    ${SRC_DIR}/game/research/mem_watchpoint.cpp)
+    ${SRC_DIR}/android/asset_manager_arm32.c)
 target_link_libraries(swemu PRIVATE swcore swgfx Threads::Threads ${CMAKE_DL_LIBS} ${SWORDIGO_LIBM})
 if (UNICORN_LIBRARY)
     target_link_libraries(swemu PRIVATE ${UNICORN_LIBRARY})

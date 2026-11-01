@@ -35,7 +35,9 @@ AevoraLabs and the Lawncher Team. It contains only what the Windows client and i
 - `tools/windows/launcher/`: the starter `Swordigo.exe` (Go)
 
 The editor suite, research tools, documentation and website of the upstream project are not part of this
-repository; see the upstream project for those.
+repository; see the upstream project for those. The client itself is reduced as well: the in-game Memory
+Research console, the scene tooling (scene loader/creator, physics/collision/entity models) and the
+OpenSwordigo host mode were removed. Playing the original game does not need them.
 
 ## Building
 
