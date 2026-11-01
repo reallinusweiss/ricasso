@@ -1,0 +1,227 @@
+# ============================================================
+# SwordigoDesktop â€” Comprehensive .gitignore for GitHub Release
+# ============================================================
+# -------- BUILDS / OUTPUTS / BINARIES --------
+# Build artifacts
+build/
+.agent/
+.gemini/
+bin/
+rl_builder/
+build-cmake/
+build-android/
+srcs/
+*.o
+/swordigo_boot
+/swordfare
+/ruby
+/ruby_cli
+/swordigo_headless
+/loader_test
+/analyze_syms
+/check_relocations
+/find_bad_ptr
+bin/swordigo_boot
+bin/swordfare
+bin/ruby
+bin/ruby_cli
+bin/swordigo_headless
+bin/loader_test
+bin/analyze_syms
+bin/check_relocations
+bin/find_bad_ptr
+bin/verify_0x10000000
+bin/poc_loader
+bin/libs/libsre.so
+# Object files and shared libraries
+*.o
+*.so
+*.so.*
+!src/ruby/android/libs/**/*.so
+# Old source snapshots (archived in trash/)
+# Archives (game asset bundles, compressed builds, etc.)
+*.zip
+*.tar
+*.tar.*
+*.xz
+*.gz
+*.7z
+# IDE and tool configs
+.gemini/
+.agents/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+# Build outputs directory
+build/
+out/
+BACKUPS/
+# OS files
+.DS_Store
+Thumbs.db
+# -------- LOGS / COREDUMPS / RUNTIME DATA --------
+*.log
+*.core
+cache/
+save/
+*.ppm
+# Engine binaries (user-provided, not distributed)
+engine/*/arm64-v8a/libswordigo.so
+engine/*/armeabi-v7a/libswordigo.so
+engine/*/arm64-v8a/libsre.so
+# -------- PROPRIETARY GAME BINARIES --------
+# Extracted from original APKs â€” copyrighted, DO NOT DISTRIBUTE
+libswordigo*.so
+rl_libswordigo*.so
+rl_libmini.so
+rl_libGlossHook.so
+rl_*.so
+# Game assets (copyrighted, not distributed)
+assets/
+# -------- COPYRIGHTED GAME MUSIC --------
+# Original Swordigo + RLSwordigo music â€” copyrighted
+/res/**
+!src/ruby/android/res/
+# Project-owned artwork and Android layout files are tracked despite the rules
+# above (original artwork, see CREDITS.md); game assets and music stay ignored.
+!src/assets/
+!web/assets/
+!/res/drawable-*/
+!/res/drawable-*/**
+!/res/layout/
+!/res/layout/**
+!/res/menu/
+!/res/menu/**
+*.mp3
+*.ogg
+# -------- COPYRIGHTED GAME ASSETS --------
+# Commercial game assets extracted from APK
+assets/resources/
+assets/dexopt/
+rl_assets/
+dexopt/
+*.wav
+*.pvr
+*.POD
+*.scene
+*.scl
+*.gdata
+*.gstate
+*.gopt
+*.proto
+*.fnt
+*.atlas
+# Keep the README which has license attributions
+!assets/README
+# -------- VITA TROPHY DATA (copyrighted) --------
+src/assets/TROPHY.TRP
+# -------- TRACES / SYMBOLS / DEBUGGING --------
+symbols_*.txt
+trace_log.txt
+background_prepare.txt
+CLEANUP_REPORT.md
+assets.tar*
+# -------- RESEARCH EXPERIMENT LOGS (large) --------
+research/experiments/
+# -------- PROPRIETARY REFERENCE MATERIALS --------
+reference/
+#reference/**
+# -------- WINDOWS BUILD DEPENDENCIES --------
+# vcpkg and build artifacts (large, downloadable)
+winbuild/
+# -------- BUILDER / PACKAGING ARTIFACTS --------
+builder/appimage/Swordigo.AppDir/
+builder/appimage/Swordigo-x86_64.AppImage
+builder/appimage/appimagetool
+builder/flatpak/.flatpak-builder/
+builder/flatpak/repo/
+builder/flatpak/export/
+packaging/
+# Packaging output
+*.rpm
+*.deb
+*.rpm
+*.AppImage
+packaging/build/
+# -------- INTERNAL AGENT PROMPTS --------
+prompt/
+# Save data
+save/
+# -------- DEVELOPMENT TOOLS --------
+.tools/
+# -------- IDE CONFIGS --------
+.idea/
+*.iml
+*.desktop
+.vscode/
+# -------- OS ARTIFACTS --------
+.DS_Store
+Thumbs.db
+desktop.ini
+System Volume Information/
+# -------- ANDROID NDK --------
+android-ndk-*-linux.zip
+# -------- EXTERNAL THIRD-PARTY RESEARCH --------
+docs/research/vita/vistaPort/
+docs/research/vita/*.zip
+# -------- PYTHON SCRIPTS --------
+generate_poc.py
+# -------- TRASH / ARCHIVED SNAPSHOTS --------
+trash/
+
+# Instance scripts (local only)
+instx.sh
+cache/instx.sh
+
+# -------- DYNARMIC JIT BUILD OUTPUT --------
+# Source is included, build output is rebuilt from source
+deps/dynarmic/build/
+
+# -------- BULK / LOCAL ARTIFACTS FOLDER --------
+.ignore/
+.ignore
+
+# -------- PRECOMPILED BINARIES --------
+*.exe
+*.dll
+*.lib
+*.jar
+!src/ruby/android/libs/
+!src/ruby/android/libs/**
+
+# -------- EMBEDDED ASSETS GENERATED SOURCE --------
+src/platform/embedded_assets.cpp
+
+# -------- FFMPEG VENDOR TREE (NOW LOADED VIA DLOPEN) --------
+src/tools/ffmpeg/
+
+# -------- PYTHON CACHE --------
+__pycache__/
+*.pyc
+*.pyo
+
+*.bak
+*.glb
+src/tools/King_Crown/
+docs/livememory/
+
+# Local Windows client build/package output
+/build-win64/
+/binw/
+/dist-windows/
+/play-windows/
+/Swordigo_Windows_Portable/
+/GitHub-Release/
+/.swordfare/
+*.apkm
+*.apk
+
+# Publication preparation and local preferences
+/GitHub-Release/
+/.Rhistory
+/imgui.ini
+
+# Generated local validation output
+/docs/windows-package-tests.json

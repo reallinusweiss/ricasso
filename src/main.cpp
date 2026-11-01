@@ -1,0 +1,9592 @@
+// Force rebuild: PostFXState struct changed in fbo_scaler.h
+#include "wincompat/posix.h"
+#include "platform/os_external.h"
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <process.h>
+#include <windows.h>
+#endif
+#include <iostream>
+#include <iomanip>
+#include <cstdlib>
+#include <vector>
+#include <stdint.h>
+#include <fstream>
+#include <sstream>
+#include <filesystem>
+namespace fs = std::filesystem;
+#include "loader/elf_loader.h"
+#include "loader/elf_loader_arm64.h"
+#include "loader/arch_detect.h"
+#include "platform/data_path.h"
+#include "platform/client_preflight.h"
+#include "platform/client_host_smoke.h"
+#include "jni/jni_layer.h"
+#include "jni/jni_layer_arm64.h"
+#include "jni/jni_bridge.h"
+#include "jni/jni_bridge_arm64.h"
+#include "platform/unicorn_dyn.h"
+#include "platform/emulator.h"
+#include "platform/emulator_arm64.h"
+#include "platform/i_emulator_arm64.h"
+#ifdef SWORDIGO_HAS_DYNARMIC
+#include "platform/emulator_dynarmic64.h"
+#include "platform/emulator_dynarmic32.h"
+#endif
+#include "srehost/srehost_abi.h"   // ProHook Phase 1: SVC #0x5352 gateway
+#include "platform/display.h"
+#include "platform/pod_ipc.h"        // Ruby GG engine-pod frame/control IPC
+#include <deque>
+#include <mutex>
+#include <thread>
+#include "platform/gui.h"            // GuiAction (GUI_MUSIC_MUTE etc.)
+#include "platform/openswordigo_host.h"
+#include "android/asset_manager.h"
+extern "C" void asset_manager_init_arm32(const char* base_path);
+extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp — drains guest deferred-free list (leak guard)
+#include "game/camera_override.h"
+#include "game/mod_tools.h"
+#include "platform/rgc.h"
+#include "game/sky_renderer.h"
+#include "platform/input_config.h"
+#include <cstring>
+#include <chrono>
+#define GL_GLEXT_PROTOTYPES
+#include "platform/gl_inc.h"
+#include <GL/glext.h>
+#include <sys/stat.h>
+
+#include "platform/video_background.h"
+#define FFMPEG_DYN_NO_MACROS
+#include "platform/ffmpeg_dyn.h"
+#include "platform/gui.h"
+#include "platform/vulkan_backend.h"
+#include "platform/fbo_scaler.h"
+#include "platform/ffp_forward.h"   // forward-lighting census at session end
+#include "platform/io_thread.h"
+#include "platform/binary_selector.h"
+#include "platform/arm64_reloc.h"       // copy_and_relocate() — shared with hook-backend tests
+#include "platform/trampoline_mgr.h"
+#include "platform/launcher_ui.h"
+#include "platform/srt_overlay.h"
+#include "platform/save_editor.h"
+#include "platform/swordfare_gui.h"  /* Swordfare: ImGui-based in-game overlay */
+#include "game/research/recovery_catalog.h" /* Memory Research embedded DB */
+#include "game/research/instance_registry.h"  /* Memory Research instance tracker */
+#include "platform/loading_screen.h" /* Boot loading screen (hiro POD + progress) */
+#include "platform/crash_dialog.h"   /* Sleek fatal-crash reporting window */
+#include "platform/launcher_config.h"
+#include "imgui/imgui.h"
+
+// Global boot loading screen. Non-null and active only during the boot gap
+// between window creation and the game's first rendered frame. The boot code
+// pumps it via BOOT_LOADING(pct, "stage") at checkpoints; it renders on the
+// main window's GL context so nothing threads across contexts.
+LoadingScreen* g_loading_screen = nullptr;
+static inline void boot_loading(float pct, const char* stage) {
+    if (!g_loading_screen) return;
+    g_loading_screen->set_progress(pct);
+    if (stage) g_loading_screen->set_stage(stage);
+    g_loading_screen->frame();
+}
+#define BOOT_LOADING(pct, stage) boot_loading((pct), (stage))
+
+extern bool g_display_active;
+extern int g_win_w;
+extern int g_win_h;
+extern int g_draw_w;  // Physical drawable pixels (for glViewport / FBO)
+extern int g_draw_h;
+
+#if defined(_MSC_VER)
+extern "C" float g_host_hero_pos[3];
+#else
+extern float g_host_hero_pos[3];
+#endif
+
+// --- Global Context ---
+uint8_t* g_guest_memory = nullptr;
+const uint32_t GUEST_MEM_SIZE = 0xE0000000; // 3.5GB — ARM64 needs >3GB for area transitions
+
+// Game internal render resolution — game engine sees this via setApplicationViewSize.
+// Defaults to 1920×1080, but dynamically updated after display init to match
+// the display's physical pixel dimensions and native aspect ratio.
+// Touch coordinates are kept in legacy 960×544 space and auto-scaled.
+int GAME_W = 1920;
+int GAME_H = 1080;
+static float TOUCH_SCALE_X = (float)GAME_W / 960.0f;
+// Which game binary to load (switchable via launcher or --lib flag)
+static std::string g_lib_name = "engine/v1.4.12/arm64-v8a/libswordigo.so";
+std::string g_assets_dir = "assets";  // "assets" for vanilla, "rl_assets" for RLSwordigo
+std::string g_instance_assets_dir = "assets";
+static float TOUCH_SCALE_Y = (float)GAME_H / 544.0f;   // ~1.985
+
+// =========================================================================
+// Engine-pod preview mode (Ruby GG dock) — see platform/pod_ipc.h
+//
+// When swordfare is launched with `--pod-preview <shm>:<W>x<H>` it runs the
+// whole boot + Dynarmic + SRE pipeline against a HIDDEN SDL/GL window at low
+// resolution, skips all host ImGui/debug overlays, and publishes every
+// finished frame into a shared-memory triple buffer that Ruby GG paints in a
+// dock widget. Input / pause / mute / quit come back over stdin as a stream
+// of pod::PodMsg records read by a dedicated control thread.
+// =========================================================================
+static bool     g_pod_enabled  = false;   // --pod-preview mode active
+static bool     g_pod_paused   = false;   // freeze button (skips update+draw)
+static int      g_pod_w = 1280;           // requested preview resolution
+static int      g_pod_h = 720;
+static std::string g_pod_shm_name;
+static pod::FrameRing* g_pod_ring = nullptr;
+static std::vector<uint8_t> g_pod_rgba;   // row-flipped frame scratch
+
+// Pod-injected virtual keyboard state (mirrors SDL_GetKeyboardState for the
+// ARM64 loop's control-button dispatch). SDL_PushEvent synthetic KEY events
+// are not reflected in SDL_GetKeyboardState inside a hidden-window pod, so the
+// loop consults THIS array (merged over SDL state) for pod key presses. This
+// is the same "bypass SDL" fix that made pod touch work.
+static uint8_t g_pod_key_state[512] = {0};
+
+// Scene Shifter guest VAs (mirror of the SwordfareGUI wiring). Filled once the
+// SRE globals resolve during ARM64 boot; enables the "Run scene" flow from
+// ruby: write target/spawn into guest memory and set g_sre_scene_shift_pending
+// — the per-frame sre_scene_shifter_tick() performs the actual GotoLevel.
+static bool     g_ss_ready = false;
+static uint64_t g_ss_pend_va = 0, g_ss_targ_va = 0, g_ss_spwn_va = 0,
+               g_ss_err_va  = 0, g_ss_act_va  = 0, g_ss_cur_va  = 0;
+static std::deque<pod::PodMsg> g_pod_cmds;
+static std::mutex  g_pod_cmds_mutex;
+static std::string g_pod_carry;           // partial stdin stream bytes
+
+// Called from the stdin reader thread → push into the command queue.
+static void pod_reader_dispatch(const pod::PodMsg& msg, void* /*user*/) {
+    std::lock_guard<std::mutex> lk(g_pod_cmds_mutex);
+    if (g_pod_cmds.size() < 4096) g_pod_cmds.push_back(msg);
+}
+
+static void pod_reader_thread() {
+    char buf[2048];
+#if defined(_WIN32)
+    _setmode(_fileno(stdin), _O_BINARY);
+    for (;;) {
+        int n = (int)::_read(0, buf, sizeof(buf));
+        if (n <= 0) break;
+        pod::pod_dispatch_stream((const uint8_t*)buf, (size_t)n,
+                                 &g_pod_carry, pod_reader_dispatch, nullptr);
+    }
+#else
+    for (;;) {
+        ssize_t n = ::read(0, buf, sizeof(buf));
+        if (n <= 0) break;
+        pod::pod_dispatch_stream((const uint8_t*)buf, (size_t)n,
+                                 &g_pod_carry, pod_reader_dispatch, nullptr);
+    }
+#endif
+}
+
+static void pod_start_reader() {
+    static std::thread* t = nullptr;
+    if (t) return;
+    t = new std::thread(pod_reader_thread);
+}
+
+// Pop one queued command (loop thread). Returns false when empty.
+static bool pod_pop_cmd(pod::PodMsg& out) {
+    std::lock_guard<std::mutex> lk(g_pod_cmds_mutex);
+    if (g_pod_cmds.empty()) return false;
+    out = g_pod_cmds.front();
+    g_pod_cmds.pop_front();
+    return true;
+}
+
+// Helper forward declarations used by pod_process_commands() below.
+void process_gui_action(GuiAction gui_action, bool& running);
+static void pod_touch_direct(int action, int finger_id,
+                             float nx, float ny, float ndx, float ndy);
+
+// Handle queued control messages on the game-loop thread.
+static void pod_process_commands(bool& running) {
+    if (!g_pod_enabled) return;
+    pod::PodMsg m;
+    while (pod_pop_cmd(m)) {
+        switch (m.kind) {
+            case pod::kMsgQuit:
+                running = false;
+                std::memset(g_pod_key_state, 0, sizeof(g_pod_key_state));
+                if (g_pod_ring) g_pod_ring->set_state(pod::kStateExiting);
+                break;
+            case pod::kMsgPause: {
+                g_pod_paused = (m.a != 0);
+                if (g_pod_ring)
+                    g_pod_ring->set_state(g_pod_paused ? pod::kStatePaused
+                                                       : pod::kStateRunning);
+                std::cout << "[Pod] " << (g_pod_paused ? "PAUSED" : "RESUMED")
+                          << std::endl;
+                break;
+            }
+            case pod::kMsgMute:
+                process_gui_action(GUI_MUSIC_MUTE, running);
+                std::cout << "[Pod] Music mute toggled" << std::endl;
+                break;
+            case pod::kMsgVolume: {
+                float v = (float)(m.a > 100 ? 100 : m.a) / 100.0f;
+                std::cout << "[Pod] Volume -> " << (int)(v * 100) << "%" << std::endl;
+                break;
+            }
+            case pod::kMsgKey: {
+                // Drive the loop's control dispatch DIRECTLY via the pod key
+                // state (SDL_PushEvent KEY events never reach
+                // SDL_GetKeyboardState in a hidden-window pod).
+                if (m.scancode > 0 && m.scancode < 512) {
+                    g_pod_key_state[m.scancode] = m.a ? 1 : 0;
+                }
+                // Also keep a pushed SDL event for any real-keyboard pollers.
+                SDL_Event e;
+                SDL_zero(e);
+                e.type = (m.a ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP);
+                e.key.key = (SDL_Keycode)m.key;
+                e.key.scancode = (SDL_Scancode)m.scancode;
+                e.key.mod = (SDL_Keymod)m.mods;
+                e.key.repeat = (m.x != 0);
+                SDL_PushEvent(&e);
+                break;
+            }
+            case pod::kMsgMouseBtn: {
+                // f[0],f[1] = normalized position (top-left origin). mods holds
+                // 1=down/0=up, a holds the SDL button number.
+                SDL_Event e;
+                SDL_zero(e);
+                e.type = (m.mods ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP);
+                e.button.button = (Uint8)(m.a & 0xFF);
+                e.button.x = (int)(m.f[0] * g_win_w);
+                e.button.y = (int)(m.f[1] * g_win_h);
+                SDL_PushEvent(&e);
+                break;
+            }
+            case pod::kMsgMouseMove: {
+                SDL_Event e;
+                SDL_zero(e);
+                e.type = SDL_EVENT_MOUSE_MOTION;
+                e.motion.x = (int)(m.f[0] * g_win_w);
+                e.motion.y = (int)(m.f[1] * g_win_h);
+                SDL_PushEvent(&e);
+                break;
+            }
+            case pod::kMsgWheel: {
+                SDL_Event e;
+                SDL_zero(e);
+                e.type = SDL_EVENT_MOUSE_WHEEL;
+                e.wheel.y = m.a ? (float)m.a : 1.0f;
+                SDL_PushEvent(&e);
+                break;
+            }
+            case pod::kMsgTouch: {
+                // a = action (1 down, 2 up, 4 motion); mods = finger id;
+                // f[0..3] = normalized x, y, dx, dy (y top-down origin).
+                // Dispatch DIRECTLY into the ARM64 guest handler (see
+                // pod_touch_direct) — synthetic SDL finger events can be
+                // swallowed by event filtering in hidden-window pod mode.
+                const int finger_id = m.mods + 20;   // keep clear of touch HUD ids
+                pod_touch_direct(m.a, finger_id,
+                                 m.f[0], m.f[1], m.f[2], m.f[3]);
+                break;
+            }
+            case pod::kMsgText: {
+                // SDL3 text events carry a borrowed const char* — keep the
+                // payload in a small rotating buffer so it stays alive until
+                // the event is polled later in this same frame.
+                static char s_text_ring[8][64];
+                static int s_text_idx = 0;
+                char* slot = s_text_ring[(s_text_idx++) & 7];
+                std::memset(slot, 0, 64);
+                std::strncpy(slot, m.text, 63);
+                SDL_Event e;
+                SDL_zero(e);
+                e.type = SDL_EVENT_TEXT_INPUT;
+                e.text.text = slot;
+                SDL_PushEvent(&e);
+                break;
+            }
+            case pod::kMsgShiftScene: {
+                // Ruby "▶ Run scene": dispatch through the SAME Scene Shifter
+                // state machine the SwordfareGUI panel uses — write target +
+                // spawn into the guest globals and set the pending flag; the
+                // per-frame sre_scene_shifter_tick() then calls the engine's
+                // GotoLevel(level, spawn) with the SRE recovery in place.
+                if (!g_ss_ready || !g_guest_memory) {
+                    std::cerr << "[Pod] Scene shift ignored: shifter not ready"
+                              << std::endl;
+                    break;
+                }
+                const char* target = m.target[0] ? m.target : nullptr;
+                if (!target) break;
+                const char* spawn = m.spawn[0] ? m.spawn : "start";
+                std::snprintf((char*)(g_guest_memory + g_ss_targ_va), 127, "%s", target);
+                std::snprintf((char*)(g_guest_memory + g_ss_spwn_va), 63, "%s", spawn);
+                *(volatile int*)(g_guest_memory + g_ss_pend_va) = (m.a == 2) ? 2 : 1;
+                std::cout << "[Pod] Scene shift -> " << target << " @ "
+                          << spawn << " (mode " << ((m.a == 2) ? "forced" : "normal")
+                          << ")" << std::endl;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+// glReadPixels the finished back buffer (top-left origin RGBA), row-flip it and
+// publish to the shared-memory ring. Called on the game-loop thread right
+// before SwapWindow so the captured frame matches exactly what a visible
+// window would have shown (host overlays are disabled in pod mode).
+static void pod_publish_frame() {
+    if (!g_pod_enabled || !g_pod_ring) return;
+    const uint32_t w = (uint32_t)g_draw_w;
+    const uint32_t h = (uint32_t)g_draw_h;
+    if (!w || !h) return;
+    const size_t bytes = (size_t)w * h * 4;
+    if (g_pod_rgba.size() != bytes) {
+        g_pod_rgba.resize(bytes);
+    }
+    std::vector<uint8_t> raw(bytes);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+    // OpenGL rows are bottom-up; ruby expects top-down like a normal image.
+    const uint32_t stride = w * 4;
+    uint8_t* dst = g_pod_rgba.data();
+    for (uint32_t row = 0; row < h; ++row) {
+        std::memcpy(dst + (h - 1 - row) * stride,
+                    raw.data() + row * stride, stride);
+    }
+    g_pod_ring->publish(dst, w, h);
+    static uint64_t s_fps_frames = 0;
+    static Uint64 s_fps_last = 0;
+    s_fps_frames++;
+    Uint64 now = SDL_GetTicks();
+    if (!s_fps_last) s_fps_last = now;
+    if (now - s_fps_last >= 1000) {
+        g_pod_ring->set_fps((uint32_t)(s_fps_frames * 1000u / (uint32_t)(now - s_fps_last)));
+        s_fps_frames = 0;
+        s_fps_last = now;
+    }
+}
+
+// ── Env-gated frame capture ───────────────────────────────────────────────────
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+// SWORDIGO_CAPTURE_FRAMES=<n>  write the first n presented frames
+// SWORDIGO_CAPTURE_DIR=<path>  destination (default /tmp/swordigo-capture)
+// SWORDIGO_CAPTURE_EVERY=<n>   capture one frame out of every n (default 1)
+// SWORDIGO_CAPTURE_EMU_START=<n>
+//     Only start capturing once the *emulated* frame counter reaches n, and
+//     name the files emu_<counter>_<i>.ppm. This is what makes an A/B honest:
+//     the emulator runs as fast as it can, so two runs reach the same emulated
+//     frame at different wall-clock times, but the game state at a given
+//     emulated frame is reproducible. Presented-frame counting cannot align
+//     two runs (a translated frame is ~3x faster, so it drifts away).
+//
+// This exists so a renderer change can be A/B'd against vanilla by diffing
+// real pixels instead of by looking at the screen and hoping. It reads the
+// finished back buffer right before swap, exactly like pod_publish_frame.
+int g_emu_frame_now = 0;   // set by the frame loops right before presenting
+
+static void maybe_capture_frame() {
+    static int remaining = -1;
+    static int index = 0;
+    static int every = 1;
+    static int emu_start = -2;
+    static std::string dir;
+    if (remaining < 0) {
+        const char* n = getenv("SWORDIGO_CAPTURE_FRAMES");
+        remaining = n ? atoi(n) : 0;
+        const char* d = getenv("SWORDIGO_CAPTURE_DIR");
+        dir = d ? d : "/tmp/swordigo-capture";
+        const char* e = getenv("SWORDIGO_CAPTURE_EVERY");
+        every = e ? atoi(e) : 1;
+        if (every < 1) every = 1;
+        const char* s = getenv("SWORDIGO_CAPTURE_EMU_START");
+        emu_start = s ? atoi(s) : -1;
+        if (remaining > 0) {
+#ifdef _WIN32
+            _mkdir(dir.c_str());
+#else
+            mkdir(dir.c_str(), 0755);
+#endif
+        }
+    }
+    if (remaining <= 0) return;
+    if (emu_start >= 0 && g_emu_frame_now < emu_start) return;
+    static int tick = 0;
+    if ((tick++ % every) != 0) return;
+
+    const uint32_t w = (uint32_t)g_draw_w;
+    const uint32_t h = (uint32_t)g_draw_h;
+    if (!w || !h) return;
+
+    std::vector<uint8_t> raw((size_t)w * h * 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+
+    const std::string path = dir + "/" +
+        (emu_start >= 0 ? ("emu_" + std::to_string(g_emu_frame_now) + "_" + std::to_string(index))
+                        : ("frame_" + std::to_string(index))) + ".ppm";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f) {
+        fprintf(f, "P6\n%u %u\n255\n", w, h);
+        std::vector<uint8_t> row((size_t)w * 3);
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t* src = raw.data() + (size_t)(h - 1 - y) * w * 4;
+            for (uint32_t x = 0; x < w; ++x) {
+                row[x * 3 + 0] = src[x * 4 + 0];
+                row[x * 3 + 1] = src[x * 4 + 1];
+                row[x * 3 + 2] = src[x * 4 + 2];
+            }
+            fwrite(row.data(), 1, row.size(), f);
+        }
+        fclose(f);
+        std::cout << "[Capture] wrote " << path << " (" << w << "x" << h << ")" << std::endl;
+    }
+    index++;
+    remaining--;
+}
+
+// Direct pod touch injection (defined after g_emulator_64 is declared).
+static void pod_touch_direct(int action, int finger_id,
+                             float nx, float ny, float ndx, float ndy);
+
+// Convenience: synthesize a pod key/mouse message from normalized Qt coords.
+// (Only used host-side in ruby — see ruby/emulator/engine_pod.cpp.)
+
+// =========================================================================
+// Render Resolution Preset System
+// =========================================================================
+// The game renders to an internal FBO at GAME_W×GAME_H, then blits it to the
+// window. Reducing GAME_W×GAME_H cuts GPU fragment load proportionally.
+// setApplicationViewSize must be re-called to tell the game engine the new
+// viewport so its camera and UI layout update correctly.
+// =========================================================================
+
+// These are stored after boot so apply_render_preset() can re-call the JNI fn.
+uint64_t g_setApplicationViewSize_addr = 0;
+uint64_t g_apply_viewsize_env_ptr = 0;
+int      g_render_preset = 0; // 0=1080p, 1=720p, 2=540p, 3=Window
+
+// Call after changing g_render_preset to rebuild the FBO and notify the engine.
+// Safe to call from the frame loop (between drawApp calls).
+void apply_render_preset(int preset) {
+    struct Preset { int w, h; const char* label; };
+    // Indices must match the GUI's ResPreset.idx values exactly.
+    // Preset 3 uses current window size — filled in below.
+    static const Preset presets[] = {
+        /* 0  */ { 1920, 1080, "1080p"          },
+        /* 1  */ { 1280,  720, "720p"           },
+        /* 2  */ {  960,  544, "540p (native)"  },
+        /* 3  */ {    0,    0, "Window"         },
+        /* 4  */ {    0,    0, "(reserved)"     },
+        /* 5  */ {    0,    0, "(reserved)"     },
+        /* 6  */ {    0,    0, "(reserved)"     },
+        /* 7  */ {    0,    0, "(reserved)"     },
+        /* 8  */ {    0,    0, "(reserved)"     },
+        /* 9  */ { 2560, 1440, "1440p"          },
+        /* 10 */ { 3840, 2160, "4K"             },
+        /* 11 */ { 1600,  900, "900p"           },
+        /* 12 */ { 1366,  768, "768p"           },
+        /* 13 */ { 1024,  600, "600p"           },
+        /* 14 */ {  854,  480, "480p"           },
+        /* 15 */ {  640,  360, "360p"           },
+        /* 16 */ {  426,  240, "240p"           },
+        /* 17 */ { 1920, 1200, "WUXGA 1920x1200"},
+        /* 18 */ { 1440,  900, "1440x900"       },
+        /* 19 */ { 1280,  800, "1280x800"       },
+        /* 20 */ { 3440, 1440, "UWQHD 3440x1440"},
+        /* 21 */ { 2560, 1080, "UWHD 2560x1080" },
+        /* 22 */ { 3840, 1600, "UWQHD+ 3840x1600"},
+        /* 23 */ { 2880, 1800, "Retina 2880x1800"},
+        /* 24 */ { 1680, 1050, "WSXGA+ 1680x1050"},
+        /* 25 */ { 1280, 1024, "SXGA 1280x1024" },
+        /* 26 */ { 1024,  768, "XGA 1024x768"   },
+    };
+    static const int num_presets = (int)(sizeof(presets)/sizeof(presets[0]));
+
+    if (preset < 0 || preset >= num_presets) {
+        std::cout << "[RenderPreset] Unknown preset index " << preset << " — ignored\n";
+        return;
+    }
+
+    extern int g_win_w, g_win_h;
+    extern void fbo_destroy();
+    extern bool fbo_init(int game_w, int game_h);
+    extern IEmulatorArm64* g_emulator_64;
+
+    int new_w = presets[preset].w;
+    int new_h = presets[preset].h;
+    if (preset == 3) { new_w = g_win_w; new_h = g_win_h; }   // "Window" = match output
+    if (new_w < 320) new_w = 320;
+    if (new_h < 180) new_h = 180;
+    // Align to even dimensions (required by some FBO formats)
+    new_w &= ~1;
+    new_h &= ~1;
+
+    GAME_W = new_w;
+    GAME_H = new_h;
+    TOUCH_SCALE_X = (float)GAME_W / 960.0f;
+    TOUCH_SCALE_Y = (float)GAME_H / 544.0f;
+    g_render_preset = preset;
+
+    // Rebuild FBO at new resolution
+    fbo_destroy();
+    fbo_init(GAME_W, GAME_H);
+
+    // Notify game engine of new viewport
+    if (g_setApplicationViewSize_addr && g_apply_viewsize_env_ptr && g_emulator_64) {
+        g_emulator_64->call(g_setApplicationViewSize_addr,
+                            {g_apply_viewsize_env_ptr, 0,
+                             (uint64_t)GAME_W, (uint64_t)GAME_H, 1});
+    }
+    std::cout << "[RenderPreset] Changed to " << presets[preset].label
+              << " (" << GAME_W << "x" << GAME_H << ")" << std::endl;
+}
+
+// Add a specific area for guest-side global variables (libc stuff)
+const uint32_t GUEST_GLOBALS_BASE = 0x50000; 
+const uint32_t GUEST_GLOBALS_SIZE = 0x1000; 
+
+// ARM32 subsystem
+so_module g_main_mod;
+ElfLoader* g_loader = nullptr;
+JniBridge g_bridge;
+Emulator* g_emulator = nullptr;
+
+// ARM64 subsystem
+so_module_arm64 g_main_mod_64;
+so_module_arm64 g_sre_mod;
+so_module_arm64 g_sre_extras_mod;   // optional libsre-extras.so (closed-source addon)
+bool g_sre_extras_loaded = false;   // true when libsre-extras.so was loaded
+ElfLoaderArm64* g_loader_64 = nullptr;
+std::string g_boot_scene = "";
+
+// Normalize host paths to forward slashes before writing them into guest VFS
+// globals. The guest SRE code does literal '/' string matching (e.g.
+// strstr(base, "/assets"), MiniPath "/Files/", "/Cache/" prefixes) and builds
+// paths by concatenating with '/'. Windows backslash paths (C:\\Users\...)
+// silently break every one of those checks, which on Windows manifests as
+// scene-load asset misses -> black screen. Windows fopen/fs accept '/' natively.
+static std::string sre_normalize_vfs_path(const std::string& p) {
+    std::string out = p;
+    for (auto& c : out) if (c == '\\') c = '/';
+    return out;
+}
+JniBridge64 g_bridge_64;
+IEmulatorArm64* g_emulator_64 = nullptr;
+
+// =========================================================================
+// Guest Native Mod Library Loader (Lawncher mod parity)
+// =========================================================================
+struct GuestModInfo {
+    std::string mod_id;
+    std::string filename;
+    std::string full_path;
+    so_module_arm64* mod = nullptr;
+    uint64_t mod_init_addr = 0;
+    uint64_t unload_mod_addr = 0;
+};
+
+static std::vector<GuestModInfo> s_loaded_guest_mods;
+extern std::vector<so_module_arm64*> g_mod_libraries_64;
+
+std::vector<std::string> get_loaded_guest_mod_libs() {
+    std::vector<std::string> res;
+    for (const auto& m : s_loaded_guest_mods) {
+        res.push_back(m.filename);
+    }
+    return res;
+}
+
+void unload_guest_mod_libraries() {
+    if (s_loaded_guest_mods.empty()) return;
+    std::cout << "[ModLoader] Unloading " << s_loaded_guest_mods.size() << " guest mod library(ies)..." << std::endl;
+
+    for (auto it = s_loaded_guest_mods.rbegin(); it != s_loaded_guest_mods.rend(); ++it) {
+        if (it->unload_mod_addr != 0 && g_emulator_64) {
+            std::cout << "[ModLoader] Calling unload_mod() for " << it->filename 
+                      << " at 0x" << std::hex << it->unload_mod_addr << std::dec << std::endl;
+            g_emulator_64->call(it->unload_mod_addr, {});
+        }
+    }
+
+    if (g_loader_64 && g_emulator_64) {
+        uint64_t del_hooks_fn = g_loader_64->get_symbol_vaddr(&g_sre_mod, "hook_delete_mod_hooks");
+        if (del_hooks_fn) {
+            g_emulator_64->call(del_hooks_fn, {});
+        }
+    }
+
+    for (auto& info : s_loaded_guest_mods) {
+        if (info.mod) {
+            delete info.mod;
+            info.mod = nullptr;
+        }
+    }
+    s_loaded_guest_mods.clear();
+    g_mod_libraries_64.clear();
+    std::cout << "[ModLoader] Guest mod libraries unloaded" << std::endl;
+}
+
+extern "C" int swordi_abi;
+
+void load_guest_mod_libraries(const std::string& mod_id) {
+    unload_guest_mod_libraries();
+    if (swordi_abi != 13) {
+        std::cout << "[ModLoader] Native .so mod loading skipped (ABI " << swordi_abi 
+                  << " does not support native guest mods; only ABI 13 / v1.4.13 is supported)" << std::endl;
+        return;
+    }
+    if (mod_id.empty() || !g_loader_64 || !g_emulator_64) return;
+
+    // Synchronize active mod name to guest SRE
+    uint64_t set_mod_fn = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre13_set_active_mod");
+    if (set_mod_fn) {
+        uint64_t str_buf_g = 0x48f00;
+        strncpy((char*)(g_guest_memory + str_buf_g), mod_id.c_str(), 127);
+        g_guest_memory[str_buf_g + 127] = '\0';
+        g_emulator_64->call(set_mod_fn, {str_buf_g});
+        std::cout << "[ModLoader] Synchronized active mod to guest SRE: \"" << mod_id << "\"" << std::endl;
+    }
+
+    std::string data_dir = get_user_data_dir();
+    std::vector<std::string> search_dirs = {
+        data_dir + "mods/" + mod_id + "/libraries/arm64-v8a",
+        data_dir + "mods/" + mod_id + "/libraries",
+        std::string("mods/") + mod_id + "/libraries/arm64-v8a",
+        std::string("mods/") + mod_id + "/libraries"
+    };
+
+    std::string lib_dir;
+    for (const auto& d : search_dirs) {
+        std::error_code ec;
+        if (fs::exists(d, ec) && fs::is_directory(d, ec)) {
+            lib_dir = d;
+            break;
+        }
+    }
+
+    if (lib_dir.empty()) {
+        std::cout << "[ModLoader] No native libraries directory for mod '" << mod_id << "'" << std::endl;
+        return;
+    }
+
+    std::cout << "[ModLoader] Loading native mod libraries from: " << lib_dir << std::endl;
+    static uint64_t s_next_mod_base = 0x2800000;
+
+    uint64_t hook_begin_fn = g_loader_64->get_symbol_vaddr(&g_sre_mod, "hook_begin_mod_capture");
+    if (hook_begin_fn) {
+        g_emulator_64->call(hook_begin_fn, {});
+    }
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(lib_dir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        std::string path = entry.path().string();
+        std::string filename = entry.path().filename().string();
+        if (filename.length() < 4 || filename.substr(filename.length() - 3) != ".so") continue;
+
+        std::cout << "[ModLoader] Loading guest mod library: " << filename << " from " << path << std::endl;
+        so_module_arm64* mod_entry = new so_module_arm64();
+
+        uint64_t load_addr = s_next_mod_base;
+        int ret = g_loader_64->load(mod_entry, path, load_addr);
+        if (ret != 0) {
+            std::cerr << "[ModLoader] Failed to load " << filename << " (error " << ret << ")" << std::endl;
+            delete mod_entry;
+            continue;
+        }
+
+        s_next_mod_base += ((mod_entry->mem_size + 0xFFFF) & ~0xFFFF) + 0x10000;
+
+        g_loader_64->relocate(mod_entry);
+        g_loader_64->resolve_all_to_bridge(mod_entry, &g_bridge_64, GUEST_GLOBALS_BASE);
+        g_mod_libraries_64.push_back(mod_entry);
+
+        if (mod_entry->init_array_vaddr != 0 && mod_entry->init_array_size > 0) {
+            int init_count = (int)(mod_entry->init_array_size / 8);
+            uint64_t* init_array = (uint64_t*)(g_guest_memory + mod_entry->init_array_vaddr);
+            for (int i = 0; i < init_count; i++) {
+                if (init_array[i] != 0) {
+                    g_emulator_64->call(init_array[i], {});
+                }
+            }
+        }
+
+        GuestModInfo info;
+        info.mod_id = mod_id;
+        info.filename = filename;
+        info.full_path = path;
+        info.mod = mod_entry;
+        info.mod_init_addr = g_loader_64->get_symbol_vaddr(mod_entry, "mod_init");
+        info.unload_mod_addr = g_loader_64->get_symbol_vaddr(mod_entry, "unload_mod");
+
+        if (info.mod_init_addr != 0) {
+            std::cout << "[ModLoader] Calling mod_init() for " << filename 
+                      << " at 0x" << std::hex << info.mod_init_addr << std::dec << std::endl;
+            g_emulator_64->call(info.mod_init_addr, {});
+        }
+
+        s_loaded_guest_mods.push_back(info);
+        std::cout << "[ModLoader] Successfully loaded and initialized " << filename << " (mod: " << mod_id << ")" << std::endl;
+    }
+
+    uint64_t hook_end_fn = g_loader_64->get_symbol_vaddr(&g_sre_mod, "hook_end_mod_capture");
+    if (hook_end_fn) {
+        g_emulator_64->call(hook_end_fn, {});
+    }
+}
+
+// =========================================================================
+// Direct pod touch injection (Ruby GG dock)
+//
+// The preview's taps arrive as normalized pod touch messages. We dispatch them
+// straight into the ARM64 guest's handleTouchEvent — the exact same AAPCS64
+// call the gamepad/mouse paths use — instead of round-tripping through
+// SDL_PushEvent -> SDL_PollEvent -> event filtering, which can silently swallow
+// synthetic finger events in hidden-window pod mode. This mirrors call_touch_64
+// inside the ARM64 game loop.
+// =========================================================================
+static uint64_t g_touch_64_handle = 0;   // Java_..._handleTouchEvent (ARM64 guest)
+
+static void pod_touch_direct(int action, int finger_id,
+                             float nx, float ny, float ndx, float ndy) {
+    if (!g_pod_enabled) return;
+    if (!g_touch_64_handle || !g_emulator_64 || !g_guest_memory) return;
+    extern volatile int g_sre_controls_disabled;
+    if (g_sre_controls_disabled) return;
+    // Never feed touch into an already-faulted guest.
+    if (g_emulator_64->has_faulted()) return;
+
+    // Normalized (top-left origin) -> legacy 960x544 space, y-up, exactly as
+    // the SDL finger handler does, then scaled to the current render preset.
+    float x     = nx * 960.0f;
+    float y     = (1.0f - ny) * 544.0f;
+    float old_x = (nx - ndx) * 960.0f;
+    float old_y = (1.0f - (ny - ndy)) * 544.0f;
+    x     *= TOUCH_SCALE_X;  y     *= TOUCH_SCALE_Y;
+    old_x *= TOUCH_SCALE_X;  old_y *= TOUCH_SCALE_Y;
+
+    double time_val = (double)SDL_GetTicks() / 1000.0;
+    const int tap = (action == 1 || action == 2) ? 1 : 0;
+
+    g_emulator_64->set_dreg(0, time_val);
+    g_emulator_64->set_sreg(1, x);
+    g_emulator_64->set_sreg(2, y);
+    g_emulator_64->set_sreg(3, old_x);
+    g_emulator_64->set_sreg(4, old_y);
+    // env=0x10000 (fake JNI env), obj=0, action, id, tapCount
+    g_emulator_64->call(g_touch_64_handle,
+                        {0x10000ULL, 0, (uint64_t)action,
+                         (uint64_t)finger_id, (uint64_t)tap});
+}
+
+// Architecture flag — set during boot based on selected binary
+bool g_is_arm64 = false;
+bool g_use_dynarmic = true;   // Dynarmic JIT is the permanent default backend
+bool g_use_sre = true;        // Set via launcher or --no-sre
+bool g_advanced_redstell_opts = false; // Advanced Redstell Optimisations (off by default)
+uint64_t g_sre_profile_addr = 0;
+
+// Global Swordigo ABI version: 12 for 1.4.12, 13 for 1.4.13
+extern "C" int swordi_abi = 12;
+
+// Memory research live root pointers (defined in emulator.cpp)
+extern uint32_t g_game_scene_controller;
+extern uint32_t g_hero_obj;
+extern uint32_t g_hero_char_ctrl_comp;
+extern uint32_t g_hero_health_comp;
+extern uint32_t g_hero_mana_comp;
+
+// =========================================================================
+// Crash-Report-03 Render-Guard Globals
+//
+// g_sre_text_base / g_sre_text_end:
+//   Guest VA bounds of libswordigo.so's .text section.
+//   Populated from g_main_mod_64.text_base + text_size after ELF load.
+//   Used by is_valid_exec_pc() in emulator_dynarmic64.cpp to detect corrupted
+//   link-register returns that land in alignment padding (non-4-byte-aligned
+//   addresses or addresses between functions).
+//
+// g_sre_render_recovery_active / g_sre_render_recovery_jmp:
+//   Set by sre_render_guard_begin() in sre_init.c before CaverShell::Render.
+//   Cleared by sre_render_guard_end() after Render returns.
+//   When the emulator detects a bad PC during a render frame, it calls
+//   sre_longjmp(g_sre_render_recovery_jmp, 2) to skip the broken frame and
+//   return control to the game loop cleanly.
+// =========================================================================
+uint64_t g_sre_text_base = 0;          // libswordigo executable segment start
+uint64_t g_sre_text_end  = 0;          // libswordigo executable segment end
+// libswordigo .dynstr STRTAB byte range (never executable). The RenderGuard
+// treats a code fetch here as a corrupted branch/return target and recovers,
+// because .dynstr lives INSIDE the executable PT_LOAD segment so the coarse
+// [text_base,text_end) range alone cannot exclude it.
+uint64_t g_sre_dynstr_base = 0;
+uint64_t g_sre_dynstr_end  = 0;
+uint64_t g_sre_runtime_text_base = 0;  // libsre executable segment start
+uint64_t g_sre_runtime_text_end  = 0;  // libsre executable segment end
+int      g_sre_render_recovery_active = 0;
+void*    g_sre_render_recovery_jmp    = nullptr;
+uint64_t g_sre_vfs_profile_addr = 0;
+std::string g_launcher_selected_mod;  // mod id selected by launcher UI, passed to VFS pre-init
+GuiRenderer g_gui;
+SrtOverlay g_srt_overlay;
+InputConfig g_input_config;
+SDL_Gamepad* g_gamepad = nullptr;
+FBOScale g_fbo_mode = FBOScale::SHARP_BILINEAR;
+PostFXState g_postfx;
+// Legacy mirror of the render pipeline default. The authoritative boot path is
+// postfx_apply_boot_defaults() (called right after fbo_init); this enum is kept
+// in sync because the N-key time-of-day cycle and the settings panel both start
+// from it. It used to be OFF, which is what desynced the F6 menu from the
+// renderer - see the comment on postfx_apply_boot_defaults() in fbo_scaler.cpp.
+PostFXPreset g_postfx_preset = PostFXPreset::SW_PLUS_MEDIUM;
+SkyRenderer g_sky;
+SwordfareGUI g_swordfare_gui;  /* Swordfare: ImGui in-game overlay */
+
+// Direct control native symbol addresses
+uint64_t g_vaddr_StartMovingToDirection = 0;
+uint64_t g_vaddr_StopMovingToDirection = 0;
+uint64_t g_vaddr_StartJumping = 0;
+uint64_t g_vaddr_StopJumping = 0;
+uint64_t g_vaddr_Swing = 0;
+uint64_t g_vaddr_StopSwing = 0;
+uint64_t g_vaddr_Use = 0;
+uint64_t g_vaddr_BeginCasting = 0;
+static inline bool is_valid_guest_ptr(uint64_t ptr) {
+    return ptr >= 0x10000 && ptr < 0x80000000ULL;
+}
+uint64_t g_vaddr_sre_gamesceneview_ptr = 0;
+
+
+// Graphics API selection (enum defined in vulkan_backend.h)
+GraphicsAPI g_graphics_api = GraphicsAPI::OPENGL;
+#ifdef VULKAN_BACKEND
+VulkanBackend g_vk_backend;
+#endif
+
+// Binary selection system
+BinarySelector g_binary_selector;
+
+// ============================================================
+//  SRE Lua Console — Execute Lua code inside the running engine
+// ============================================================
+static uint64_t g_lua_console_buf_addr = 0;       // Guest addr of SRE's command buffer
+static uint64_t g_lua_console_result_addr = 0;    // Guest addr of SRE's result buffer
+static uint64_t g_lua_console_pending_addr = 0;   // Guest addr of pending flag
+static uint64_t g_lua_console_status_addr = 0;    // Guest addr of status (0=idle,1=ok,2=err)
+static uint64_t g_lua_console_print_addr = 0;     // Guest addr of captured print() output
+static bool     g_lua_console_ready = false;       // true when all addrs resolved
+// NOTE: console open state + history now owned by SwordfareGUI (draw_lua_console)
+static uint64_t g_sre_game_notification_addr = 0;
+static uint64_t g_sre_game_notification_pending_addr = 0;
+
+static bool should_block_keyboard() {
+    if (g_graphics_api != GraphicsAPI::OPENGL) return false;
+    if (ImGui::GetCurrentContext() == nullptr) return false;
+    ImGuiIO& io = ImGui::GetIO();
+    return io.WantCaptureKeyboard || 
+           g_swordfare_gui.is_mod_overlay_visible() || 
+           g_swordfare_gui.is_research_overlay_visible() ||
+           g_swordfare_gui.is_visible() || 
+           g_swordfare_gui.is_lua_console_open();
+}
+
+// SRE lua_resume error monitoring — guest addresses
+static uint64_t g_sre_resume_err_count_addr = 0;
+static uint64_t g_sre_resume_last_err_addr = 0;
+static int g_sre_resume_err_last_seen = 0;  // host-side last read value
+
+// SRE lua_call_safe error monitoring — guest addresses
+static uint64_t g_sre_lua_error_buf_addr = 0;
+static uint64_t g_sre_lua_error_count_addr = 0;
+static int g_sre_lua_error_last_seen = 0;
+
+// SRE __cxa_throw caller diagnostics — guest addresses
+static uint64_t g_sre_cxa_caller_addr = 0;     // addr of g_sre_cxa_throw_caller
+static uint64_t g_sre_cxa_unrecovered_addr = 0; // addr of g_sre_cxa_throw_unrecovered
+static int g_sre_cxa_last_seen = 0;
+
+// Player position guest addresses for GLES2 lighting
+uint64_t g_sre_hero_pos_x_addr = 0;
+uint64_t g_sre_hero_pos_y_addr = 0;
+uint64_t g_sre_hero_pos_z_addr = 0;
+
+static uint64_t g_sre_cam_x_addr = 0;
+static uint64_t g_sre_cam_y_addr = 0;
+static uint64_t g_sre_cam_z_addr = 0;
+static uint64_t g_sre_z_walk_axis_addr = 0;
+static uint64_t g_sre_x_walk_axis_addr = 0;
+static uint64_t g_sre_zwalk_f5l_addr = 0;  // g_sre_zwalk_f5l (WASD-mode latch)
+static uint64_t g_sre_host_dt_addr = 0;    // g_sre_host_dt (frame dt for z-walk)
+
+// SRE Background Renderer — guest addresses
+static uint64_t bg_mode_addr = 0;       // Guest addr of g_sre_bg_mode
+static uint64_t bg_brightness_addr = 0; // Guest addr of g_sre_bg_brightness
+static uint64_t bg_depth_addr = 0;      // Guest addr of g_sre_bg_depth
+static uint64_t bg_scale_addr = 0;      // Guest addr of g_sre_bg_scale
+static uint64_t bg_cam_z_addr = 0;      // Guest addr of g_sre_bg_cam_z
+
+// SRE Effect hooks — guest addresses
+static uint64_t portal_active_addr = 0;
+static uint64_t portal_x_addr = 0;
+static uint64_t portal_y_addr = 0;
+static uint64_t portal_z_addr = 0;
+static uint64_t portal_count_addr = 0;
+static uint64_t portal_color_r_addr = 0;
+static uint64_t portal_color_g_addr = 0;
+static uint64_t portal_color_b_addr = 0;
+static uint64_t portal_vp_matrix_addr = 0;  // 16 floats — VP matrix for screen positioning
+static uint64_t effect_frame_reset_addr = 0;
+
+// SRE Music — guest addresses for command interface
+static uint64_t sre_music_load_name_addr = 0;    // char[256] — music name to load
+static uint64_t sre_music_load_pending_addr = 0;  // int — 1 = load requested
+static uint64_t sre_music_play_pending_addr = 0;  // int — 1 = play requested
+static uint64_t sre_music_pause_pending_addr = 0; // int — 1 = pause requested
+static uint64_t sre_music_stop_pending_addr = 0;  // int — 1 = stop requested
+static uint64_t sre_music_volume_addr = 0;        // float — current volume
+static uint64_t sre_music_volume_dirty_addr = 0;  // int — 1 = volume changed
+static uint64_t sre_music_master_volume_addr = 0; // float — guest s_master_volume reference
+static uint64_t sre_music_looping_addr = 0;       // int — looping flag
+static uint64_t sre_music_looping_dirty_addr = 0; // int — 1 = looping changed
+
+// SRE LNI — guest addresses for command interface
+static uint64_t sre_lni_command_addr = 0;
+static uint64_t sre_lni_arg1_addr = 0;
+static uint64_t sre_lni_arg2_addr = 0;
+static uint64_t sre_lni_pending_addr = 0;
+static uint64_t sre_controls_hidden_addr = 0;
+
+// Host-side music ducking — triggered by 0item.wav asset loading
+// When the engine loads this SFX (boss kill, XP sack), we duck the
+// background music volume: fade down → hold low → fade back up.
+#define DUCK_FADE_DOWN_TIME  2.0f    // seconds to fade volume down
+#define DUCK_HOLD_TIME       7.0f    // seconds to hold at low volume
+#define DUCK_FADE_UP_TIME    3.0f    // seconds to fade volume back up
+#define DUCK_LOW_VOLUME      0.15f   // volume floor during ducking (15%)
+int   g_music_duck_trigger = 0;      // set to 1 by bridge — starts ducking
+static int   s_duck_phase = 0;       // 0=off, 1=fading down, 2=holding, 3=fading up
+static float s_duck_timer = 0.0f;    // time remaining in current phase
+static float s_duck_volume = 1.0f;   // current ducking multiplier (0..1)
+
+// SRE GUI — player stats (read from GameState via GameSceneView::Update hook)
+static uint64_t sre_player_hp_addr = 0;         // int — current HP
+static uint64_t sre_player_max_hp_addr = 0;     // int — max HP (computed: level*2+4)
+static uint64_t sre_player_mana_addr = 0;       // int — current mana
+static uint64_t sre_player_max_mana_addr = 0;   // int — max mana (computed: level*20+10)
+static uint64_t sre_player_coins_addr = 0;      // int — coins
+static uint64_t sre_player_xp_addr = 0;         // int — experience points
+static uint64_t sre_player_level_addr = 0;       // int — experience level
+static uint64_t sre_player_atk_level_addr = 0;   // int — attack attribute
+static uint64_t sre_gui_scene_active_addr = 0;  // int — 1 when scene is active
+static uint64_t sre_gamestate_ptr_addr = 0;      // uint64_t — guest ptr to GameState
+static uint64_t sre_menu_active_addr = 0;        // int — bitfield, nonzero = menu open
+static uint64_t sre_text_input_active_addr = 0;  // int — nonzero = SRE text input active
+static uint64_t g_vaddr_sre_text_input_init_val = 0; // char* — SRE text input initial value
+
+static uint64_t sre_hardmode_addr = 0;            // int — nonzero = hard mode (no frame cap, double-tick)
+
+// SRE Lua write-back — setters (SetLevel, SetExp, SetHealth, SetMana, SetCoins) store
+// their request here; the host game loop must poll and apply it to guest memory.
+static uint64_t sre_char_set_pending_addr = 0;   // int — nonzero when a Lua setter fired
+static uint64_t sre_char_set_field_addr   = 0;   // int — which field (1=level,2=exp,3=hp,4=mana,5=coins)
+static uint64_t sre_char_set_value_addr   = 0;   // int — the value to write
+
+static uint64_t sre_hero_obj_addr = 0;
+static uint64_t sre_hero_health_comp_addr = 0;
+static uint64_t sre_hero_mana_comp_addr = 0;
+
+// SRE Developer Overlays & Tools
+static uint64_t g_sre_toggle_debug_info_addr = 0;
+static uint64_t g_sre_toggle_collision_shapes_addr = 0;
+static uint64_t g_sre_toggle_combat_wireframe_addr = 0;
+
+void trigger_toggle_debug_info() {
+    if (g_sre_toggle_debug_info_addr && g_guest_memory) {
+        *(volatile int*)(g_guest_memory + g_sre_toggle_debug_info_addr) = 1;
+        mod_toast("Touch Foo Debug HUD toggled", 1.5f);
+        std::cout << "[Developer] Requested Touch Foo Debug Info HUD toggle" << std::endl;
+    } else {
+        std::cout << "[Developer] SRE debug info toggle symbol not available" << std::endl;
+    }
+}
+
+void trigger_toggle_collision_shapes() {
+    if (g_sre_toggle_collision_shapes_addr && g_guest_memory) {
+        *(volatile int*)(g_guest_memory + g_sre_toggle_collision_shapes_addr) = 1;
+        mod_toast("Collision Shapes toggled", 1.5f);
+        std::cout << "[Developer] Requested Collision Shapes toggle" << std::endl;
+    } else {
+        std::cout << "[Developer] SRE collision shapes toggle symbol not available" << std::endl;
+    }
+}
+
+void trigger_toggle_combat_wireframe() {
+    if (g_sre_toggle_combat_wireframe_addr && g_guest_memory) {
+        *(volatile int*)(g_guest_memory + g_sre_toggle_combat_wireframe_addr) = 1;
+        mod_toast("Combat Wireframe toggled", 1.5f);
+        std::cout << "[Developer] Requested Combat Wireframe toggle" << std::endl;
+    } else {
+        std::cout << "[Developer] SRE combat wireframe toggle symbol not available" << std::endl;
+    }
+}
+
+// SRE ButtonController — guest addresses and layout struct
+#define SRE_BTN_MAX       128
+#define SRE_BTN_ID_LEN    32
+#define SRE_BTN_LABEL_LEN 64
+
+struct SreBtnSlot;
+static bool simulate_virtual_key(const char* label, bool is_down);
+
+struct SreBtnSlot {
+    char     id[SRE_BTN_ID_LEN];       /* Lua string ID */
+    char     label[SRE_BTN_LABEL_LEN]; /* Display text */
+    float    x, y;                      /* Normalized position (0-1) */
+    float    w, h;                      /* Normalized dimensions (base-relative) */
+    float    alpha;                     /* Overall alpha 0-255 */
+    float    scale_x, scale_y;         /* Scaling factors */
+    int      text_color;               /* Packed ARGB */
+    float    text_scale;               /* Text size multiplier */
+    int      bg_alpha;                 /* Background alpha (0-255) */
+    int      hidden;                   /* Per-button hidden flag */
+    int      clickable;                /* Whether it accepts clicks */
+    int      movable;                  /* Can be dragged */
+    int      snapback;                 /* Returns to original pos on release */
+    float    home_x, home_y;           /* Original position (for snapback) */
+    int      padding_l, padding_t, padding_r, padding_b;
+    int      alignment;                /* Text alignment / gravity */
+    char     overlay_id[SRE_BTN_ID_LEN]; /* Belongs to overlay */
+    int      confined;                  /* Confined to overlay bounds */
+    /* ---- STATE (written by host, read by SRE) ---- */
+    volatile int pressed;              /* Host writes: 1=down, 0=up */
+    volatile int released;             /* Host writes: 1 on release */
+    volatile int dragging;             /* Host writes: 1=dragging, 0=not */
+    volatile float cur_x, cur_y;       /* Current position (after drag) */
+    int      active;                   /* 1 = slot in use, 0 = free */
+    int      dirty;                    /* 1 = needs visual update by host */
+};
+
+#define SRE_OVERLAY_MAX 8
+struct SreOverlaySlot {
+    char     id[SRE_BTN_ID_LEN];
+    float    x, y;
+    float    w, h;
+    int      bg_color;
+    int      bg_alpha;
+    float    corner_radius;
+    int      hidden;
+    int      movable;
+    int      pinchable;
+    float    scale_factor;
+    int      pinching;
+    /* Separators inside overlay */
+    float    separators[8];
+    int      separator_count;
+    int      active;
+    int      dirty;
+};
+
+static uint64_t sre_btn_array_addr = 0;           // SreBtnSlot[SRE_BTN_MAX]
+static uint64_t sre_overlay_array_addr = 0;       // SreOverlaySlot[SRE_OVERLAY_MAX]
+static uint64_t sre_btn_globally_hidden_addr = 0;  // int — 1 = all buttons hidden
+
+static bool simulate_virtual_key(const char* label, bool is_down) {
+    if (!sre_btn_array_addr || !g_guest_memory) return false;
+    SreBtnSlot* buttons = (SreBtnSlot*)(g_guest_memory + sre_btn_array_addr);
+    bool found = false;
+    for (int i = 0; i < SRE_BTN_MAX; i++) {
+        if (buttons[i].active && !buttons[i].hidden) {
+            if (strcasecmp(buttons[i].label, label) == 0) {
+                found = true;
+                if (is_down) {
+                    if (buttons[i].pressed == 0) {
+                        buttons[i].pressed = 1;
+                        buttons[i].released = 0;
+                        buttons[i].dirty = 1;
+                    }
+                } else {
+                    if (buttons[i].pressed == 1) {
+                        buttons[i].pressed = 0;
+                        buttons[i].released = 1;
+                        buttons[i].dirty = 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+int g_sre_viewport_x = 0;
+int g_sre_viewport_y = 0;
+int g_sre_viewport_w = 960;
+int g_sre_viewport_h = 544;
+
+int g_sre_coin_limit = 9999; // Global coin limit variable referenced by loader patches
+volatile int g_sre_controls_disabled = 0; // Global controls disabled flag set by Lua UI API
+
+// PostFX auto-disable state — tracks what the user chose so we can restore
+static bool postfx_suppressed_by_menu = false;
+static PostFXPreset postfx_user_preset = PostFXPreset::OFF;
+static bool postfx_user_enabled = true;
+
+// SRE Music Host API — declared in jni_bridge_arm64.cpp
+extern bool sre_music_host_load(const std::string& name);
+extern void sre_music_host_play();
+extern void sre_music_host_pause();
+extern void sre_music_host_stop();
+extern void sre_music_host_set_volume(float vol);
+extern void sre_music_host_set_looping(bool loop);
+extern const std::string& sre_music_host_get_track();
+extern float sre_music_host_get_volume();
+extern bool sre_music_host_is_playing();
+
+// FWKeyboard API — resolved from game binary symbols
+// Using uint64_t to support both ARM32 and ARM64 address spaces
+static uint64_t g_fw_sharedKeyboard = 0;   // Caver::FWKeyboard::sharedKeyboard()
+static uint64_t g_fw_sendKeyDown = 0;       // Caver::FWKeyboard::SendKeyDownEvent(uint, uint, double)
+static uint64_t g_fw_sendKeyUp = 0;         // Caver::FWKeyboard::SendKeyUpEvent(uint, uint, double)
+static uint64_t g_fw_sendKeyChar = 0;       // Caver::FWKeyboard::SendKeyCharEvent(uint, double)
+static uint64_t g_fw_handleMenuBtn = 0;     // Java_com_touchfoo_swordigo_Native_handleMenuButtonPress
+static bool g_typing_mode = false;          // F6 toggle: keyboard sends FWKeyboard events
+
+// Text input system — game calls startTextInput/stopTextInput via JNI,
+// we route SDL text events back to the game via textInputTextDidChange/textInputDidFinish
+static uint64_t g_fw_textInputDidChange = 0; // Java_com_touchfoo_swordigo_Native_textInputTextDidChange
+static uint64_t g_fw_textInputDidFinish = 0; // Java_com_touchfoo_swordigo_Native_textInputDidFinish
+extern bool g_text_input_active;             // Defined in jni_bridge.cpp
+extern std::string g_text_input_buffer;      // Defined in jni_bridge.cpp
+static bool g_text_input_was_active = false;  // Previous frame state for edge detection
+
+extern std::string g_save_dir;  // Defined in jni_bridge.cpp
+extern bool g_gl_hide_hud;      // Defined in jni_bridge.cpp — hides HUD draw calls
+extern int g_death_detected_countdown;  // Defined in jni_bridge.cpp
+std::string g_cache_dir;
+
+#include "platform/data_path.h"  // get_data_path() — implemented in data_path.cpp
+
+void call_handle_touch_event(uint32_t addr, uint32_t env, uint32_t obj, int action, int id, double time_val, float x, float y, float old_x, float old_y, int tap_count) {
+    if (addr == 0) return;
+    
+    // Check if touch input is disabled globally by Lua scripts (e.g. UI active)
+    extern volatile int g_sre_controls_disabled;
+    if (g_sre_controls_disabled) {
+        return;
+    }
+    
+    // Auto-scale from legacy 960×544 touch space to actual game resolution
+    x     *= TOUCH_SCALE_X;  y     *= TOUCH_SCALE_Y;
+    old_x *= TOUCH_SCALE_X;  old_y *= TOUCH_SCALE_Y;
+
+    // Save current SP
+    uint32_t old_sp = g_emulator->get_reg(13);
+    
+    // Allocate stack space (aligned to 8 bytes)
+    uint32_t new_sp = old_sp - 32;
+    g_emulator->set_reg(13, new_sp);
+    
+    // Write stack arguments to guest memory
+    uint8_t* memory = g_emulator->get_memory_base();
+    *(double*)(memory + new_sp + 0) = time_val;
+    *(float*)(memory + new_sp + 8) = x;
+    *(float*)(memory + new_sp + 12) = y;
+    *(float*)(memory + new_sp + 16) = old_x;
+    *(float*)(memory + new_sp + 20) = old_y;
+    *(uint32_t*)(memory + new_sp + 24) = tap_count;
+    
+    // R0-R3 registers
+    g_emulator->set_reg(0, env);
+    g_emulator->set_reg(1, obj);
+    g_emulator->set_reg(2, action);
+    g_emulator->set_reg(3, id);
+    
+    // Run guest function
+    g_emulator->run(addr);
+    
+    // Restore SP
+    g_emulator->set_reg(13, old_sp);
+}
+
+// Get FWKeyboard singleton pointer from the game engine
+static uint32_t get_fw_keyboard() {
+    if (!g_fw_sharedKeyboard) return 0;
+    g_emulator->run(g_fw_sharedKeyboard);
+    return g_emulator->get_reg(0);  // Returns FWKeyboard* in R0
+}
+
+// Call FWKeyboard::SendKeyDownEvent(keyCode, modifiers, timestamp) or SendKeyUpEvent
+// ARM32 AAPCS: this=R0, keyCode=R1, modifiers=R2, double timestamp → aligned to stack
+static void call_fw_key_event(uint32_t func_addr, uint32_t keyboard_ptr, uint32_t keyCode, uint32_t modifiers, double timestamp) {
+    if (!func_addr || !keyboard_ptr) return;
+    
+    uint32_t old_sp = g_emulator->get_reg(13);
+    uint32_t new_sp = (old_sp - 16) & ~7;  // 8-byte aligned
+    g_emulator->set_reg(13, new_sp);
+    
+    uint8_t* memory = g_emulator->get_memory_base();
+    // double on stack (R3 skipped for 8-byte alignment)
+    *(double*)(memory + new_sp) = timestamp;
+    
+    g_emulator->set_reg(0, keyboard_ptr);  // this
+    g_emulator->set_reg(1, keyCode);
+    g_emulator->set_reg(2, modifiers);
+    // R3 is padding for double alignment
+    
+    g_emulator->run(func_addr);
+    g_emulator->set_reg(13, old_sp);
+}
+
+// Call FWKeyboard::SendKeyCharEvent(charCode, timestamp)
+// ARM32: this=R0, charCode=R1, double timestamp → R2+R3 (8-byte aligned)
+static void call_fw_key_char(uint32_t keyboard_ptr, uint32_t charCode, double timestamp) {
+    if (!g_fw_sendKeyChar || !keyboard_ptr) return;
+    
+    uint32_t old_sp = g_emulator->get_reg(13);
+    uint32_t new_sp = (old_sp - 16) & ~7;
+    g_emulator->set_reg(13, new_sp);
+    
+    uint8_t* memory = g_emulator->get_memory_base();
+    // charCode in R1, then double must be 8-byte aligned → goes to R2+R3
+    union { double d; uint32_t u[2]; } conv;
+    conv.d = timestamp;
+    
+    g_emulator->set_reg(0, keyboard_ptr);
+    g_emulator->set_reg(1, charCode);
+    g_emulator->set_reg(2, conv.u[0]);  // low word
+    g_emulator->set_reg(3, conv.u[1]);  // high word
+    
+    g_emulator->run(g_fw_sendKeyChar);
+    g_emulator->set_reg(13, old_sp);
+}
+
+// Send a complete key press (down + up) through FWKeyboard
+static void fw_send_key_press(uint32_t keyCode, double timestamp) {
+    uint32_t kb = get_fw_keyboard();
+    if (!kb) return;
+    call_fw_key_event(g_fw_sendKeyDown, kb, keyCode, 0, timestamp);
+    call_fw_key_event(g_fw_sendKeyUp, kb, keyCode, 0, timestamp);
+}
+
+// Send a character through FWKeyboard (for text input fields)
+static void fw_send_char(uint32_t charCode, double timestamp) {
+    uint32_t kb = get_fw_keyboard();
+    if (!kb) return;
+    call_fw_key_char(kb, charCode, timestamp);
+}
+
+// --- Text Input Callbacks ---
+// These call back into the game's native JNI functions to notify
+// it of text changes (like Android's EditText → Native bridge).
+
+// Guest memory region for text input strings (must be < 0x40000000 for resolve_jstring)
+static uint32_t g_text_input_str_addr = 0x3F000000;
+
+// Allocate a jstring in guest memory and return its guest address
+static uint32_t write_guest_jstring(uint8_t* memory, const std::string& text) {
+    // Write string at a fixed scratch area (text input is single-threaded)
+    uint32_t addr = g_text_input_str_addr;
+    size_t len = text.length();
+    if (len > 4000) len = 4000;  // Safety clamp
+    memcpy(memory + addr, text.c_str(), len + 1);
+    return addr;
+}
+
+// Call textInputTextDidChange(JNIEnv* env, jclass cls, jstring text)
+// Hooked by SRE — our reimplementation bypasses the corrupt vtable.
+static void call_text_input_did_change(uint32_t env_ptr, const std::string& text) {
+    if (!g_fw_textInputDidChange) return;
+    uint8_t* memory = g_emulator->get_memory_base();
+    uint32_t str_addr = write_guest_jstring(memory, text);
+    g_emulator->call(g_fw_textInputDidChange, {env_ptr, 0, str_addr});
+}
+
+// Call textInputDidFinish(JNIEnv* env, jclass cls)
+// Hooked by SRE — clears editing state and delegate pointer directly.
+static void call_text_input_did_finish(uint32_t env_ptr) {
+    if (!g_fw_textInputDidFinish) return;
+    g_emulator->call(g_fw_textInputDidFinish, {env_ptr, 0});
+}
+
+void init_all() {
+    // CRITICAL: calloc zero-initializes via OS lazy-zeroing (demand-paged).
+    // new uint8_t[N] leaves garbage that causes 0xFFFFFFFF... in uninitialized
+    // stack/BSS areas, creating corrupt 64-bit pointers on ARM64.
+    // Allocate 4GB guest memory via mmap so we cover the 0xFF000000 bridge region safely.
+    g_guest_memory = (uint8_t*)os_external::reserve_large_region(0x100000000ULL);
+    if (!g_guest_memory) {
+        std::cerr << "FATAL: Failed to allocate 4GB guest memory (mmap/VirtualAlloc)" << std::endl;
+        exit(1);
+    }
+
+    // Fill bridge region (0xFF000000 to 0xFF100000) with HLT #0 (0xD4400000)
+    uint32_t* bridge_mem = (uint32_t*)(g_guest_memory + 0xFF000000ULL);
+    for (size_t i = 0; i < (0x100000 / 4); i++) {
+        bridge_mem[i] = 0xD4400000;
+    }
+
+    // Fill magic LR region (0xE0000000 to 0xE0001000) with HLT #0 (0xD4400000)
+    uint32_t* magic_lr_mem = (uint32_t*)(g_guest_memory + 0xE0000000ULL);
+    for (size_t i = 0; i < (0x1000 / 4); i++) {
+        magic_lr_mem[i] = 0xD4400000;
+    }
+    g_loader = new ElfLoader(g_guest_memory, GUEST_MEM_SIZE);
+    g_loader_64 = new ElfLoaderArm64(g_guest_memory, GUEST_MEM_SIZE);
+    g_bridge.init_standard_bridges();
+    g_bridge_64.init_standard_bridges();
+    asset_manager_init(get_data_path(g_assets_dir).c_str());
+    asset_manager_init_arm32(get_data_path(g_assets_dir).c_str());
+    g_gui.init();
+    g_input_config.load(g_save_dir + "/controls.ini");
+    std::cout << "[Input] Loaded controls config (" << g_input_config.button_count() << " buttons)" << std::endl;
+    
+    // Start async IO thread
+    io_thread_start();
+
+    // Start Redstell Garbage Collector Subsystem
+    RedstellGC::instance().init();
+
+    // Initialize FBO Scaler
+    if (g_display_active) {
+        fbo_init(GAME_W, GAME_H);
+        draw_batcher_init();
+        // Boot through the SAME two entry points the F6 menu uses (tier, then
+        // cosmetic filter). This site previously called
+        //     postfx_apply_preset(g_postfx, g_postfx_preset);
+        // with g_postfx_preset defaulting to OFF, whose first statement is
+        // `s = PostFXState{}`. That wiped every tier flag fbo_init() had just
+        // applied while leaving graphics_tier at its struct default of SW_PLUS,
+        // so the F6 menu displayed an active "SW+" tier over an OFF pipeline and
+        // the tier only took effect once the user re-clicked the already-
+        // selected SW+ button. See postfx_apply_boot_defaults().
+        postfx_apply_boot_defaults(g_postfx);
+        postfx_user_preset = PostFXPreset::SW_PLUS_MEDIUM;
+        postfx_user_enabled = g_postfx.enabled;
+    }
+    
+    // Open any connected gamepad
+    SDL_Init(SDL_INIT_GAMEPAD);
+    int gpad_count = 0;
+    SDL_JoystickID *gpad_ids = SDL_GetGamepads(&gpad_count);
+    if (gpad_ids) {
+        for (int i = 0; i < gpad_count; i++) {
+            g_gamepad = SDL_OpenGamepad(gpad_ids[i]);
+            if (g_gamepad) {
+                std::cout << "[Input] Gamepad: " << SDL_GetGamepadName(g_gamepad) << std::endl;
+                break;
+            }
+        }
+        SDL_free(gpad_ids);
+    }
+    std::cout << "[Main] Infrastructure initialized." << std::endl;
+}
+
+uint32_t setup_jni_env(uint8_t* memory) {
+    uint32_t env_ptr = 0x10000;
+    uint32_t vtable_ptr = 0x10010;
+    
+    *(uint32_t*)(memory + env_ptr) = vtable_ptr;
+    
+    // Fill vtable with a default unhandled bridge address
+    for (int i = 0; i < 300; i++) {
+        std::string slot_name = "UnhandledJNI_" + std::to_string(i);
+        *(uint32_t*)(memory + vtable_ptr + i * 4) = g_bridge.get_address(slot_name);
+    }
+    
+    // Set specific JNI functions at their correct offsets
+    *(uint32_t*)(memory + vtable_ptr + 0x18) = g_bridge.get_address("FindClass");
+    *(uint32_t*)(memory + vtable_ptr + 0x38) = g_bridge.get_address("ThrowNew");
+    *(uint32_t*)(memory + vtable_ptr + 0x4C) = g_bridge.get_address("PushLocalFrame");
+    *(uint32_t*)(memory + vtable_ptr + 0x50) = g_bridge.get_address("PopLocalFrame");
+    *(uint32_t*)(memory + vtable_ptr + 0x54) = g_bridge.get_address("NewGlobalRef");
+    *(uint32_t*)(memory + vtable_ptr + 0x58) = g_bridge.get_address("DeleteGlobalRef");
+    *(uint32_t*)(memory + vtable_ptr + 0x5C) = g_bridge.get_address("DeleteLocalRef");
+    *(uint32_t*)(memory + vtable_ptr + 0x74) = g_bridge.get_address("NewObjectV");
+    *(uint32_t*)(memory + vtable_ptr + 0x7C) = g_bridge.get_address("GetObjectClass");
+    *(uint32_t*)(memory + vtable_ptr + 0x84) = g_bridge.get_address("GetMethodID");
+    *(uint32_t*)(memory + vtable_ptr + 0x8C) = g_bridge.get_address("CallObjectMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x98) = g_bridge.get_address("CallBooleanMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0xC8) = g_bridge.get_address("CallIntMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0xD4) = g_bridge.get_address("CallLongMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0xF8) = g_bridge.get_address("CallVoidMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x178) = g_bridge.get_address("GetFieldID");
+    *(uint32_t*)(memory + vtable_ptr + 0x17C) = g_bridge.get_address("GetBooleanField");
+    *(uint32_t*)(memory + vtable_ptr + 0x190) = g_bridge.get_address("GetIntField");
+    *(uint32_t*)(memory + vtable_ptr + 0x198) = g_bridge.get_address("GetFloatField");
+    *(uint32_t*)(memory + vtable_ptr + 0x1C4) = g_bridge.get_address("GetStaticMethodID");
+    *(uint32_t*)(memory + vtable_ptr + 0x1CC) = g_bridge.get_address("CallStaticObjectMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x1D8) = g_bridge.get_address("CallStaticBooleanMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x208) = g_bridge.get_address("CallStaticIntMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x21C) = g_bridge.get_address("CallStaticLongMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x220) = g_bridge.get_address("CallStaticFloatMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x238) = g_bridge.get_address("CallStaticVoidMethodV");
+    *(uint32_t*)(memory + vtable_ptr + 0x240) = g_bridge.get_address("GetStaticFieldID");
+    *(uint32_t*)(memory + vtable_ptr + 0x244) = g_bridge.get_address("GetStaticObjectField");
+    *(uint32_t*)(memory + vtable_ptr + 0x29C) = g_bridge.get_address("NewStringUTF");
+    *(uint32_t*)(memory + vtable_ptr + 0x2A0) = g_bridge.get_address("GetStringUTFLength");
+    *(uint32_t*)(memory + vtable_ptr + 0x2A4) = g_bridge.get_address("GetStringUTFChars");
+    *(uint32_t*)(memory + vtable_ptr + 0x2A8) = g_bridge.get_address("ReleaseStringUTFChars");
+    *(uint32_t*)(memory + vtable_ptr + 0x2AC) = g_bridge.get_address("GetArrayLength");
+    *(uint32_t*)(memory + vtable_ptr + 0x2B4) = g_bridge.get_address("GetObjectArrayElement");
+    *(uint32_t*)(memory + vtable_ptr + 0x2C0) = g_bridge.get_address("NewByteArray");          // Slot 176
+    *(uint32_t*)(memory + vtable_ptr + 0x2CC) = g_bridge.get_address("NewIntArray");
+    *(uint32_t*)(memory + vtable_ptr + 0x2E0) = g_bridge.get_address("GetByteArrayElements");  // Slot 184
+    *(uint32_t*)(memory + vtable_ptr + 0x2EC) = g_bridge.get_address("GetIntArrayElements");
+    *(uint32_t*)(memory + vtable_ptr + 0x300) = g_bridge.get_address("ReleaseByteArrayElements"); // Slot 192
+    *(uint32_t*)(memory + vtable_ptr + 0x30C) = g_bridge.get_address("ReleaseIntArrayElements");
+    *(uint32_t*)(memory + vtable_ptr + 0x340) = g_bridge.get_address("SetByteArrayRegion");     // Slot 208
+    *(uint32_t*)(memory + vtable_ptr + 0x34C) = g_bridge.get_address("SetIntArrayRegion");
+    *(uint32_t*)(memory + vtable_ptr + 0x35C) = g_bridge.get_address("RegisterNatives");
+    *(uint32_t*)(memory + vtable_ptr + 0x36C) = g_bridge.get_address("GetJavaVM");
+    *(uint32_t*)(memory + vtable_ptr + 0x374) = g_bridge.get_address("GetStringUTFRegion");
+
+    // Setup JavaVM structures at 0x11000
+    uint32_t vm_ptr = 0x11000;
+    uint32_t vm_vtable_ptr = 0x11010;
+    *(uint32_t*)(memory + vm_ptr) = vm_vtable_ptr;
+    
+    for (int i = 0; i < 50; i++) {
+        std::string slot_name = "UnhandledVM_" + std::to_string(i);
+        *(uint32_t*)(memory + vm_vtable_ptr + i * 4) = g_bridge.get_address(slot_name);
+    }
+    *(uint32_t*)(memory + vm_vtable_ptr + 0x18) = g_bridge.get_address("GetEnv"); // GetEnv at offset 0x18
+
+    return env_ptr;
+}
+
+uint64_t setup_jni_env_arm64(uint8_t* memory) {
+    uint64_t env_ptr = 0x10000;
+    uint64_t vtable_ptr = 0x10010;
+    
+    *(uint64_t*)(memory + env_ptr) = vtable_ptr;
+    
+    // Fill vtable with a default unhandled bridge address (300 slots × 8 bytes)
+    for (int i = 0; i < 300; i++) {
+        std::string slot_name = "UnhandledJNI_" + std::to_string(i);
+        *(uint64_t*)(memory + vtable_ptr + i * 8) = g_bridge_64.get_address(slot_name);
+    }
+    
+    // Set specific JNI functions at their correct ARM64 offsets (ARM32 offset × 2)
+    *(uint64_t*)(memory + vtable_ptr + 0x30)  = g_bridge_64.get_address("FindClass");
+    *(uint64_t*)(memory + vtable_ptr + 0x70)  = g_bridge_64.get_address("ThrowNew");
+    *(uint64_t*)(memory + vtable_ptr + 0x98)  = g_bridge_64.get_address("PushLocalFrame");
+    *(uint64_t*)(memory + vtable_ptr + 0xA0)  = g_bridge_64.get_address("PopLocalFrame");
+    *(uint64_t*)(memory + vtable_ptr + 0xA8)  = g_bridge_64.get_address("NewGlobalRef");
+    *(uint64_t*)(memory + vtable_ptr + 0xB0)  = g_bridge_64.get_address("DeleteGlobalRef");
+    *(uint64_t*)(memory + vtable_ptr + 0xB8)  = g_bridge_64.get_address("DeleteLocalRef");
+    *(uint64_t*)(memory + vtable_ptr + 0xE8)  = g_bridge_64.get_address("NewObjectV");
+    *(uint64_t*)(memory + vtable_ptr + 0xF8)  = g_bridge_64.get_address("GetObjectClass");
+    *(uint64_t*)(memory + vtable_ptr + 0x108) = g_bridge_64.get_address("GetMethodID");
+    *(uint64_t*)(memory + vtable_ptr + 0x118) = g_bridge_64.get_address("CallObjectMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x130) = g_bridge_64.get_address("CallBooleanMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x190) = g_bridge_64.get_address("CallIntMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x1A8) = g_bridge_64.get_address("CallLongMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x1F0) = g_bridge_64.get_address("CallVoidMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x2F0) = g_bridge_64.get_address("GetFieldID");
+    *(uint64_t*)(memory + vtable_ptr + 0x2F8) = g_bridge_64.get_address("GetBooleanField");
+    *(uint64_t*)(memory + vtable_ptr + 0x320) = g_bridge_64.get_address("GetIntField");
+    *(uint64_t*)(memory + vtable_ptr + 0x330) = g_bridge_64.get_address("GetFloatField");
+    *(uint64_t*)(memory + vtable_ptr + 0x388) = g_bridge_64.get_address("GetStaticMethodID");
+    *(uint64_t*)(memory + vtable_ptr + 0x398) = g_bridge_64.get_address("CallStaticObjectMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x3B0) = g_bridge_64.get_address("CallStaticBooleanMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x410) = g_bridge_64.get_address("CallStaticIntMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x438) = g_bridge_64.get_address("CallStaticLongMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x440) = g_bridge_64.get_address("CallStaticFloatMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x470) = g_bridge_64.get_address("CallStaticVoidMethodV");
+    *(uint64_t*)(memory + vtable_ptr + 0x480) = g_bridge_64.get_address("GetStaticFieldID");
+    *(uint64_t*)(memory + vtable_ptr + 0x488) = g_bridge_64.get_address("GetStaticObjectField");
+    *(uint64_t*)(memory + vtable_ptr + 0x538) = g_bridge_64.get_address("NewStringUTF");
+    *(uint64_t*)(memory + vtable_ptr + 0x540) = g_bridge_64.get_address("GetStringUTFLength");
+    *(uint64_t*)(memory + vtable_ptr + 0x548) = g_bridge_64.get_address("GetStringUTFChars");
+    *(uint64_t*)(memory + vtable_ptr + 0x550) = g_bridge_64.get_address("ReleaseStringUTFChars");
+    *(uint64_t*)(memory + vtable_ptr + 0x558) = g_bridge_64.get_address("GetArrayLength");
+    *(uint64_t*)(memory + vtable_ptr + 0x568) = g_bridge_64.get_address("GetObjectArrayElement");
+    *(uint64_t*)(memory + vtable_ptr + 0x580) = g_bridge_64.get_address("NewByteArray");
+    *(uint64_t*)(memory + vtable_ptr + 0x598) = g_bridge_64.get_address("NewIntArray");
+    *(uint64_t*)(memory + vtable_ptr + 0x5C0) = g_bridge_64.get_address("GetByteArrayElements");
+    *(uint64_t*)(memory + vtable_ptr + 0x5D8) = g_bridge_64.get_address("GetIntArrayElements");
+    *(uint64_t*)(memory + vtable_ptr + 0x600) = g_bridge_64.get_address("ReleaseByteArrayElements");
+    *(uint64_t*)(memory + vtable_ptr + 0x618) = g_bridge_64.get_address("ReleaseIntArrayElements");
+    *(uint64_t*)(memory + vtable_ptr + 0x680) = g_bridge_64.get_address("SetByteArrayRegion"); // [208]
+    *(uint64_t*)(memory + vtable_ptr + 0x698) = g_bridge_64.get_address("SetIntArrayRegion");
+    *(uint64_t*)(memory + vtable_ptr + 0x6B8) = g_bridge_64.get_address("RegisterNatives");
+    *(uint64_t*)(memory + vtable_ptr + 0x6D8) = g_bridge_64.get_address("GetJavaVM");
+    *(uint64_t*)(memory + vtable_ptr + 0x6E8) = g_bridge_64.get_address("GetStringUTFRegion");
+
+    // Setup JavaVM structures at 0x11000 (64-bit)
+    uint64_t vm_ptr = 0x11000;
+    uint64_t vm_vtable_ptr = 0x11010;
+    *(uint64_t*)(memory + vm_ptr) = vm_vtable_ptr;
+    
+    for (int i = 0; i < 50; i++) {
+        std::string slot_name = "UnhandledVM_" + std::to_string(i);
+        *(uint64_t*)(memory + vm_vtable_ptr + i * 8) = g_bridge_64.get_address(slot_name);
+    }
+    *(uint64_t*)(memory + vm_vtable_ptr + 0x30) = g_bridge_64.get_address("GetEnv"); // GetEnv at ARM64 offset (0x18 * 2)
+
+    return env_ptr;
+}
+
+void process_gui_action(GuiAction gui_action, bool& running) {
+    if (gui_action == GUI_NONE) return;
+    switch (gui_action) {
+        case GUI_EXIT:
+            running = false;
+            break;
+        case GUI_PAUSE:
+            mod_toggle_pause();
+            std::cout << "[GUI] Emulation " << (g_game_paused ? "PAUSED" : "RESUMED") << std::endl;
+            break;
+        case GUI_CUSTOMIZE_CONTROLS:
+            g_input_config.set_editing(true);
+            std::cout << "[GUI] Controls editor opened" << std::endl;
+            break;
+        case GUI_SAVE_STATE:
+            std::cout << "[GUI] Save State requested" << std::endl;
+            break;
+        case GUI_LOAD_STATE:
+            std::cout << "[GUI] Load State requested" << std::endl;
+            break;
+        case GUI_GAME_SPEED_UP:
+            mod_speed_up();
+            break;
+        case GUI_GAME_SPEED_DOWN:
+            mod_speed_down();
+            break;
+        case GUI_GAME_SPEED_RESET:
+            mod_speed_reset();
+            break;
+        case GUI_TOGGLE_CAM:
+            cam_toggle();
+            break;
+        case GUI_TOGGLE_PAUSE:
+            mod_toggle_pause();
+            break;
+        case GUI_TOGGLE_SMOOTH_CAM:
+            cam_toggle_smooth();
+            break;
+        case GUI_GFX_OPENGL:
+            g_graphics_api = GraphicsAPI::OPENGL;
+            std::cout << "[GFX] Graphics API set to OpenGL (active)" << std::endl;
+            break;
+        case GUI_GFX_VULKAN:
+            g_graphics_api = GraphicsAPI::VULKAN;
+            std::cout << "[GFX] Graphics API set to Vulkan (WIP) — restart required" << std::endl;
+            break;
+        // Mod menu actions (value adjustments)
+        case GUI_MOD_WALK_SPEED_UP:
+            g_gui.mod_walk_speed = std::min(g_gui.mod_walk_speed + 0.5f, 10.0f);
+            break;
+        case GUI_MOD_WALK_SPEED_DOWN:
+            g_gui.mod_walk_speed = std::max(g_gui.mod_walk_speed - 0.5f, 0.5f);
+            break;
+        case GUI_MOD_RUN_SPEED_UP:
+            g_gui.mod_run_speed = std::min(g_gui.mod_run_speed + 0.5f, 10.0f);
+            break;
+        case GUI_MOD_RUN_SPEED_DOWN:
+            g_gui.mod_run_speed = std::max(g_gui.mod_run_speed - 0.5f, 0.5f);
+            break;
+        case GUI_MOD_JUMP_HEIGHT_UP:
+            g_gui.mod_jump_height = std::min(g_gui.mod_jump_height + 0.5f, 10.0f);
+            break;
+        case GUI_MOD_JUMP_HEIGHT_DOWN:
+            g_gui.mod_jump_height = std::max(g_gui.mod_jump_height - 0.5f, 0.5f);
+            break;
+        case GUI_MOD_LEVEL_UP:
+        case GUI_MOD_LEVEL_DOWN:
+        case GUI_MOD_EXP_UP:
+        case GUI_MOD_EXP_DOWN: {
+            if (sre_gamestate_ptr_addr && g_guest_memory) {
+                uint64_t gs = *(uint64_t*)(g_guest_memory + sre_gamestate_ptr_addr);
+                if (gs != 0) {
+                    char* gs_host = (char*)g_guest_memory + gs;
+                    extern uint32_t g_hero_obj;
+                    if (gui_action == GUI_MOD_EXP_UP) {
+                        *(int*)(gs_host + 0xB4) += 500;
+                        if (g_hero_obj != 0) {
+                            *(int*)(g_guest_memory + g_hero_obj + 0x60) = *(int*)(gs_host + 0xB4);
+                        }
+                    } else if (gui_action == GUI_MOD_EXP_DOWN) {
+                        int xp = *(int*)(gs_host + 0xB4);
+                        int new_xp = xp > 500 ? xp - 500 : 0;
+                        *(int*)(gs_host + 0xB4) = new_xp;
+                        if (g_hero_obj != 0) {
+                            *(int*)(g_guest_memory + g_hero_obj + 0x60) = new_xp;
+                        }
+                    } else if (gui_action == GUI_MOD_LEVEL_UP) {
+                        *(int*)(gs_host + 0xB8) += 1;
+                        if (g_hero_obj != 0) {
+                            *(int*)(g_guest_memory + g_hero_obj + 0x64) = *(int*)(gs_host + 0xB8);
+                        }
+                    } else if (gui_action == GUI_MOD_LEVEL_DOWN) {
+                        int lv = *(int*)(gs_host + 0xB8);
+                        int new_lv = lv > 1 ? lv - 1 : 1;
+                        *(int*)(gs_host + 0xB8) = new_lv;
+                        if (g_hero_obj != 0) {
+                            *(int*)(g_guest_memory + g_hero_obj + 0x64) = new_lv;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case GUI_MOD_HEAL_FULL:
+        case GUI_MOD_ADD_COINS:
+        case GUI_MOD_REFILL_MANA: {
+            if (sre_gamestate_ptr_addr && g_guest_memory) {
+                uint64_t gs = *(uint64_t*)(g_guest_memory + sre_gamestate_ptr_addr);
+                if (gs != 0) {
+                    char* gs_host = (char*)g_guest_memory + gs;
+                    extern uint32_t g_hero_health_comp;
+                    extern uint32_t g_hero_mana_comp;
+                    if (gui_action == GUI_MOD_HEAL_FULL) {
+                        int hp_level = *(int*)(gs_host + 0xBC);
+                        int max_hp = hp_level * 2 + 4;
+                        *(int*)(gs_host + 0xA8) = max_hp;
+                        if (g_hero_health_comp != 0) {
+                            int actual_max_hp = *(int*)(g_guest_memory + g_hero_health_comp + 0x88);
+                            *(int*)(g_guest_memory + g_hero_health_comp + 0x7c) = actual_max_hp;
+                            *(int*)(g_guest_memory + g_hero_health_comp + 0x80) = actual_max_hp;
+                        }
+                        mod_toast("HP restored to full!", 1.5f);
+                    } else if (gui_action == GUI_MOD_ADD_COINS) {
+                        *(int*)(gs_host + 0xB0) += 100;
+                        char cbuf[64]; snprintf(cbuf, sizeof(cbuf), "Coins: %d (+100)", *(int*)(gs_host + 0xB0));
+                        mod_toast(cbuf, 1.5f);
+                    } else if (gui_action == GUI_MOD_REFILL_MANA) {
+                        int mana_level = *(int*)(gs_host + 0xC4);
+                        int max_mana = mana_level * 20 + 10;
+                        *(int*)(gs_host + 0xAC) = max_mana;
+                        if (g_hero_mana_comp != 0) {
+                            int actual_max_mana = *(int*)(g_guest_memory + g_hero_mana_comp + 0x3c);
+                            *(int*)(g_guest_memory + g_hero_mana_comp + 0x40) = actual_max_mana;
+                        }
+                        mod_toast("Mana restored to full!", 1.5f);
+                    }
+                }
+            }
+            break;
+        }
+        case GUI_MUSIC_VOL_UP: {
+            float v = 0.0f;
+            if (sre_music_master_volume_addr) {
+                v = *(float*)(g_guest_memory + sre_music_master_volume_addr);
+                v = std::min(v + 0.1f, 1.0f);
+                *(float*)(g_guest_memory + sre_music_master_volume_addr) = v;
+                int one = 1;
+                memcpy(g_guest_memory + sre_music_volume_dirty_addr, &one, 4);
+            } else {
+                v = sre_music_host_get_volume();
+                v = std::min(v + 0.1f, 1.0f);
+                sre_music_host_set_volume(v);
+            }
+            char vbuf[64]; snprintf(vbuf, sizeof(vbuf), "Music Volume: %d%%", (int)(v * 100));
+            mod_toast(vbuf, 1.5f);
+            break;
+        }
+        case GUI_MUSIC_VOL_DOWN: {
+            float v = 0.0f;
+            if (sre_music_master_volume_addr) {
+                v = *(float*)(g_guest_memory + sre_music_master_volume_addr);
+                v = std::max(v - 0.1f, 0.0f);
+                *(float*)(g_guest_memory + sre_music_master_volume_addr) = v;
+                int one = 1;
+                memcpy(g_guest_memory + sre_music_volume_dirty_addr, &one, 4);
+            } else {
+                v = sre_music_host_get_volume();
+                v = std::max(v - 0.1f, 0.0f);
+                sre_music_host_set_volume(v);
+            }
+            char vbuf[64]; snprintf(vbuf, sizeof(vbuf), "Music Volume: %d%%", (int)(v * 100));
+            mod_toast(vbuf, 1.5f);
+            break;
+        }
+        case GUI_MUSIC_MUTE: {
+            float v = 0.0f;
+            if (sre_music_master_volume_addr) {
+                v = *(float*)(g_guest_memory + sre_music_master_volume_addr);
+                static float last_non_mute_vol = 1.0f;
+                if (v > 0.01f) {
+                    last_non_mute_vol = v;
+                    v = 0.0f;
+                    mod_toast("Music: MUTED", 1.5f);
+                } else {
+                    v = last_non_mute_vol;
+                    char vbuf[64]; snprintf(vbuf, sizeof(vbuf), "Music: Unmuted (%d%%)", (int)(v * 100));
+                    mod_toast(vbuf, 1.5f);
+                }
+                *(float*)(g_guest_memory + sre_music_master_volume_addr) = v;
+                int one = 1;
+                memcpy(g_guest_memory + sre_music_volume_dirty_addr, &one, 4);
+            } else {
+                v = sre_music_host_get_volume();
+                if (v > 0.01f) {
+                    sre_music_host_set_volume(0.0f);
+                    mod_toast("Music: MUTED", 1.5f);
+                } else {
+                    sre_music_host_set_volume(1.0f);
+                    mod_toast("Music: Unmuted (100%)", 1.5f);
+                }
+            }
+            break;
+        }
+        case GUI_TOGGLE_TOUCHFOO_DEBUG_INFO: {
+            trigger_toggle_debug_info();
+            break;
+        }
+        case GUI_TOGGLE_COLLISION_SHAPES: {
+            trigger_toggle_collision_shapes();
+            break;
+        }
+        case GUI_TOGGLE_COMBAT_WIREFRAME: {
+            trigger_toggle_combat_wireframe();
+            break;
+        }
+        default: break;
+    }
+}
+
+void load_and_boot() {
+    std::string so_path = get_data_path(g_lib_name);
+    std::cout << "[Loader] Loading: " << so_path << std::endl;
+    uint32_t load_addr = 0x1000000;
+    
+    // 1. Load ELF
+    if (g_loader->load(&g_main_mod, so_path, load_addr) != 0) {
+        std::cerr << "[Loader] Failed to load SO" << std::endl;
+        exit(1);
+    }
+
+    // Determine ABI version from SHA256 / instance metadata
+    {
+        std::string sha = BinarySelector::compute_sha256(so_path);
+        std::cout << "[ABI] Binary SHA256: " << sha << std::endl;
+        if (sha == "f847814d1b6f81268567ed5ec2473fea4d4ee3b75d2c6fec7057227225e989f8" || // 1.4.12 arm64
+            sha == "08d49dd6f7f8639a4c59f290ff2bb79254accf710f530bf53c2fce1659191c9e") {  // 1.4.12 arm32
+            swordi_abi = 12;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.12 (swordi_abi = 12)" << std::endl;
+        } else if (sha == "c2f567a34ec7bed9cf6b0af0ce88e9c925c11e5c2a2f2fbd8604461cf93aae7d" || // 1.4.13 arm64
+                   sha == "4e03fb28b16e9ed729b774ffa34f2b370742a8e6bee31f221083908e7a1089fa") {  // 1.4.13 arm32
+            swordi_abi = 13;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.13 (swordi_abi = 13)" << std::endl;
+        } else {
+            const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+            if (binfo && binfo->version.find("1.4.13") != std::string::npos) {
+                swordi_abi = 13;
+                std::cout << "[ABI] Detected Swordigo ABI v1.4.13 via instance metadata (swordi_abi = 13)" << std::endl;
+            } else {
+                swordi_abi = 12;
+                std::cout << "[ABI] Unknown binary hash, fallback to swordi_abi = 12" << std::endl;
+            }
+        }
+    }
+    
+    // 2. Internal Relocations
+    g_loader->relocate(&g_main_mod);
+    
+    // 3. External Symbol Resolution (to Bridge addresses)
+    g_loader->resolve_all_to_bridge(&g_main_mod, &g_bridge, GUEST_GLOBALS_BASE);
+    
+    std::cout << "[Loader] Game binary ready (all symbols bridged)." << std::endl;
+
+    // Initialize Emulator AFTER memory is prepared
+    // ARM32 backend selection: Dynarmic (A32 JIT) is the permanent default for
+    // ARM32 instances too; Unicorn (TCG) remains as --engine=unicorn fallback.
+#ifdef SWORDIGO_HAS_DYNARMIC
+    if (g_use_dynarmic) {
+        g_emulator = new EmulatorDynarmic32(g_guest_memory, GUEST_MEM_SIZE);
+        std::cout << "[Engine] ARM32 backend: Dynarmic (A32 JIT)" << std::endl;
+    } else
+#endif
+    {
+        g_emulator = new Emulator(g_guest_memory, GUEST_MEM_SIZE);
+        std::cout << "[Engine] ARM32 backend: Unicorn (TCG)" << std::endl;
+    }
+    g_emulator->set_bridge(&g_bridge);
+
+    // Run dynamic initializers (.init_array)
+    if (g_main_mod.init_array_vaddr != 0 && g_main_mod.init_array_size > 0) {
+        int count = g_main_mod.init_array_size / 4;
+        std::cout << "[Boot] Executing " << count << " dynamic initializers..." << std::endl;
+        uint32_t* init_array = (uint32_t*)(g_guest_memory + g_main_mod.init_array_vaddr);
+        for (int i = 0; i < count; i++) {
+            uint32_t init_func = init_array[i];
+            if (init_func != 0) {
+                if (i % 50 == 0 || i == count - 1) {
+                    std::cout << "  -> Initializer " << i << "/" << count << " at 0x" << std::hex << init_func << std::dec << std::endl;
+                }
+                g_emulator->call(init_func, {});
+            }
+        }
+        std::cout << "[Boot] Dynamic initializers completed successfully." << std::endl;
+    }
+
+    // 4. Boot Sequence
+    uint32_t setFilesDir = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_setFilesDir");
+    uint32_t setCacheDir = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_setCacheDir");
+    uint32_t setAssetMgr = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_setAssetManager");
+    uint32_t googleSignInCompleted = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_googleSignInCompleted");
+    uint32_t handleAppLaunch = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_handleApplicationLaunch");
+    uint32_t initMusicPlayer = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_MusicPlayer_initMusicPlayer");
+    uint32_t setupNative = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_setupNativeInterface");
+    uint32_t setupApp = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_setupApplication");
+    uint32_t setApplicationViewSize = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_setApplicationViewSize");
+    uint32_t applicationDidBecomeActive = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_applicationDidBecomeActive");
+
+    // Resolve FWKeyboard API symbols (mangled C++ names from the Caver engine)
+    g_fw_sharedKeyboard = g_loader->get_symbol_vaddr(&g_main_mod, "_ZN5Caver10FWKeyboard14sharedKeyboardEv");
+    g_fw_sendKeyDown    = g_loader->get_symbol_vaddr(&g_main_mod, "_ZN5Caver10FWKeyboard16SendKeyDownEventEjjd");
+    g_fw_sendKeyUp      = g_loader->get_symbol_vaddr(&g_main_mod, "_ZN5Caver10FWKeyboard14SendKeyUpEventEjjd");
+    g_fw_sendKeyChar    = g_loader->get_symbol_vaddr(&g_main_mod, "_ZN5Caver10FWKeyboard16SendKeyCharEventEjd");
+    g_fw_handleMenuBtn  = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_handleMenuButtonPress");
+
+    // Resolve text input callback symbols (native JNI functions the game exports)
+    g_fw_textInputDidChange = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_textInputTextDidChange");
+    g_fw_textInputDidFinish = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_textInputDidFinish");
+
+    std::cout << "[Boot] FWKeyboard API: sharedKeyboard=0x" << std::hex << g_fw_sharedKeyboard
+              << " sendDown=0x" << g_fw_sendKeyDown << " sendUp=0x" << g_fw_sendKeyUp
+              << " sendChar=0x" << g_fw_sendKeyChar << " menuBtn=0x" << g_fw_handleMenuBtn
+              << std::dec << std::endl;
+    std::cout << "[Boot] TextInput API: didChange=0x" << std::hex << g_fw_textInputDidChange
+              << " didFinish=0x" << g_fw_textInputDidFinish << std::dec << std::endl;
+
+    // Setup fake JNI structures in guest memory
+    uint32_t env_ptr = setup_jni_env(g_guest_memory);
+    std::cout << "[Debug] env_ptr = 0x" << std::hex << env_ptr << " vtable_ptr = 0x" << *(uint32_t*)(g_guest_memory + env_ptr) << std::dec << std::endl;
+    std::cout << "[Debug] FindClass slot (0x10028) = 0x" << std::hex << *(uint32_t*)(g_guest_memory + 0x10028) << std::dec << std::endl;
+    std::cout << "[Debug] GetStringUTFChars slot (0x102b4) = 0x" << std::hex << *(uint32_t*)(g_guest_memory + 0x102b4) << std::dec << std::endl;
+
+
+    
+    // Allocate some strings in guest memory for paths.
+    // Use 0x10000000 (256 MB) — safely in the 475MB unused memory gap well below guest heap (0x20000000)
+    // and well above loaded modules (0x01000000 - 0x02200000).
+    uint32_t path_ptr = 0x10000000;
+    uint32_t files_dir = path_ptr;
+    std::string files_dir_norm = sre_normalize_vfs_path(g_save_dir);
+    strncpy((char*)(g_guest_memory + files_dir), files_dir_norm.c_str(), 255);
+    ((char*)(g_guest_memory + files_dir))[255] = '\0';
+    path_ptr += 256;
+    
+    uint32_t cache_dir = path_ptr;
+    std::string cache_dir_norm = sre_normalize_vfs_path(g_cache_dir);
+    strncpy((char*)(g_guest_memory + cache_dir), cache_dir_norm.c_str(), 255);
+    ((char*)(g_guest_memory + cache_dir))[255] = '\0';
+    path_ptr += 256;
+
+    if (setFilesDir) {
+        std::cout << "[Boot] Calling setFilesDir" << std::endl;
+        g_emulator->call(setFilesDir, {env_ptr, 0, files_dir});
+    }
+    if (setCacheDir) {
+        std::cout << "[Boot] Calling setCacheDir" << std::endl;
+        g_emulator->call(setCacheDir, {env_ptr, 0, cache_dir});
+    }
+    if (setAssetMgr) {
+        std::cout << "[Boot] Calling setAssetManager" << std::endl;
+        g_emulator->call(setAssetMgr, {env_ptr, 0, 0x55555555}); 
+    }
+    if (googleSignInCompleted) {
+        std::cout << "[Boot] Calling googleSignInCompleted(true) — enable snapshots" << std::endl;
+        g_emulator->call(googleSignInCompleted, {env_ptr, 0, 1}); // true = signed in
+    }
+    if (handleAppLaunch) {
+        std::cout << "[Boot] Calling handleApplicationLaunch" << std::endl;
+        g_emulator->call(handleAppLaunch, {env_ptr, 0});
+    }
+    if (initMusicPlayer) {
+        std::cout << "[Boot] Calling initMusicPlayer" << std::endl;
+        g_emulator->call(initMusicPlayer, {env_ptr, 0x22222222}); // pass non-zero fake MusicPlayer object to enable music callbacks
+    }
+    if (setupNative) {
+        std::cout << "[Boot] Calling setupNativeInterface" << std::endl;
+        g_emulator->call(setupNative, {env_ptr, 0});
+    }
+    if (setupApp) {
+        std::cout << "[Boot] Calling setupApplication" << std::endl;
+        g_emulator->call(setupApp, {env_ptr, 0});
+    }
+    if (setApplicationViewSize) {
+        std::cout << "[Boot] Calling setApplicationViewSize" << std::endl;
+        g_emulator->call(setApplicationViewSize, {env_ptr, 0, (uint32_t)GAME_W, (uint32_t)GAME_H, 1}); // Full HD internal resolution
+    }
+    if (applicationDidBecomeActive) {
+        std::cout << "[Boot] Calling applicationDidBecomeActive" << std::endl;
+        g_emulator->call(applicationDidBecomeActive, {env_ptr, 0});
+    }
+
+    // ========================================================================
+    // Store and ads on desktop: there is no Google Play Billing and no ad SDK.
+    // Every in-app product counts as NOT purchased, so no paid content is
+    // unlocked and the game never waits for a billing service that does not
+    // exist here. "Remove Ads" is not faked either: ad requests are answered
+    // as "no ad available" (ShowInterstitialAd returns without showing
+    // anything), like on a device where no ad can be loaded.
+    // ========================================================================
+    {
+        uint8_t* memory = g_emulator->get_memory_base();
+
+        // Patch IsNoAdsUnlockedCheck() -> return false (MOVS R0, #0; BX LR)
+        uint32_t noAdsCheck = g_loader->get_symbol_vaddr(&g_main_mod,
+            "_ZN5Caver15StoreController20IsNoAdsUnlockedCheckEv");
+        if (noAdsCheck) {
+            uint32_t addr = noAdsCheck & ~1u;
+            *(uint16_t*)(memory + addr + 0) = 0x2000; // MOVS R0, #0
+            *(uint16_t*)(memory + addr + 2) = 0x4770; // BX LR
+            std::cout << "[Store] Patched IsNoAdsUnlockedCheck at 0x" << std::hex << noAdsCheck
+                      << " -> return false (not purchased; no store on desktop)" << std::dec << std::endl;
+        }
+
+        // Patch IsProductPurchased -> return false for every product
+        uint32_t isPurchased = g_loader->get_symbol_vaddr(&g_main_mod,
+            "_ZN5Caver23StoreController_Android18IsProductPurchasedERKSs");
+        if (isPurchased) {
+            uint32_t addr = isPurchased & ~1u;
+            *(uint16_t*)(memory + addr + 0) = 0x2000; // MOVS R0, #0
+            *(uint16_t*)(memory + addr + 2) = 0x4770; // BX LR
+            std::cout << "[Store] Patched IsProductPurchased at 0x" << std::hex << isPurchased
+                      << " -> return false (not purchased; no store on desktop)" << std::dec << std::endl;
+        }
+        // Patch ShowInterstitialAd to return immediately ("no ad available") —
+        // prevents JNI ad code from corrupting game state. Death respawn is
+        // handled by the death-detection countdown / execv restart fallback.
+        uint32_t showAd = g_loader->get_symbol_vaddr(&g_main_mod,
+            "_ZN5Caver24OnlineController_Android18ShowInterstitialAdERKSsif");
+        if (showAd) {
+            uint32_t addr = showAd & ~1u;
+            *(uint16_t*)(memory + addr + 0) = 0x4770; // BX LR
+            std::cout << "[Fix] Patched ShowInterstitialAd at 0x" << std::hex << showAd
+                      << " -> bx lr" << std::dec << std::endl;
+        }
+        uint32_t showAd2 = g_loader->get_symbol_vaddr(&g_main_mod,
+            "_ZN5Caver25AndroidShowInterstitialAdEd");
+        if (showAd2) {
+            uint32_t addr = showAd2 & ~1u;
+            *(uint16_t*)(memory + addr + 0) = 0x4770; // BX LR
+            std::cout << "[Fix] Patched AndroidShowInterstitialAd at 0x" << std::hex << showAd2
+                      << " -> bx lr" << std::dec << std::endl;
+        }
+
+        // Coin limit patches (ARM32)
+        // Lua coin limit: offset 0x27fce0
+        // Game event limit: offset 0x27e656
+        // Too rich check: offset 0x27e666
+        if (swordi_abi == 12) {
+            uint32_t base_addr = g_main_mod.base_addr;
+            if (base_addr) {
+                extern int g_sre_coin_limit;
+                uint16_t limit = (uint16_t)g_sre_coin_limit;
+                
+                // movw r1, limit (instruction: 0xf2400100 | (imm4 << 16) | (val << 12) | (imm3 << 12) | imm8)
+                // For simplified inline patch, let's assemble Thumb2 MOVW:
+                // format: 1111 0 i 10 0100 imm4 0 imm3 rd imm8
+                // We can construct it precisely:
+                auto emit_movw_thumb = [](uint8_t reg, uint16_t val) -> uint32_t {
+                    uint32_t imm4 = (val >> 12) & 0xF;
+                    uint32_t i = (val >> 11) & 0x1;
+                    uint32_t imm3 = (val >> 8) & 0x7;
+                    uint32_t imm8 = val & 0xFF;
+                    uint16_t inst1 = 0xF240 | (i << 10) | imm4;
+                    uint16_t inst2 = (imm3 << 12) | (reg << 8) | imm8;
+                    return inst1 | (inst2 << 16);
+                };
+                
+                uint32_t inst_lua = emit_movw_thumb(1, limit);  // movw r1, #limit
+                *(uint32_t*)(memory + base_addr + 0x27fce0) = inst_lua;
+                
+                uint32_t inst_event = emit_movw_thumb(0, limit); // movw r0, #limit
+                *(uint32_t*)(memory + base_addr + 0x27e656) = inst_event;
+                
+                uint32_t inst_rich = emit_movw_thumb(1, limit - 1); // movw r1, #(limit - 1)
+                *(uint32_t*)(memory + base_addr + 0x27e666) = inst_rich;
+                
+                std::cout << "[CoinLimit] Applied ARM32 coin limit patches (limit=" << limit << ")" << std::endl;
+            }
+        }
+    }
+
+    // Resolve adVisibilityChanged (kept for death detection countdown fallback)
+    uint32_t adVisibilityChanged = g_loader->get_symbol_vaddr(&g_main_mod,
+        "Java_com_touchfoo_swordigo_Native_interstitialAdVisibilityChanged");
+
+    // 5. Game Loop
+    uint32_t updateApp = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_updateApplication");
+    uint32_t drawApp = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_drawApplication");
+    uint32_t handleTouchEvent = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_handleTouchEvent");
+    uint32_t snapshotLoaded = g_loader->get_symbol_vaddr(&g_main_mod, "Java_com_touchfoo_swordigo_Native_snapshotLoaded");
+    
+    // Tell the game that Google Sign-In succeeded so snapshot system is enabled
+    if (googleSignInCompleted) {
+        std::cout << "[Boot] Calling googleSignInCompleted(true) — enable snapshots" << std::endl;
+        g_emulator->call(googleSignInCompleted, {env_ptr, 0, 1}); // (env, this, true)
+    }
+
+    // NOTE: We used to call handleMenuButtonPress here to hide on-screen controls,
+    // but that function opens the game menu AND hides controls. The game then shows
+    // controls again on any touch input, making it useless. Instead, we use g_gl_hide_hud
+    // in the JNI bridge to make HUD draw calls fully transparent.
+    bool g_hide_touch_hud = true;  // Hide touch controls by default (desktop uses keyboard)
+    g_gl_hide_hud = g_hide_touch_hud;
+
+    if (updateApp && drawApp) {
+        // Real delta time
+        Uint64 last_ticks = SDL_GetTicks();
+        double accumulated_time = 0.0;
+        bool gui_visible = false;  // GUI hidden by default
+        bool debug_visible = false;  // F3 debug overlay
+        bool hint_shown = false;  // One-time "Press F1" hint
+        Uint64 hint_start_time = SDL_GetTicks();  // Show hint for first 5 seconds
+        float fps = 0.0f;
+        Uint64 fps_last_time = SDL_GetTicks();
+        int fps_frame_count = 0;
+        
+        const int TARGET_FRAMES = g_display_active ? 0 : 1000; // 0 = infinite
+        int completed_frames = 0;
+        
+        // Totals for summary
+        uint32_t total_draw_calls = 0;
+        uint32_t total_tex_binds = 0;
+        uint32_t total_tex_uploads = 0;
+        uint32_t total_matrix_ops = 0;
+        uint32_t total_state_changes = 0;
+        uint32_t total_asset_opens = 0;
+
+        std::cout << "\n========================================" << std::endl;
+        if (g_display_active) {
+            std::cout << "[Loop] Starting visual game loop (close window to stop)" << std::endl;
+        } else {
+            std::cout << "[Loop] Starting " << TARGET_FRAMES << "-frame stability test" << std::endl;
+        }
+        std::cout << "========================================\n" << std::endl;
+
+        // Get the display pointer from main (passed via extern)
+        extern Display* g_display_ptr;
+
+        // Input states for touch mapping and GUI integration
+        int mouse_x = 0;
+        int mouse_y = 0;
+        bool mouse_pressed = false;
+        bool click_swallowed_by_gui = false;
+        float last_mouse_x = -1.0f;
+        float last_mouse_y = -1.0f;
+
+        bool key_left = false;
+        bool key_right = false;
+        bool key_jump = false;
+        bool key_attack = false;
+        bool key_magic = false;
+        bool key_use_item = false;
+        bool key_menu = false;
+
+        // Camera override keys (Arrow keys — no numpad needed!)
+        bool arrow_left  = false;
+        bool arrow_right = false;
+        bool arrow_up    = false;
+        bool arrow_down  = false;
+        bool cam_key_pgup  = false;   // PageUp — raise camera
+        bool cam_key_pgdn  = false;   // PageDown — lower camera
+
+        bool running = true;
+        while (running) {
+            g_frame_stats.reset();
+            
+            // Real delta time
+            Uint64 now_ticks = SDL_GetTicks();
+            float dt_seconds = (now_ticks - last_ticks) / 1000.0f;
+            if (dt_seconds > 0.1f) dt_seconds = 0.016666668f;
+            if (dt_seconds < 0.001f) dt_seconds = 0.016666668f;
+            last_ticks = now_ticks;
+            accumulated_time += dt_seconds;
+            
+            // Show details for first 10 frames only
+            if (completed_frames < 10) {
+                g_emulator->quiet_mode = false;
+            } else {
+                g_emulator->quiet_mode = true;
+            }
+            
+            // --- Send TOUCH_MOVED every frame for held buttons (uses InputConfig positions) ---
+            for (int bi = 0; bi < g_input_config.button_count(); bi++) {
+                const TouchButton* btn = g_input_config.get_button(bi);
+                if (btn && btn->is_pressed) {
+                    call_handle_touch_event(handleTouchEvent, env_ptr, 0, 4, btn->touch_id, accumulated_time,
+                        btn->game_x, btn->game_y, btn->game_x, btn->game_y, 0);
+                }
+            }
+
+            // --- Process pending macro step 2 (delayed spell slot tap) ---
+            g_input_config.process_macros(accumulated_time,
+                [&](int action, int id, double time, float x, float y, float ox, float oy, int tap) {
+                    call_handle_touch_event(handleTouchEvent, env_ptr, 0, action, id, time, x, y, ox, oy, tap);
+                });
+
+            // --- Per-frame camera movement (Arrow keys, dt-scaled with acceleration) ---
+            if (g_cam_active) {
+                bool any_cam_key = arrow_left || arrow_right || arrow_up || arrow_down || cam_key_pgup || cam_key_pgdn;
+                if (any_cam_key) {
+                    float dx = 0, dy = 0, dz = 0;
+                    if (arrow_left)   dx -= 1.0f;
+                    if (arrow_right)  dx += 1.0f;
+                    if (arrow_up)     dy += 1.0f;
+                    if (arrow_down)   dy -= 1.0f;
+                    if (cam_key_pgup) dz -= 1.0f;  // zoom in
+                    if (cam_key_pgdn) dz += 1.0f;  // zoom out
+                    cam_move_scaled(dx, dy, dz, dt_seconds);
+                } else {
+                    cam_reset_accel();
+                }
+                extern void cam_write_to_guest();
+                cam_write_to_guest();
+            }
+
+            // --- Apply game speed multiplier ---
+            float game_dt = dt_seconds * g_game_speed;
+            uint32_t dt_hex;
+            memcpy(&dt_hex, &game_dt, 4);
+
+            // --- Pause / Frame Advance ---
+            if (!g_game_paused || g_step_one_frame) {
+                g_emulator->call(updateApp, {env_ptr, 0, dt_hex});
+                if (g_step_one_frame) {
+                    g_step_one_frame = false;
+                    mod_toast("Stepped 1 frame", 0.8f);
+                }
+            }
+
+            g_swordfare_gui.update_console_backend();
+            // Update Memory Research live root pointers every frame
+            if (g_swordfare_gui.is_research_ready()) {
+                swordfare::research::InstanceRegistry::instance().tick();
+                swordfare::research::LiveRoots rr;
+                rr.gsc_va       = g_game_scene_controller;
+                rr.hero_va      = g_hero_obj;
+                rr.health_va    = g_hero_health_comp;
+                rr.mana_va      = g_hero_mana_comp;
+                rr.char_ctrl_va = g_hero_char_ctrl_comp;
+                g_swordfare_gui.update_research_roots(rr);
+            }
+            // --- Death recovery: execv restart after ~3s ---
+            // The death state machine is tied to Android's ad system and can't be
+            // replicated (same issue as PS Vita port). Restart the process cleanly.
+            if (g_death_detected_countdown > 0) {
+                g_death_detected_countdown--;
+                if (g_death_detected_countdown == 0) {
+                    std::cout << "\n[Fix] Death timeout — restarting from checkpoint..." << std::endl;
+                    VideoBackground::cleanup();
+                    SDL_Quit();
+                    extern std::string g_lib_name;
+                    extern char** g_saved_argv;
+                    extern int g_saved_argc;
+                    std::vector<std::string> arg_strs;
+                    std::vector<char*> args;
+                    for (int i = 0; i < g_saved_argc; i++) {
+                        std::string a = g_saved_argv[i];
+                        if ((a == "--lib" || a == "--assets") && i + 1 < g_saved_argc) { i++; continue; }
+                        arg_strs.push_back(a);
+                    }
+                    arg_strs.push_back("--lib");
+                    arg_strs.push_back(g_lib_name);
+                    arg_strs.push_back("--assets");
+                    arg_strs.push_back(g_assets_dir);
+                    for (auto& s : arg_strs) args.push_back(&s[0]);
+                    args.push_back(nullptr);
+                    os_external::restart_process(arg_strs);
+                    exit(1);
+                }
+            }
+            
+            // Poll async IO thread completion callbacks
+            io_thread_poll();
+
+            // Handle async callbacks: if loadSnapshot was called, call snapshotLoaded
+            extern int g_snapshot_load_pending_count;
+            extern bool g_snapshot_has_data;
+            extern std::vector<uint8_t> g_snapshot_data;
+            while (g_snapshot_load_pending_count > 0 && snapshotLoaded) {
+                g_snapshot_load_pending_count--;
+                if (g_snapshot_has_data && !g_snapshot_data.empty()) {
+                    // Bump-allocate save buffer in guest high-memory so a second load
+                    // doesn't clobber the previous one. Aligned to 64 bytes for safety.
+                    // Region: 0x40000000 – 0xDFFFFFFF (well below the 0xE0000000 magic LR page).
+                    static uint32_t save_buf_addr = 0x40000000;
+                    uint32_t array_len = (uint32_t)g_snapshot_data.size();
+                    uint32_t needed    = 4 + array_len;
+                    uint32_t aligned   = (needed + 63u) & ~63u; // round up to 64-byte boundary
+                    if ((uint64_t)save_buf_addr + aligned > 0xE0000000ULL) {
+                        // Out of high-memory — wrap back to base (rare: only if many saves loaded)
+                        std::cerr << "[SAVE] Save buffer region exhausted, resetting to base" << std::endl;
+                        save_buf_addr = 0x40000000;
+                    }
+                    *(uint32_t*)(g_guest_memory + save_buf_addr) = array_len;
+                    memcpy(g_guest_memory + save_buf_addr + 4, g_snapshot_data.data(), array_len);
+                    std::cout << "[Callback] snapshotLoaded with " << array_len
+                              << " bytes of save data @ guest:0x" << std::hex << save_buf_addr << std::dec << std::endl;
+                    g_emulator->call(snapshotLoaded, {env_ptr, 0, 0, save_buf_addr}); // (env, this, name=null, data=array)
+                    save_buf_addr += aligned; // advance past this allocation
+                    g_snapshot_has_data = false; // always reset to avoid double-delivery
+                } else {
+                    std::cout << "[Callback] snapshotLoaded(null, null) — no saved game" << std::endl;
+                    g_emulator->call(snapshotLoaded, {env_ptr, 0, 0, 0}); // (env, this, name=null, data=null)
+                    g_snapshot_has_data = false; // reset unconditionally (prevents stale replay on next poll)
+                }
+            }
+            
+            if (g_display_active) {
+#ifdef VULKAN_BACKEND
+                if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    g_vk_backend.begin_frame();
+                } else
+#endif
+                {
+                    fbo_begin_game();
+                }
+            }
+            
+            g_emulator->call(drawApp, {env_ptr, 0});
+
+            if (g_display_active) {
+#ifdef VULKAN_BACKEND
+                if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    // Vulkan frame end + present is done after overlays
+                } else
+#endif
+                {
+                    draw_batcher_flush(); // Flush any pending batched draws
+                    fbo_end_game_and_blit(g_draw_w, g_draw_h, g_fbo_mode, &g_postfx);
+                    // Vanilla portal — DISABLED pending proper fixed-function implementation
+                    // if (!fbo_is_active()) {
+                    //     fbo_draw_portal_vanilla(g_draw_w, g_draw_h);
+                    // }
+                }
+            }
+
+            // Apply camera position override (after draw, before swap)
+            // cam_apply(g_emulator, g_guest_memory);
+            mod_apply_frame(g_guest_memory);
+
+            // Render GUI overlay (F1 toggle)
+            if (g_display_active && gui_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+                g_gui.render(mouse_x, mouse_y, mouse_pressed, g_win_w, g_win_h);
+            }
+            
+            // Render controls editor overlay (F2 toggle)
+            if (g_display_active && g_input_config.is_editing()) {
+                g_input_config.render_editor(g_win_w, g_win_h, mouse_x, mouse_y, mouse_pressed);
+                // Draw instruction text on top (uses GUI font renderer)
+                /* GL_ALL_ATTRIB_BITS causes a full pipeline flush on Mesa/NVIDIA.
+                 * We only change blend, depth, texture — save just those bits. */
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+                glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                // Controls editor header text
+                {
+                    std::string mode_str = "POSITION";
+                    if (g_input_config.get_editor_mode() == EDITOR_REBIND) mode_str = "REBIND (click button, press key)";
+                    g_gui.draw_string("CONTROLS EDITOR [" + mode_str + "]  |  F2=Save & Close  R=Toggle Rebind", 10, g_win_h - 20, 1.3f, 100, 200, 255, 255);
+                    g_gui.draw_string("Blue=Move  Green=Action  Orange=Menu  Purple=Magic Macro  Yellow=Custom", 10, g_win_h - 38, 1.1f, 180, 180, 200, 200);
+                }
+                // Draw readable button labels on each circle
+                {
+                    float sx = (float)g_win_w / 960.0f;
+                    float sy = (float)g_win_h / 544.0f;
+                    for (int i = 0; i < g_input_config.button_count(); i++) {
+                        TouchButton* btn = g_input_config.get_button(i);
+                        if (!btn) continue;
+                        float wx = btn->game_x * sx;
+                        float wy = btn->game_y * sy;
+                        float wr = btn->radius * std::min(sx, sy) * 0.7f;
+                        // Display name
+                        std::string dname = btn->display_name.empty() ? btn->name : btn->display_name;
+                        // Key binding text
+                        std::string key1 = InputConfig::scancode_name(btn->sdl_scancode);
+                        std::string key2 = InputConfig::scancode_name(btn->sdl_scancode_alt);
+                        std::string keytxt = "[" + key1;
+                        if (btn->sdl_scancode_alt > 0) keytxt += "/" + key2;
+                        keytxt += "]";
+                        // Color
+                        uint8_t cr = 255, cg = 255, cb = 255;
+                        if (btn->is_macro) { cr = 200; cg = 140; cb = 255; }
+                        else if (btn->is_custom) { cr = 255; cg = 255; cb = 100; }
+                        // Draw name above center
+                        g_gui.draw_string(dname, (int)(wx - dname.size() * 4), (int)(wy + 6), 1.0f, cr, cg, cb, 255);
+                        // Draw key binding below center
+                        g_gui.draw_string(keytxt, (int)(wx - keytxt.size() * 3.5f), (int)(wy - 10), 0.9f, 180, 180, 180, 200);
+                        if (btn->is_macro) {
+                            g_gui.draw_string("MACRO", (int)(wx - 16), (int)(wy - wr - 14), 0.8f, 180, 80, 220, 200);
+                        }
+                    }
+                }
+                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+                glPopAttrib();
+            }
+            
+            // Render F3 debug overlay
+            if (g_display_active && debug_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION);
+                glPushMatrix();
+                glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW);
+                glPushMatrix();
+                glLoadIdentity();
+                glDisable(GL_TEXTURE_2D);
+                glDisable(GL_LIGHTING);
+                glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                // Dark background strip
+                glColor4ub(0, 0, 0, 180);
+                glBegin(GL_QUADS);
+                glVertex2f(10, g_win_h - 10); glVertex2f(420, g_win_h - 10);
+                glVertex2f(420, g_win_h - 290); glVertex2f(10, g_win_h - 290);
+                glEnd();
+                // FPS text using simple pixel rendering
+                char dbg[256];
+                snprintf(dbg, sizeof(dbg), "FPS: %.1f", fps);
+                g_gui.draw_string(dbg, 20, g_win_h - 35, 2.0f, 0, 255, 100, 255);
+                snprintf(dbg, sizeof(dbg), "Frame: %d", completed_frames);
+                g_gui.draw_string(dbg, 20, g_win_h - 60, 1.4f, 200, 200, 200, 255);
+                snprintf(dbg, sizeof(dbg), "Draws: %d  TexBinds: %d", g_frame_stats.draw_calls, g_frame_stats.texture_binds);
+                g_gui.draw_string(dbg, 20, g_win_h - 80, 1.2f, 180, 180, 180, 255);
+                snprintf(dbg, sizeof(dbg), "Verts: %d  MatOps: %d", g_frame_stats.vertices_submitted, g_frame_stats.matrix_ops);
+                g_gui.draw_string(dbg, 20, g_win_h - 97, 1.2f, 180, 180, 180, 255);
+                snprintf(dbg, sizeof(dbg), "State: %d  TexUps: %d", g_frame_stats.state_changes, g_frame_stats.tex_uploads);
+                g_gui.draw_string(dbg, 20, g_win_h - 114, 1.2f, 180, 180, 180, 255);
+                snprintf(dbg, sizeof(dbg), "Render: %dx%d -> Window: %dx%d (Draw: %dx%d)", GAME_W, GAME_H, g_win_w, g_win_h, g_draw_w, g_draw_h);
+                g_gui.draw_string(dbg, 20, g_win_h - 131, 1.2f, 140, 140, 160, 255);
+                snprintf(dbg, sizeof(dbg), "Mouse: %d,%d  DT: %.4fs", mouse_x, mouse_y, dt_seconds);
+                g_gui.draw_string(dbg, 20, g_win_h - 148, 1.2f, 140, 140, 160, 255);
+                
+                const char* mode_str = "Unknown";
+                if (g_fbo_mode == FBOScale::SHARP_BILINEAR) mode_str = "Sharp-Bilinear";
+                else if (g_fbo_mode == FBOScale::NEAREST) mode_str = "Nearest";
+                else if (g_fbo_mode == FBOScale::CRT_SCANLINE) mode_str = "CRT Scanline";
+                else if (g_fbo_mode == FBOScale::FSR) mode_str = "FSR 1.0";
+                snprintf(dbg, sizeof(dbg), "Scale Mode: %s", mode_str);
+                g_gui.draw_string(dbg, 20, g_win_h - 165, 1.2f, 255, 200, 100, 255);
+
+                snprintf(dbg, sizeof(dbg), "Speed: %s  %s", mod_speed_label(), g_game_paused ? "|| PAUSED" : "");
+                g_gui.draw_string(dbg, 20, g_win_h - 185, 1.2f, 255, 180, 50, 255);
+                snprintf(dbg, sizeof(dbg), "F1:GUI F2:Ctrl F3:Dbg F4:Scale F5:Cam F6:Graphics F7:Video \\\\:Type F10:HUD");
+                g_gui.draw_string(dbg, 20, g_win_h - 202, 1.1f, 100, 100, 120, 200);
+                if (g_typing_mode) {
+                    g_gui.draw_string("TYPING MODE ACTIVE", 20, g_win_h - 218, 1.2f, 255, 100, 100, 255);
+                }
+                char cam_dbg[128];
+                cam_debug_string(cam_dbg, sizeof(cam_dbg));
+                g_gui.draw_string(cam_dbg, 20, g_win_h - 222, 1.1f,
+                    g_cam_active ? 0 : 120,
+                    g_cam_active ? 220 : 120,
+                    g_cam_active ? 100 : 120, 255);
+
+                // Binary info
+                const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+                if (binfo) {
+                    snprintf(dbg, sizeof(dbg), "Binary: %s (%s)",
+                             binfo->filename.c_str(), binfo->label.c_str());
+                    g_gui.draw_string(dbg, 20, g_win_h - 240, 1.2f, 100, 200, 255, 255);
+                } else {
+                    snprintf(dbg, sizeof(dbg), "Binary: %s", g_lib_name.c_str());
+                    g_gui.draw_string(dbg, 20, g_win_h - 240, 1.2f, 100, 200, 255, 255);
+                }
+
+                // PostFX info
+                if (g_postfx.enabled) {
+                    snprintf(dbg, sizeof(dbg), "PostFX: %s", g_postfx.preset_name);
+                    g_gui.draw_string(dbg, 20, g_win_h - 255, 1.2f, 255, 180, 100, 255);
+                } else {
+                    g_gui.draw_string("PostFX: Off", 20, g_win_h - 255, 1.2f, 120, 120, 120, 200);
+                }
+
+                // Graphics API
+                const char* api_str = (g_graphics_api == GraphicsAPI::VULKAN) ? "Vulkan" : "OpenGL";
+                snprintf(dbg, sizeof(dbg), "Graphics API: %s", api_str);
+                g_gui.draw_string(dbg, 20, g_win_h - 272, 1.2f, 100, 220, 255, 255);
+
+                glPopMatrix();
+                glMatrixMode(GL_PROJECTION);
+                glPopMatrix();
+                glPopAttrib();
+            }
+            
+            // Render mod tools overlay (speed indicator, toasts, pause screen)
+            if (g_display_active) {
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+                glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                mod_render_overlay(g_gui, g_win_w, g_win_h, dt_seconds);
+                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+                glPopAttrib();
+            }
+
+            // Render SRT overlay (inventory editor, etc.) — F11 toggle
+            if (g_display_active && !g_pod_enabled && g_srt_overlay.is_visible()) {
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+                glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                g_srt_overlay.render(g_gui, g_win_w, g_win_h,
+                                      mouse_x, mouse_y,
+                                      mouse_pressed, dt_seconds);
+                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+                glPopAttrib();
+            }
+
+            // Show hint for first 5 seconds
+            if (g_display_active && !gui_visible && (SDL_GetTicks() - hint_start_time) < 5000) {
+                glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION);
+                glPushMatrix();
+                glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW);
+                glPushMatrix();
+                glLoadIdentity();
+                glDisable(GL_TEXTURE_2D);
+                glDisable(GL_LIGHTING);
+                glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glColor4ub(0, 0, 0, 160);
+                int cx = g_win_w / 2;
+                int cy = g_win_h / 2;
+                glBegin(GL_QUADS);
+                glVertex2f(cx - 280, cy - 15); glVertex2f(cx + 280, cy - 15);
+                glVertex2f(cx + 280, cy + 15); glVertex2f(cx - 280, cy + 15);
+                glEnd();
+                g_gui.draw_string("WASD:Move  Arrows:Camera  +/-:Speed  F5:Cam  F11:Inventory  F12:Fullscreen", cx - 340, cy - 7, 1.1f, 0, 200, 255, 255);
+                glPopMatrix();
+                glMatrixMode(GL_PROJECTION);
+                glPopMatrix();
+                glPopAttrib();
+            }
+            
+            // Draw Swordfare GUI F3 Overlay if visible
+            if (g_display_active && !g_pod_enabled) {
+                g_swordfare_gui.begin_frame();
+                if (g_swordfare_gui.is_visible()) {
+                    SwordfareDebugStats st;
+                    st.fps           = fps;
+                    st.dt_seconds    = dt_seconds;
+                    st.frame_count   = completed_frames;
+                    st.draw_calls    = g_frame_stats.draw_calls;
+                    st.tex_binds     = g_frame_stats.texture_binds;
+                    st.vertices      = g_frame_stats.vertices_submitted;
+                    st.matrix_ops    = g_frame_stats.matrix_ops;
+                    st.state_changes = g_frame_stats.state_changes;
+                    st.tex_uploads   = g_frame_stats.tex_uploads;
+                    st.win_w         = g_win_w;
+                    st.win_h         = g_win_h;
+                    st.draw_w        = g_draw_w;
+                    st.draw_h        = g_draw_h;
+                    st.mouse_x       = mouse_x;
+                    st.mouse_y       = mouse_y;
+                    st.cam_x         = g_sre_cam_x_addr ? *(float*)(g_guest_memory + g_sre_cam_x_addr) : g_cam_off_x;
+                    st.cam_y         = g_sre_cam_y_addr ? *(float*)(g_guest_memory + g_sre_cam_y_addr) : g_cam_off_y;
+                    st.cam_z         = g_sre_cam_z_addr ? *(float*)(g_guest_memory + g_sre_cam_z_addr) : g_cam_off_z;
+                    st.cam_zoom      = 1.0f;
+                    st.hero_x        = g_sre_hero_pos_x_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_x_addr) : 0.0f;
+                    st.hero_y        = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
+                    st.hero_z        = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
+                    st.cam_active    = g_cam_active;
+                    st.typing_mode   = g_typing_mode;
+                    st.game_paused   = g_game_paused;
+                    st.postfx_on     = g_postfx.enabled;
+                    st.postfx_preset = g_postfx.preset_name;
+                    if (g_fbo_mode == FBOScale::SHARP_BILINEAR) st.scale_mode = "Sharp-Bilinear";
+                    else if (g_fbo_mode == FBOScale::NEAREST) st.scale_mode = "Nearest";
+                    else if (g_fbo_mode == FBOScale::CRT_SCANLINE) st.scale_mode = "CRT Scanline";
+                    else if (g_fbo_mode == FBOScale::FSR) st.scale_mode = "FSR 1.0";
+                    st.binary_name    = g_lib_name.c_str();
+                    st.speed_label    = mod_speed_label();
+                    st.graphics_api   = (g_graphics_api == GraphicsAPI::VULKAN) ? "Vulkan" : "OpenGL";
+                    g_swordfare_gui.draw_debug(st);
+                }
+                
+                // Draw SRE LUA buttons and overlays if present
+                if (sre_btn_array_addr && g_guest_memory) {
+                    void* overlays_ptr = sre_overlay_array_addr ? (g_guest_memory + sre_overlay_array_addr) : nullptr;
+                    bool globally_hidden = false;
+                    if (sre_btn_globally_hidden_addr) {
+                        globally_hidden = (*(int*)(g_guest_memory + sre_btn_globally_hidden_addr) != 0);
+                    }
+                    g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr, overlays_ptr, globally_hidden);
+                }
+                if (gui_visible) {
+                    GuiAction act = g_swordfare_gui.draw_control_panel(&gui_visible);
+                    if (act != GUI_NONE) {
+                        process_gui_action(act, running);
+                    }
+                }
+                g_swordfare_gui.draw_lua_console();
+                g_swordfare_gui.draw_lua_script_editor();
+                g_swordfare_gui.draw_lua_script_manager();
+                g_swordfare_gui.draw_mod_overlay(g_save_dir);
+                g_swordfare_gui.draw_research_overlay();
+                g_swordfare_gui.draw_research_hud();
+                g_swordfare_gui.draw_graphics_options_modal(g_postfx);
+                g_swordfare_gui.end_frame();
+            }
+
+            extern int g_gl_diag_frame;
+            g_gl_diag_frame++;
+            
+            // Present the frame
+            if (g_display_active && g_display_ptr) {
+#ifdef VULKAN_BACKEND
+                if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    g_vk_backend.end_frame_and_present(&g_postfx, (int)g_fbo_mode);
+                } else
+#endif
+                {
+                    RedstellGC::instance().process_main_thread_deletions();
+                    g_emu_frame_now = completed_frames;
+                    if (g_pod_enabled) pod_publish_frame();
+                    maybe_capture_frame();
+                    g_display_ptr->swap();
+                }
+                // Reclaim stale deferred guest frees every frame, on BOTH render paths
+                // (RL mod leak guard — the deferred-free list only drains on guest
+                // malloc, so free-heavy workloads need a frame-driven drain).
+                sre_guest_heap_drain_deferred();
+                
+                // Auto-toggle SDL text input when game requests it
+                if (g_text_input_active && !g_text_input_was_active) {
+                    SDL_StartTextInput(g_display_ptr->get_window());
+                    std::cout << "[TextInput] SDL text input enabled" << std::endl;
+                } else if (!g_text_input_active && g_text_input_was_active) {
+                    SDL_StopTextInput(g_display_ptr->get_window());
+                    std::cout << "[TextInput] SDL text input disabled" << std::endl;
+                }
+                g_text_input_was_active = g_text_input_active;
+
+                // Poll and process SDL window and input events
+                SDL_Event event;
+                while (SDL_PollEvent(&event)) {
+                    if (g_swordfare_gui.process_event(event)) {
+                        continue;
+                    }
+                    switch (event.type) {
+                        case SDL_EVENT_QUIT:
+                            running = false;
+                            break;
+                        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                            running = false;
+                            break;
+                        case SDL_EVENT_WINDOW_RESIZED:
+                            g_win_w = event.window.data1;
+                            g_win_h = event.window.data2;
+                            // Physical drawable size for GL rendering (HiDPI)
+                            SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
+                            std::cout << "[Display] Window resized to " << g_win_w << "x" << g_win_h
+                                      << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                            break;
+                        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                            if (event.button.button == SDL_BUTTON_LEFT) {
+                                mouse_pressed = true;
+                                mouse_x = event.button.x;
+                                mouse_y = g_win_h - event.button.y;
+                                
+                                // Controls editor intercepts all mouse events
+                                if (g_input_config.is_editing()) {
+                                    float gx = event.button.x * 960.0f / (float)g_win_w;
+                                    float gy = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
+                                    g_input_config.editor_mouse_down(gx, gy);
+                                    click_swallowed_by_gui = true;
+                                    break;
+                                }
+                                
+                                GuiAction gui_action = GUI_NONE;
+                                bool gui_consumed = false;
+                                if (gui_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+                                    gui_action = g_gui.handle_click(mouse_x, mouse_y, g_win_w, g_win_h);
+                                    gui_consumed = (gui_action != GUI_NONE) 
+                                                 || (mouse_y >= g_win_h - (int)(32 * g_gui.get_scale()))
+                                                 || g_gui.has_modal_open();
+                                }
+                                if (gui_consumed) {
+                                    click_swallowed_by_gui = true;
+                                    process_gui_action(gui_action, running);
+                                } else {
+                                    bool btn_hit = false;
+                                    if (g_graphics_api == GraphicsAPI::OPENGL) {
+                                        ImGuiIO& io = ImGui::GetIO();
+                                        if (io.WantCaptureMouse || g_swordfare_gui.is_input_blocked((float)event.button.x, (float)event.button.y)) {
+                                            btn_hit = true;
+                                        }
+                                    }
+                                    if (btn_hit) {
+                                        click_swallowed_by_gui = true;
+                                    } else {
+                                        click_swallowed_by_gui = false;
+                                        float x = event.button.x * 960.0f / (float)g_win_w;
+                                        float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
+                                        last_mouse_x = x;
+                                        last_mouse_y = y;
+                                        call_handle_touch_event(handleTouchEvent, env_ptr, 0, 1, 1, accumulated_time, x, y, x, y, 1);
+                                    }
+                                }
+                            }
+                            break;
+                        case SDL_EVENT_MOUSE_MOTION:
+                            mouse_x = event.motion.x;
+                            mouse_y = g_win_h - event.motion.y;
+                            if (g_input_config.is_editing() && mouse_pressed) {
+                                float gx = event.motion.x * 960.0f / (float)g_win_w;
+                                float gy = 544.0f - (event.motion.y * 544.0f / (float)g_win_h);
+                                g_input_config.editor_mouse_move(gx, gy);
+                            } else if (mouse_pressed && !click_swallowed_by_gui) {
+                                float x = event.motion.x * 960.0f / (float)g_win_w;
+                                float y = 544.0f - (event.motion.y * 544.0f / (float)g_win_h);
+                                call_handle_touch_event(handleTouchEvent, env_ptr, 0, 4, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 0);
+                                last_mouse_x = x;
+                                last_mouse_y = y;
+                            }
+                            break;
+                        case SDL_EVENT_MOUSE_BUTTON_UP:
+                            if (event.button.button == SDL_BUTTON_LEFT) {
+                                mouse_pressed = false;
+                                mouse_x = event.button.x;
+                                mouse_y = g_win_h - event.button.y;
+                                if (g_input_config.is_editing()) {
+                                    g_input_config.editor_mouse_up();
+                                } else if (!click_swallowed_by_gui) {
+                                    float x = event.button.x * 960.0f / (float)g_win_w;
+                                    float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
+                                    call_handle_touch_event(handleTouchEvent, env_ptr, 0, 2, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 0);
+                                    last_mouse_x = -1.0f;
+                                    last_mouse_y = -1.0f;
+                                }
+                                click_swallowed_by_gui = false;
+                            }
+                            break;
+                        case SDL_EVENT_MOUSE_WHEEL:
+                            if (g_cam_active) {
+                                cam_scroll_zoom((float)event.wheel.y);
+                            }
+                            break;
+                        case SDL_EVENT_KEY_DOWN:
+                            if (g_swordfare_gui.process_event(event)) {
+                                break;
+                            }
+                            if (should_block_keyboard()) {
+                                bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
+                                if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
+                            }
+                            if (event.key.key == SDLK_F1 && !event.key.repeat) {
+                                gui_visible = !gui_visible;
+                                std::cout << "[GUI] " << (gui_visible ? "ON" : "OFF") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F4 && !event.key.repeat) {
+                                g_swordfare_gui.toggle_mod_overlay();
+                                std::cout << "[ModOverlay] " << (g_swordfare_gui.is_mod_overlay_visible() ? "ON" : "OFF") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F2 && !event.key.repeat) {
+                                g_input_config.toggle_editor();
+                                if (!g_input_config.is_editing()) {
+                                    g_input_config.save(g_save_dir + "/controls.ini");
+                                    std::cout << "[Input] Controls config saved" << std::endl;
+                                }
+                                std::cout << "[Controls Editor] " << (g_input_config.is_editing() ? "ON" : "OFF") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F3 && !event.key.repeat) {
+                                if (event.key.mod & SDL_KMOD_CTRL) {
+                                    trigger_toggle_debug_info();
+                                    break;
+                                }
+                                debug_visible = !debug_visible;
+                                g_swordfare_gui.toggle_visible();
+                                std::cout << "[Debug] " << (debug_visible ? "ON" : "OFF") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_D && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
+                                trigger_toggle_collision_shapes();
+                                break;
+                            }
+                            if (event.key.key == SDLK_W && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
+                                trigger_toggle_combat_wireframe();
+                                break;
+                            }
+                            if (event.key.key == SDLK_F12 && !event.key.repeat) {
+                                SDL_WindowFlags flags = SDL_GetWindowFlags(g_display_ptr->get_window());
+                                if (flags & SDL_WINDOW_FULLSCREEN) {
+                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), false);
+                                    // Query actual window size — preserves native aspect ratio (16:10, etc.)
+                                    int ww, wh;
+                                    SDL_GetWindowSize(g_display_ptr->get_window(), &ww, &wh);
+                                    g_win_w = ww;
+                                    g_win_h = wh;
+                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
+                                    std::cout << "[Display] Windowed " << ww << "x" << wh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                                } else {
+                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), true);
+                                    // Get actual fullscreen resolution (logical + physical)
+                                    int fw, fh;
+                                    SDL_GetWindowSize(g_display_ptr->get_window(), &fw, &fh);
+                                    g_win_w = fw;
+                                    g_win_h = fh;
+                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
+                                    std::cout << "[Display] Fullscreen " << fw << "x" << fh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_F5 && !event.key.repeat) {
+                                cam_toggle();
+                                break;
+                            }
+                            if (event.key.key == SDLK_M && !event.key.repeat) {
+                                if (g_cam_active) {
+                                    g_cam_pov_mode = !g_cam_pov_mode;
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "Camera POV: %s", g_cam_pov_mode ? "ON" : "OFF");
+                                    mod_toast(msg, 1.5f);
+                                    cam_write_to_guest();
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_F6 && !event.key.repeat) {
+                                g_swordfare_gui.toggle_graphics_options();
+                                break;
+                            }
+                            if (event.key.key == SDLK_R && !event.key.repeat) {
+                                std::cout << "[PostFX] Reloading custom postfx config..." << std::endl;
+                                if (postfx_load_custom_json(g_postfx)) {
+                                    std::cout << "[PostFX] Successfully loaded custom config!" << std::endl;
+                                } else {
+                                    std::cout << "[PostFX] Failed to load custom config, generating default template." << std::endl;
+                                    postfx_save_default_json();
+                                    postfx_load_custom_json(g_postfx);
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
+                                g_typing_mode = !g_typing_mode;
+                                if (g_typing_mode) {
+                                    SDL_StartTextInput(g_display_ptr->get_window());
+                                    std::cout << "[Keyboard] Typing mode ON — keyboard sends FWKeyboard events" << std::endl;
+                                } else {
+                                    SDL_StopTextInput(g_display_ptr->get_window());
+                                    std::cout << "[Keyboard] Typing mode OFF — keyboard sends touch events" << std::endl;
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                                if (!g_video_background_enabled) {
+                                    if (!ffmpeg_dyn_available() && !ffmpeg_dyn_init()) {
+                                        std::cout << "[VideoBackground] Cannot enable video background: FFmpeg runtime libraries not found on this system." << std::endl;
+                                        break;
+                                    }
+                                }
+                                g_video_background_enabled = !g_video_background_enabled;
+                                std::cout << "[VideoBackground] Video playback: " << (g_video_background_enabled ? "ENABLED" : "DISABLED") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F10 && !event.key.repeat) {
+                                // Toggle host-side touch HUD visibility
+                                // (paints over button areas instead of calling handleMenuButtonPress
+                                //  which would open the game's settings menu)
+                                g_hide_touch_hud = !g_hide_touch_hud;
+                                g_gl_hide_hud = g_hide_touch_hud;
+                                std::cout << "[Keyboard] Touch HUD: " << (g_hide_touch_hud ? "HIDDEN" : "VISIBLE") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F8 && !event.key.repeat) {
+                                mod_toggle_pause();
+                                break;
+                            }
+                            if (event.key.key == SDLK_F9 && !event.key.repeat) {
+                                mod_step_frame();
+                                break;
+                            }
+                            if (event.key.key == SDLK_EQUALS && !event.key.repeat) {
+                                mod_speed_up();
+                                break;
+                            }
+                            if (event.key.key == SDLK_MINUS && !event.key.repeat) {
+                                mod_speed_down();
+                                break;
+                            }
+                            if (event.key.key == SDLK_0 && !event.key.repeat) {
+                                mod_speed_reset();
+                                break;
+                            }
+                        case SDL_EVENT_KEY_UP: {
+                            if (should_block_keyboard()) {
+                                bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
+                                if (!is_toggle) break;
+                            }
+                            bool is_down = (event.type == SDL_EVENT_KEY_DOWN);
+                            int scancode = event.key.scancode;
+
+                            // ---- Virtual Key translation for Android mods ----
+                            bool handled_virtual = false;
+                            extern bool g_sre_overlay_blocking;
+                            bool block_virtual = g_sre_overlay_blocking && (event.key.key != SDLK_ESCAPE && event.key.key != SDLK_X);
+                            if (!block_virtual) {
+                                if (event.key.key == SDLK_TAB) {
+                                    handled_virtual = simulate_virtual_key("Open", is_down);
+                                } else if (event.key.key == SDLK_E) {
+                                    handled_virtual = simulate_virtual_key("Use", is_down);
+                                } else if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_X) {
+                                    handled_virtual = simulate_virtual_key("X", is_down);
+                                } else if (event.key.key == SDLK_V) {
+                                    handled_virtual = simulate_virtual_key("Armory", is_down);
+                                // NOTE: K is the attack/swing key — do NOT intercept it for SRE overlays.
+                                // NOTE: W/S are reserved for world-depth movement in desktop WASD controls.
+                                } else if (event.key.key == SDLK_P) {
+                                    handled_virtual = simulate_virtual_key("+ Keybind", is_down);
+                                }
+                            }
+                            if (handled_virtual) {
+                                break;
+                            }
+                            
+                            // ---- TEXT INPUT MODE: intercept keys when game requests text input ----
+                            if (g_text_input_active && is_down) {
+                                if (event.key.key == SDLK_RETURN) {
+                                    std::cout << "[TextInput] Enter — confirming \"" << g_text_input_buffer << "\"" << std::endl;
+                                    call_text_input_did_change(env_ptr, g_text_input_buffer);
+                                    call_text_input_did_finish(env_ptr);
+                                    g_text_input_active = false;
+                                    g_text_input_buffer.clear();
+                                    break;
+                                } else if (event.key.key == SDLK_ESCAPE) {
+                                    std::cout << "[TextInput] Escape — cancelling" << std::endl;
+                                    g_text_input_buffer.clear();
+                                    call_text_input_did_change(env_ptr, "");
+                                    call_text_input_did_finish(env_ptr);
+                                    g_text_input_active = false;
+                                    break;
+                                } else if (event.key.key == SDLK_BACKSPACE) {
+                                    if (!g_text_input_buffer.empty()) {
+                                        g_text_input_buffer.pop_back();
+                                        call_text_input_did_change(env_ptr, g_text_input_buffer);
+                                        std::cout << "[TextInput] Backspace → \"" << g_text_input_buffer << "\"" << std::endl;
+                                    }
+                                    break;
+                                }
+                                // Other keys: fall through to typing mode or normal handling
+                                // (text characters come via SDL_EVENT_TEXT_INPUT, not KEY_DOWN)
+                                break; // Eat all other key_down events during text input
+                            }
+                            if (g_text_input_active && !is_down) break; // Eat key-up too
+
+                            // ---- TYPING MODE: route through FWKeyboard API ----
+                            if (g_typing_mode && g_fw_sendKeyDown && g_fw_sendKeyUp) {
+                                // Map SDL keysym to FWKeyboard key codes
+                                // Based on Caver engine internal codes (iOS/Android keycodes)
+                                uint32_t fw_key = 0;
+                                switch (event.key.key) {
+                                    case SDLK_RETURN:     fw_key = 0x24; break; // Enter
+                                    case SDLK_BACKSPACE:  fw_key = 0x33; break; // Backspace/Delete
+                                    case SDLK_ESCAPE:     fw_key = 0x35; break; // Escape
+                                    case SDLK_LEFT:       fw_key = 0x7B; break; // Arrow left
+                                    case SDLK_RIGHT:      fw_key = 0x7C; break; // Arrow right
+                                    case SDLK_DOWN:       fw_key = 0x7D; break; // Arrow down
+                                    case SDLK_UP:         fw_key = 0x7E; break; // Arrow up
+                                    case SDLK_TAB:        fw_key = 0x30; break; // Tab
+                                    case SDLK_SPACE:      fw_key = 0x31; break; // Space
+                                    case SDLK_DELETE:     fw_key = 0x75; break; // Forward delete
+                                    // Menu button (same as handleMenuButtonPress)
+                                    case SDLK_F10:        fw_key = 0x5d; break;
+                                    default: break;
+                                }
+
+                                if (fw_key != 0) {
+                                    uint32_t kb = get_fw_keyboard();
+                                    if (kb) {
+                                        if (is_down)
+                                            call_fw_key_event(g_fw_sendKeyDown, kb, fw_key, 0, accumulated_time);
+                                        else
+                                            call_fw_key_event(g_fw_sendKeyUp, kb, fw_key, 0, accumulated_time);
+                                    }
+                                }
+                                break; // Don't fall through to InputConfig
+                            }
+                            
+                            // ---- NORMAL MODE: route through InputConfig ----
+                            extern bool g_sre_overlay_blocking;
+                            if (!g_input_config.is_editing() && !g_sre_overlay_blocking) {
+                                bool controls_hidden = false;
+                                if (sre_controls_hidden_addr) {
+                                    controls_hidden = (*(int*)(g_guest_memory + sre_controls_hidden_addr) != 0);
+                                }
+                                if (event.key.key == SDLK_A || event.key.key == SDLK_D) {
+                                    if (is_down && g_cam_active && g_cam_pov_mode) {
+                                        g_cam_pov_facing = (event.key.key == SDLK_A) ? -1.0f : 1.0f;
+                                        cam_write_to_guest();
+                                    }
+                                }
+                                if (controls_hidden) {
+                                    break;
+                                }
+
+                                if (event.key.key == SDLK_W || event.key.key == SDLK_S) {
+                                    break;
+                                }
+
+                                // Prevent camera keys from moving the character when camera mode is active
+                                bool is_cam_key = (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT ||
+                                                   event.key.key == SDLK_UP || event.key.key == SDLK_DOWN ||
+                                                   event.key.key == SDLK_EQUALS || event.key.key == SDLK_MINUS ||
+                                                   event.key.key == SDLK_KP_PLUS || event.key.key == SDLK_KP_MINUS);
+                                if (g_cam_active && is_cam_key) {
+                                    // Bypassed, do not route to game controls
+                                } else {
+                                    int btn_idx = g_input_config.find_by_scancode(scancode);
+                                    if (btn_idx >= 0) {
+                                        TouchButton* btn = g_input_config.get_button(btn_idx);
+                                        if (btn && btn->is_pressed != is_down) {
+                                            btn->is_pressed = is_down;
+                                            
+                                            if (is_down && btn->is_macro && btn->macro_open_touch_id >= 0) {
+                                                // Macro step 1: press the opener button (use_item)
+                                                TouchButton* opener = nullptr;
+                                                for (int j = 0; j < g_input_config.button_count(); j++) {
+                                                    TouchButton* t = g_input_config.get_button(j);
+                                                    if (t && t->touch_id == btn->macro_open_touch_id) { opener = t; break; }
+                                                }
+                                                if (opener) {
+                                                    int macro_tid = 100 + btn->touch_id;
+                                                    call_handle_touch_event(handleTouchEvent, env_ptr, 0,
+                                                        1, macro_tid, accumulated_time,
+                                                        opener->game_x, opener->game_y, opener->game_x, opener->game_y, 1);
+                                                }
+                                                btn->macro_pending = true;
+                                                btn->macro_stage = 1;
+                                                btn->macro_fire_time = (uint64_t)(accumulated_time * 1000.0);
+                                            } else if (!btn->is_macro) {
+                                                // Normal button press/release
+                                                call_handle_touch_event(handleTouchEvent, env_ptr, 0,
+                                                    is_down ? 1 : 2, btn->touch_id, accumulated_time,
+                                                    btn->game_x, btn->game_y, btn->game_x, btn->game_y,
+                                                    is_down ? 1 : 0);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            } else {
+                                // Editor: capture key for rebinding
+                                if (is_down && g_input_config.editor_handle_key(scancode)) break;
+                            }
+                            
+                            // Camera + arrow keys (camera-only, not game movement)
+                            switch (event.key.key) {
+                                case SDLK_LEFT:
+                                    if (g_cam_active) arrow_left = is_down;
+                                    break;
+                                case SDLK_RIGHT:
+                                    if (g_cam_active) arrow_right = is_down;
+                                    break;
+                                case SDLK_UP:
+                                    if (g_cam_active) arrow_up = is_down;
+                                    break;
+                                case SDLK_DOWN:
+                                    if (g_cam_active) arrow_down = is_down;
+                                    break;
+                                case SDLK_PAGEUP:
+                                    if (g_cam_active) cam_key_pgup = is_down;
+                                    break;
+                                case SDLK_PAGEDOWN:
+                                    if (g_cam_active) cam_key_pgdn = is_down;
+                                    break;
+                                case SDLK_EQUALS:
+                                case SDLK_KP_PLUS:
+                                    if (g_cam_active) cam_key_pgup = is_down;
+                                    break;
+                                case SDLK_MINUS:
+                                case SDLK_KP_MINUS:
+                                    if (g_cam_active) cam_key_pgdn = is_down;
+                                    break;
+                                case SDLK_HOME:
+                                    if (is_down && g_cam_active) cam_reset();
+                                    break;
+                            }
+                            break;
+                        }
+                        // --- Text input events ---
+                        case SDL_EVENT_TEXT_INPUT: {
+                            const char* text = event.text.text;
+                            if (g_text_input_active) {
+                                // Game-driven text input: append to buffer and notify game
+                                g_text_input_buffer += text;
+                                call_text_input_did_change(env_ptr, g_text_input_buffer);
+                                std::cout << "[TextInput] \"" << g_text_input_buffer << "\"" << std::endl;
+                            } else if (g_typing_mode && g_fw_sendKeyChar) {
+                                // Manual typing mode (F7): send through FWKeyboard
+                                for (int ci = 0; text[ci] != '\0'; ci++) {
+                                    uint32_t ch = (uint32_t)(unsigned char)text[ci];
+                                    fw_send_char(ch, accumulated_time);
+                                }
+                            }
+                            break;
+                        }
+                        // --- Multi-touch support (touchscreen laptops, up to 10 fingers) ---
+                        case SDL_EVENT_FINGER_DOWN: {
+                            // SDL finger coords are normalized 0.0-1.0, scale to game 960x544
+                            float x = event.tfinger.x * 960.0f;
+                            float y = (1.0f - event.tfinger.y) * 544.0f;  // flip Y
+                            int finger_id = (int)(event.tfinger.fingerID % 10) + 20;  // IDs 20-29 for touch
+                            extern bool g_sre_overlay_blocking;
+                            if (!g_sre_overlay_blocking) {
+                                call_handle_touch_event(handleTouchEvent, env_ptr, 0, 1, finger_id, accumulated_time, x, y, x, y, 1);
+                            }
+                            break;
+                        }
+                        case SDL_EVENT_FINGER_UP: {
+                            float x = event.tfinger.x * 960.0f;
+                            float y = (1.0f - event.tfinger.y) * 544.0f;
+                            int finger_id = (int)(event.tfinger.fingerID % 10) + 20;
+                            extern bool g_sre_overlay_blocking;
+                            if (!g_sre_overlay_blocking) {
+                                call_handle_touch_event(handleTouchEvent, env_ptr, 0, 2, finger_id, accumulated_time, x, y, x, y, 0);
+                            }
+                            break;
+                        }
+                        case SDL_EVENT_FINGER_MOTION: {
+                            float x = event.tfinger.x * 960.0f;
+                            float y = (1.0f - event.tfinger.y) * 544.0f;
+                            float old_x = (event.tfinger.x - event.tfinger.dx) * 960.0f;
+                            float old_y = (1.0f - (event.tfinger.y - event.tfinger.dy)) * 544.0f;
+                            int finger_id = (int)(event.tfinger.fingerID % 10) + 20;
+                            extern bool g_sre_overlay_blocking;
+                            if (!g_sre_overlay_blocking) {
+                                call_handle_touch_event(handleTouchEvent, env_ptr, 0, 4, finger_id, accumulated_time, x, y, old_x, old_y, 0);
+                            }
+                            break;
+                        }
+                        // --- Gamepad support ---
+                        case SDL_EVENT_GAMEPAD_ADDED: {
+                            if (!g_gamepad) {
+                                g_gamepad = SDL_OpenGamepad(event.gdevice.which);
+                                if (g_gamepad)
+                                    std::cout << "[Input] Gamepad connected: " << SDL_GetGamepadName(g_gamepad) << std::endl;
+                            }
+                            break;
+                        }
+                        case SDL_EVENT_GAMEPAD_REMOVED: {
+                            if (g_gamepad && event.gdevice.which == SDL_GetJoystickID(SDL_GetGamepadJoystick(g_gamepad))) {
+                                SDL_CloseGamepad(g_gamepad);
+                                g_gamepad = nullptr;
+                                std::cout << "[Input] Gamepad disconnected" << std::endl;
+                            }
+                            break;
+                        }
+                        case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+                            if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) {
+                                float val = event.gaxis.value / 32768.0f;
+                                if (g_cam_active) {
+                                    cam_move_scaled(val, 0.0f, 0.0f, dt_seconds);
+                                } else {
+                                    extern bool g_sre_overlay_blocking;
+                                    if (!g_sre_overlay_blocking) {
+                                        bool new_left = (val < -0.2f);
+                                        bool new_right = (val > 0.2f);
+                                        
+                                        if (key_left != new_left) {
+                                            key_left = new_left;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0,
+                                                key_left ? 1 : 2, 6, accumulated_time,
+                                                60.0f, 94.0f, 60.0f, 94.0f, key_left ? 1 : 0);
+                                        }
+                                        if (key_right != new_right) {
+                                            key_right = new_right;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0,
+                                                key_right ? 1 : 2, 7, accumulated_time,
+                                                155.0f, 94.0f, 155.0f, 94.0f, key_right ? 1 : 0);
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                        case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+                            bool gp_down = (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+                            extern bool g_sre_overlay_blocking;
+                            if (!g_sre_overlay_blocking) {
+                                switch (event.gbutton.button) {
+                                    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+                                        if (key_left != gp_down) {
+                                            key_left = gp_down;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0, gp_down ? 1 : 2, 6, accumulated_time, 60.0f, 94.0f, 60.0f, 94.0f, gp_down ? 1 : 0);
+                                        }
+                                        break;
+                                    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+                                        if (key_right != gp_down) {
+                                            key_right = gp_down;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0, gp_down ? 1 : 2, 7, accumulated_time, 155.0f, 94.0f, 155.0f, 94.0f, gp_down ? 1 : 0);
+                                        }
+                                        break;
+                                    case SDL_GAMEPAD_BUTTON_SOUTH:
+                                        if (key_jump != gp_down) {
+                                            key_jump = gp_down;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0, gp_down ? 1 : 2, 5, accumulated_time, 900.0f, 94.0f, 900.0f, 94.0f, gp_down ? 1 : 0);
+                                        }
+                                        break;
+                                    case SDL_GAMEPAD_BUTTON_WEST:
+                                        if (key_attack != gp_down) {
+                                            key_attack = gp_down;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0, gp_down ? 1 : 2, 8, accumulated_time, 790.0f, 94.0f, 790.0f, 94.0f, gp_down ? 1 : 0);
+                                        }
+                                        break;
+                                    case SDL_GAMEPAD_BUTTON_NORTH:
+                                        if (key_magic != gp_down) {
+                                            key_magic = gp_down;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0, gp_down ? 1 : 2, 10, accumulated_time, 900.0f, 184.0f, 900.0f, 184.0f, gp_down ? 1 : 0);
+                                        }
+                                        break;
+                                    case SDL_GAMEPAD_BUTTON_EAST:
+                                    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+                                    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+                                        if (key_use_item != gp_down) {
+                                            key_use_item = gp_down;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0, gp_down ? 1 : 2, 12, accumulated_time, 425.0f, 54.0f, 425.0f, 54.0f, gp_down ? 1 : 0);
+                                        }
+                                        break;
+                                    case SDL_GAMEPAD_BUTTON_START:
+                                        if (key_menu != gp_down) {
+                                            key_menu = gp_down;
+                                            call_handle_touch_event(handleTouchEvent, env_ptr, 0, gp_down ? 1 : 2, 9, accumulated_time, 48.0f, 500.0f, 48.0f, 500.0f, gp_down ? 1 : 0);
+                                        }
+                                        break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // FPS counter
+            fps_frame_count++;
+            Uint64 fps_now = SDL_GetTicks();
+            if (fps_now - fps_last_time >= 1000) {
+                fps = fps_frame_count * 1000.0f / (fps_now - fps_last_time);
+                fps_frame_count = 0;
+                fps_last_time = fps_now;
+            }
+            
+            completed_frames++;
+            
+            // Accumulate totals
+            total_draw_calls += g_frame_stats.draw_calls;
+            total_tex_binds += g_frame_stats.texture_binds;
+            total_tex_uploads += g_frame_stats.tex_uploads;
+            total_matrix_ops += g_frame_stats.matrix_ops;
+            total_state_changes += g_frame_stats.state_changes;
+            total_asset_opens += g_frame_stats.asset_opens;
+            
+            // Print stats periodically
+            if (completed_frames == 1 || completed_frames == 10 || 
+                completed_frames % 100 == 0) {
+                std::cout << "[Frame " << completed_frames << "] "
+                          << "draws=" << g_frame_stats.draw_calls
+                          << " verts=" << g_frame_stats.vertices_submitted
+                          << " tex_binds=" << g_frame_stats.texture_binds
+                          << " tex_uploads=" << g_frame_stats.tex_uploads
+                          << " vtx_calls=" << g_frame_stats.vertex_pointer_calls
+                          << " texc_calls=" << g_frame_stats.texcoord_pointer_calls
+                          << " matrix=" << g_frame_stats.matrix_ops
+                          << " state=" << g_frame_stats.state_changes
+                          << std::endl;
+            }
+            
+            // In headless mode, stop after TARGET_FRAMES
+            if (TARGET_FRAMES > 0 && completed_frames >= TARGET_FRAMES) running = false;
+        }
+
+        // Cleanup
+        g_input_config.save(g_save_dir + "/controls.ini");
+        if (g_gamepad) {
+            SDL_CloseGamepad(g_gamepad);
+            g_gamepad = nullptr;
+        }
+
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "[RESULT] Completed " << completed_frames << " frames" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "  Total draw calls:      " << total_draw_calls << std::endl;
+        std::cout << "  Total tex binds:       " << total_tex_binds << std::endl;
+        std::cout << "  Total tex uploads:     " << total_tex_uploads << std::endl;
+        std::cout << "  Total matrix ops:      " << total_matrix_ops << std::endl;
+        std::cout << "  Total state changes:   " << total_state_changes << std::endl;
+        std::cout << "  Total asset opens:     " << total_asset_opens << std::endl;
+        std::cout << "  Unique textures seen:  " << g_frame_stats.unique_textures_bound << std::endl;
+        std::cout << "  Avg draw/frame:        " << (completed_frames ? total_draw_calls / completed_frames : 0) << std::endl;
+        std::cout << "  Avg tex_bind/frame:    " << (completed_frames ? total_tex_binds / completed_frames : 0) << std::endl;
+        std::cout << "========================================" << std::endl;
+        
+        // Asset Proof Summary
+        std::cout << "\n--- Asset Proof ---" << std::endl;
+        std::cout << "  Menu scene:      " << (g_frame_stats.menu_scene_loaded ? "✓ LOADED" : "✗ missing") << std::endl;
+        std::cout << "  Title texture:   " << (g_frame_stats.title_texture_loaded ? "✓ LOADED" : "✗ missing") << std::endl;
+        std::cout << "  Common atlas:    " << (g_frame_stats.common_atlas_loaded ? "✓ LOADED" : "✗ missing") << std::endl;
+        std::cout << "  Menu background: " << (g_frame_stats.menu_back_loaded ? "✓ LOADED" : "✗ missing") << std::endl;
+        std::cout << "-------------------\n" << std::endl;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// copy_and_relocate — the ARM64 instruction relocator now lives in its own
+// translation unit (src/platform/arm64_reloc.cpp) so the SAME single definition
+// is reused by the app AND by the standalone hook-backend unit tests without
+// dragging in main.cpp's heavy dependencies. The declaration comes from
+// platform/arm64_reloc.h (included below); behavior is byte-for-byte identical
+// to the previous inline definition that lived here.
+// ---------------------------------------------------------------------------
+#include "platform/arm64_reloc.h"
+
+extern "C" void advance_guest_virtual_clock(float dt);
+
+// ===========================================================================
+// ARM64 live-root discovery for the Memory Research inspector
+// ---------------------------------------------------------------------------
+// The ARM32 backends (emulator.cpp, emulator_dynarmic32.cpp) fill the
+// g_game_scene_controller / g_hero_* observer globals from code hooks.  The
+// ARM64 JIT installs no equivalent hooks, so on a SRE13 ARM64 session every
+// root in the Live Inspector read "not yet observed".
+//
+// libsre13 already hooks Caver::GameSceneController::Update and exports the
+// live controller through its gsc_get() accessor.  Rather than duplicating that
+// hook, we ask SRE for the pointer (a trivially-returning call, throttled) and
+// then read the hero component pointers straight out of guest memory at the
+// documented ARM64 offsets — the same offsets the embedded recovery catalog
+// publishes for struct 'GameSceneController'.
+// ===========================================================================
+static uint64_t s_gsc_get_fn = 0;   // libsre13 gsc_get() VA (0 = unavailable)
+
+// Component offsets inside Caver::GameSceneController (ARM64, v1.4.13).
+// Source: docs/sre13/GameSceneController.md and the embedded recovery catalog
+// (struct_fields rows for struct_id = 'GameSceneController').
+static constexpr uint32_t kGscOffHero     = 0xD8;   // SceneObject*
+static constexpr uint32_t kGscOffCharCtrl = 0xE0;   // CharControllerComponent*
+static constexpr uint32_t kGscOffHealth   = 0xF0;   // HealthComponent*
+static constexpr uint32_t kGscOffMana     = 0xF8;   // ManaComponent*
+
+// Bounds-checked 32-bit guest read (returns 0 for anything out of range).
+static uint32_t read_guest_ptr32(uint64_t va) {
+    if (!g_guest_memory || va < 0x10000 || va + 4 > GUEST_MEM_SIZE) return 0;
+    uint32_t v = 0;
+    std::memcpy(&v, g_guest_memory + va, 4);
+    return v;
+}
+
+// Resolve libsre13's gsc_get() once, after the SRE module is loaded.
+static void resolve_arm64_research_symbols() {
+    s_gsc_get_fn = 0;
+    if (swordi_abi >= 13 && g_loader_64)
+        s_gsc_get_fn = g_loader_64->get_symbol_vaddr(&g_sre_mod, "gsc_get");
+    if (s_gsc_get_fn)
+        std::cout << "[Research] ARM64 roots: SRE gsc_get() resolved at 0x"
+                  << std::hex << s_gsc_get_fn << std::dec << std::endl;
+    else
+        std::cout << "[Research] ARM64 roots: gsc_get() unavailable — the Live "
+                     "Inspector will report roots as unobserved" << std::endl;
+}
+
+// Called once per frame from the ARM64 loop (after the frame was run).
+static void update_arm64_research_roots() {
+    if (!g_emulator_64 || !g_guest_memory) return;
+
+    // Poll for the controller while we have none (1 s), then re-validate every
+    // ~5 s at 60 fps — room transitions re-create the controller.
+    if (s_gsc_get_fn != 0) {
+        static int retry_in = 0;
+        if (retry_in > 0) --retry_in;
+        if (g_game_scene_controller == 0 || retry_in <= 0) {
+            retry_in = (g_game_scene_controller == 0) ? 60 : 300;
+            const bool first = (g_game_scene_controller == 0);
+            const uint64_t gsc = g_emulator_64->call(s_gsc_get_fn, {});
+            if (gsc >= 0x10000 && gsc + 0x200 < GUEST_MEM_SIZE) {
+                g_game_scene_controller = static_cast<uint32_t>(gsc);
+                if (first)
+                    std::cout << "[Research] ARM64 roots: GameSceneController @ 0x"
+                              << std::hex << g_game_scene_controller << std::dec
+                              << " (SRE gsc_get)" << std::endl;
+            } else {
+                g_game_scene_controller = 0;   // no level running yet
+            }
+        }
+    }
+
+    const uint32_t gsc = g_game_scene_controller;
+    if (gsc == 0) return;
+    const uint64_t base = static_cast<uint64_t>(gsc);
+    g_hero_obj            = read_guest_ptr32(base + kGscOffHero);
+    g_hero_char_ctrl_comp = read_guest_ptr32(base + kGscOffCharCtrl);
+    g_hero_health_comp    = read_guest_ptr32(base + kGscOffHealth);
+    g_hero_mana_comp      = read_guest_ptr32(base + kGscOffMana);
+}
+
+void load_and_boot_arm64() {
+    std::string so_path = get_data_path(g_lib_name);
+    std::cout << "[Loader64] Loading: " << so_path << std::endl;
+    uint64_t load_addr = 0x1000000;
+    
+    BOOT_LOADING(0.10f, "Loading game binary");
+    // 1. Load ELF (ARM64)
+    if (g_loader_64->load(&g_main_mod_64, so_path, load_addr) != 0) {
+        std::cerr << "[Loader64] Failed to load SO" << std::endl;
+        exit(1);
+    }
+
+    // Determine ABI version from SHA256 / instance metadata
+    {
+        std::string sha = BinarySelector::compute_sha256(so_path);
+        std::cout << "[ABI] Binary SHA256: " << sha << std::endl;
+        if (sha == "f847814d1b6f81268567ed5ec2473fea4d4ee3b75d2c6fec7057227225e989f8" || // 1.4.12 arm64
+            sha == "08d49dd6f7f8639a4c59f290ff2bb79254accf710f530bf53c2fce1659191c9e") {  // 1.4.12 arm32
+            swordi_abi = 12;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.12 (swordi_abi = 12)" << std::endl;
+        } else if (sha == "c2f567a34ec7bed9cf6b0af0ce88e9c925c11e5c2a2f2fbd8604461cf93aae7d" || // 1.4.13 arm64
+                   sha == "4e03fb28b16e9ed729b774ffa34f2b370742a8e6bee31f221083908e7a1089fa") {  // 1.4.13 arm32
+            swordi_abi = 13;
+            std::cout << "[ABI] Detected Swordigo ABI v1.4.13 (swordi_abi = 13)" << std::endl;
+        } else {
+            const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+            if (binfo && binfo->version.find("1.4.13") != std::string::npos) {
+                swordi_abi = 13;
+                std::cout << "[ABI] Detected Swordigo ABI v1.4.13 via instance metadata (swordi_abi = 13)" << std::endl;
+            } else {
+                swordi_abi = 12;
+                std::cout << "[ABI] Unknown binary hash, fallback to swordi_abi = 12" << std::endl;
+            }
+        }
+    }
+    
+    BOOT_LOADING(0.30f, "Relocating symbols");
+    // 2. Internal Relocations
+    g_loader_64->relocate(&g_main_mod_64);
+    
+    // Initialize TrampolineMgr before symbol resolution
+    TrampolineMgr::instance().init(g_guest_memory, load_addr);
+
+    // Populate render-guard text-segment bounds (Crash-Report-03 fix).
+    // g_sre_text_base / g_sre_text_end are read by is_valid_exec_pc() in the
+    // Dynarmic run loop to detect corrupted LR returns into alignment padding.
+    // .dynstr STRTAB bounds — a code fetch here is always a corrupted target.
+    if (g_main_mod_64.dynstr_vaddr && g_main_mod_64.dynstr_size) {
+        g_sre_dynstr_base = g_main_mod_64.dynstr_vaddr;
+        g_sre_dynstr_end  = g_main_mod_64.dynstr_vaddr + g_main_mod_64.dynstr_size;
+        std::cout << "[RenderGuard] .dynstr (non-exec) bounds: 0x" << std::hex
+                  << g_sre_dynstr_base << " – 0x" << g_sre_dynstr_end << std::dec << std::endl;
+    }
+    if (g_main_mod_64.text_base && g_main_mod_64.text_size) {
+        g_sre_text_base = g_main_mod_64.text_base;
+        g_sre_text_end  = g_main_mod_64.text_base + g_main_mod_64.text_size;
+        std::cout << "[RenderGuard] Text bounds: 0x" << std::hex
+                  << g_sre_text_base << " – 0x" << g_sre_text_end
+                  << std::dec << std::endl;
+    }
+
+    // 3. External Symbol Resolution (to Bridge addresses)
+    g_loader_64->resolve_all_to_bridge(&g_main_mod_64, &g_bridge_64, GUEST_GLOBALS_BASE);
+    
+    std::cout << "[Loader64] Game binary ready (all symbols bridged)." << std::endl;
+
+    if (swordi_abi == 12) {
+        // [DIAG/vtable] Verify the CaverShell vtable + its Render slot survived (1.4.12 only)
+        uint64_t got_slot   = g_main_mod_64.base_addr + 0x6e76a0; // GOT: &vtable
+        uint64_t vt_render  = g_main_mod_64.base_addr + 0x6b8f40; // vtable[Render]
+        uint64_t got_val    = *(uint64_t*)(g_guest_memory + got_slot);
+        uint64_t render_val = *(uint64_t*)(g_guest_memory + vt_render);
+        uint64_t exp_got    = g_main_mod_64.base_addr + 0x6b8ec0; // CaverShell vtable
+        uint64_t exp_render = g_main_mod_64.base_addr + 0x211014; // CaverShell::Render
+        std::cout << "[DIAG/vtable] GOT[0x6e76a0]=0x" << std::hex << got_val
+                  << " (expect 0x" << exp_got << ")"
+                  << (got_val == exp_got ? " OK" : " *** MISMATCH ***") << std::dec << std::endl;
+        std::cout << "[DIAG/vtable] vtable[Render]@0x6b8f40=0x" << std::hex << render_val
+                  << " (expect 0x" << exp_render << ")"
+                  << (render_val == exp_render ? " OK" : " *** MISMATCH ***") << std::dec << std::endl;
+    }
+
+    if (swordi_abi == 12) {
+        // Diagnostic: find the symbol for address 0x1478ccc (offset 0x478ccc, 1.4.12 only)
+        std::cout << "[SRE DIAG] Finding closest symbol to 0x1478ccc..." << std::endl;
+        Elf64_Sym* closest_sym = nullptr;
+        uint64_t closest_diff = 0xffffffffffffffffULL;
+        for (int i = 0; i < g_main_mod_64.num_dynsym; i++) {
+            Elf64_Sym* sym = &g_main_mod_64.dynsym[i];
+            if (sym->st_value == 0) continue;
+            uint64_t addr = g_main_mod_64.base_addr + sym->st_value;
+            if (0x1478ccc >= addr) {
+                uint64_t diff = 0x1478ccc - addr;
+                if (diff < closest_diff) {
+                    closest_diff = diff;
+                    closest_sym = sym;
+                }
+            }
+        }
+        if (closest_sym) {
+            std::cout << "[SRE DIAG] Closest symbol to 0x1478ccc: '" 
+                      << (g_main_mod_64.dynstr + closest_sym->st_name)
+                      << "' @ 0x" << std::hex << (g_main_mod_64.base_addr + closest_sym->st_value)
+                      << " (diff: +" << std::dec << closest_diff << " bytes)" << std::endl;
+        }
+
+        // Dump disassembly bytes at 0x1478ccc
+        std::cout << "[SRE DIAG] Hex bytes at 0x1478ccc (offset 0x478ccc):" << std::endl;
+        if (g_guest_memory) {
+            for (int i = -16; i < 48; i++) {
+                uint64_t addr = 0x1478ccc + i;
+                uint8_t byte_val = g_guest_memory[0x1478ccc + i];
+                if (i == 0) std::cout << "-> ";
+                else std::cout << "   ";
+                std::cout << "0x" << std::hex << addr << ": " 
+                          << std::setw(2) << std::setfill('0') << (int)byte_val << std::dec << std::endl;
+            }
+        }
+    }
+
+    // Initialize ARM64 Emulator AFTER memory is prepared
+    // Multi-engine backend selection
+    if (g_use_dynarmic) {
+#ifdef SWORDIGO_HAS_DYNARMIC
+        g_emulator_64 = new EmulatorDynarmic64(g_guest_memory, GUEST_MEM_SIZE);
+        // ProHook Phase 1: Register Dynarmic emulator for JIT cache invalidation
+        SREHost_RegisterEmulator(static_cast<EmulatorDynarmic64*>(g_emulator_64));
+#else
+        std::cerr << "[Main] Dynarmic was not built; falling back to Unicorn\n";
+        g_use_dynarmic = false;
+        g_emulator_64 = new EmulatorArm64(g_guest_memory, GUEST_MEM_SIZE);
+#endif
+    } else {
+        if (!unicorn_backend_available()) {
+            std::cerr << "\n[Main] ERROR: Unicorn backend requested but is not available.\n"
+                      << "[Main]   " << unicorn_backend_error() << "\n"
+                      << "[Main]   Install Unicorn Engine (e.g. libunicorn-dev) and rebuild, or\n"
+                      << "[Main]   drop libunicorn.so / unicorn.dll next to the app, then run with\n"
+                      << "[Main]   --engine=dynarmic (or select Dynarmic in the launcher).\n" << std::endl;
+            exit(1);
+        }
+        g_emulator_64 = new EmulatorArm64(g_guest_memory, GUEST_MEM_SIZE);
+    }
+    std::cout << "[Engine] Using " << g_emulator_64->engine_name() << " backend" << std::endl;
+    g_emulator_64->set_bridge(&g_bridge_64);
+
+    // =========================================================================
+    // Guest TLS (Thread Local Storage) and Stack Canary setup
+    // =========================================================================
+    // EVERY Caver function ends with a canary check:
+    //   if (*(long *)(tpidr_el0 + 0x28) != local_saved_canary) __stack_chk_fail();
+    // If TPIDR_EL0 is 0 or unmapped, all functions will crash instantly.
+    {
+        uint64_t tls_base = 0x20000;
+        uint64_t canary_val = 0xDEADC0DE12345678ULL;
+        
+        // Write the canary to TLS base + 0x28
+        *(uint64_t*)(g_guest_memory + tls_base + 0x28) = canary_val;
+        
+        // Let the emulator know about TPIDR_EL0
+        g_emulator_64->set_tpidr_el0(tls_base);
+        std::cout << "[Engine] Guest TLS initialized at 0x" << std::hex << tls_base
+                  << ", stack canary set to 0x" << canary_val << std::dec << std::endl;
+    }
+
+    // --- Runtime binary patches (ARM64) ---
+    // NO hardcoded address patches — they break when switching binary versions.
+    // Only version-independent patches are applied:
+    //   1. __cxa_guard_* (symbol lookup — works for any binary)
+    //   2. STXR patcher (scans .text — works for any binary)
+    //   3. .text protection (uses ELF loader text_size — works for any binary)
+    //   4. Generic abort NOP (scans for bl abort patterns)
+    {
+        std::cerr << "\n======== [Patch64] APPLYING BINARY PATCHES ========" << std::endl;
+        std::cout << "[Patch64] Version-independent patches starting..." << std::endl;
+    }
+
+    // =========================================================================
+    // [LEGACY] STXR/STLXR → STR binary patcher (atomic CAS spin-loop fix)
+    // =========================================================================
+    // ORIGINAL PURPOSE: ARM64 uses LDXR/STXR for ALL atomics (boost::shared_ptr
+    // refcount, std::mutex, __cxa_guard, etc.). In Unicorn's single-threaded mode
+    // the exclusive monitor is unreliable — STXR may never succeed, causing the
+    // retry branch to spin forever. Patching every STXR to plain STR forces
+    // success and NOPs the retry branch.
+    //
+    // [YUZU-INSPIRED FIX] DISABLED for Dynarmic backend.
+    // emulator_dynarmic64.cpp now implements MemoryWriteExclusive8/16/32/64 via
+    // std::atomic::compare_exchange_weak — proper CAS semantics. LDXR/STXR
+    // succeeds on the first attempt inside the JIT; no binary patching needed.
+    // Yuzu ref: arm_dynarmic_64.cpp MemoryWriteExclusive* callbacks.
+    //
+    // UNICORN: Patcher still runs unconditionally — exclusive monitor still broken.
+    // =========================================================================
+    // 1.4.13 keeps the original exclusive operations and real monitor.
+    // The older 1.4.12 GNU COW string runtime still requires its legacy
+    // compatibility patches: starting a new profile otherwise retries an
+    // exclusive store to a null string refcount indefinitely (0x156a598).
+    // Match the existing 1.4.12 portable runtime without changing 1.4.13.
+    /* LEGACY_STXR_PATCHER_START
+     * Retained for Unicorn; never applied to the Dynarmic client.
+     */
+    if (!g_use_dynarmic || swordi_abi == 12) {
+        uint32_t NOP = 0xD503201F;
+        std::cout << "[Patch64] STXR scan: text_base=0x" << std::hex << g_main_mod_64.text_base
+                  << " text_size=0x" << g_main_mod_64.text_size 
+                  << " (" << std::dec << (g_main_mod_64.text_size / 4) << " insns)" << std::endl;
+        uint32_t* code = (uint32_t*)(g_guest_memory + g_main_mod_64.text_base);
+        int num_insns = g_main_mod_64.text_size / 4;
+        int patched = 0;
+        int cbz_fixed = 0, cbnz_fixed = 0;
+        
+        int cas_skipped = 0;
+        for (int i = 0; i < num_insns; i++) {
+            uint32_t insn = code[i];
+            
+            // Match STXR/STLXR/STXRB/STLXRB/STXRH/STLXRH:
+            // Fixed bits: [29:24]=001000, [22]=0(store), [14:10]=11111
+            if ((insn & 0x3FE07C00) == 0x08007C00) {
+                uint32_t size = (insn >> 30) & 3;
+                uint32_t Rt = insn & 0x1F;
+                uint32_t Rn = (insn >> 5) & 0x1F;
+                uint32_t Rs = (insn >> 16) & 0x1F;
+
+                // ---------------------------------------------------------------
+                // CAS-AWARE GUARD (fixes 0x10771ac / draws=0 with SRE on):
+                //
+                // Neutering STXR→STR + NOPing the retry is only correct for a
+                // PLAIN refcount spin (LDXR; add/sub; STXR; CBNZ retry) — the
+                // store then always "succeeds". But boost::enable_shared_from_this
+                // ::_internal_accept_owner (and other compare-and-swap installs)
+                // use the exclusive pair as a CAS: they LOAD the current value,
+                // CONDITIONALLY BRANCH on it (bail if it doesn't match), then STXR
+                // the new pointer. Forcing that store to always succeed installs a
+                // pointer even when the CAS should have failed, leaving the guest
+                // stack canary (0xdeadc0de12345678) as the stored owner pointer —
+                // which is later called through, jumping the JIT into .dynstr at
+                // 0x10771ac and preventing MainMenuViewController::LoadView from
+                // ever building the menu (draws=0).
+                //
+                // For the Dynarmic backend the emulator already implements correct
+                // CAS via MemoryWriteExclusive8/16/32/64, so leaving the CAS
+                // sequence INTACT is both correct and safe — the real exclusive
+                // monitor handles it. We only neuter true refcount STXRs.
+                //
+                // Detection: scan backwards (small window) for the matching
+                // LDXR/LDAXR on the SAME base register Rn. If, between that load
+                // and this store, there is a conditional branch (B.cond / CBZ /
+                // CBNZ / TBZ / TBNZ) that is NOT this STXR's own status-register
+                // branch, the sequence is a CAS with an early-out → SKIP it.
+                // ---------------------------------------------------------------
+                // REGRESSION FIX: the CAS-skip below is DISABLED. With
+                // Unsafe_IgnoreGlobalMonitor re-enabled in the emulator (its
+                // known-good state), STXR/STLXR always succeed, so the correct
+                // and proven behaviour is to neuter EVERY refcount STXR here (as
+                // the 2-day-old reference build did). Leaving CAS sequences
+                // "intact" only makes sense when the real global monitor is
+                // active — which it deliberately is not — and that combination
+                // caused guest exclusive-store retry loops to spin forever,
+                // freezing the game right after the menu background loaded.
+                // We keep the detection code compiled but force is_cas=false so
+                // no STXR is ever skipped, matching the reference behaviour.
+                bool is_cas = false;
+                (void)Rn;  // detection intentionally not used while monitor is ignored
+                if (is_cas) {
+                    // (unreachable) — retained only to preserve the counter and
+                    // make re-enabling the guard a one-line change if ever needed.
+                    cas_skipped++;
+                    continue;
+                }
+
+                // Replace with size-appropriate STR (unsigned offset, imm=0)
+                uint32_t str_insn;
+                switch (size) {
+                    case 0: str_insn = 0x39000000; break;  // STRB
+                    case 1: str_insn = 0x79000000; break;  // STRH
+                    case 2: str_insn = 0xB9000000; break;  // STR W
+                    case 3: str_insn = 0xF9000000; break;  // STR X
+                    default: continue;
+                }
+                code[i] = str_insn | (Rn << 5) | Rt;
+                
+                // Fix the following branch that checks the STXR status register
+                if (i + 1 < num_insns) {
+                    uint32_t next = code[i + 1];
+                    // CBNZ Rs, retry → NOP (don't retry, store always succeeds)
+                    if ((next & 0xFF000000) == 0x35000000 && (next & 0x1F) == Rs) {
+                        code[i + 1] = NOP;
+                        cbnz_fixed++;
+                    }
+                    // CBZ Rs, success → unconditional B (always branch to success)
+                    else if ((next & 0xFF000000) == 0x34000000 && (next & 0x1F) == Rs) {
+                        int32_t imm19 = (int32_t)((next >> 5) & 0x7FFFF);
+                        if (imm19 & 0x40000) imm19 |= (int32_t)0xFFF80000;
+                        code[i + 1] = 0x14000000 | (imm19 & 0x3FFFFFF);
+                        cbz_fixed++;
+                    }
+                }
+                patched++;
+            }
+        }
+        std::cout << "[Patch64] STXR patcher: " << patched << " stores, "
+                  << cbnz_fixed << " CBNZ\u2192NOP, " << cbz_fixed << " CBZ\u2192B, "
+                  << cas_skipped << " CAS-sequences preserved" << std::endl;
+    }
+    /* LEGACY_STXR_PATCHER_END */
+
+
+    // =========================================================================
+    // PROTECT .text section from corruption
+    // NOTE: Skip for RLSwordigo instances - they require writable text segments
+    // for their modified game data, otherwise UC_ERR_WRITE_PROT crashes occur.
+    // =========================================================================
+    {
+        const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+        bool is_rlsw = (binfo && binfo->game_type == "RLSwordigo");
+        
+        if (!is_rlsw) {
+            uint64_t text_start = g_main_mod_64.text_base;
+            uint64_t text_size_rounded = (g_main_mod_64.text_size + 0xFFF) & ~0xFFF;
+            g_emulator_64->protect_memory(text_start, text_size_rounded, UC_PROT_READ | UC_PROT_EXEC);
+            std::cout << "[Patch64] Protected .text section (0x" << std::hex << text_start 
+                      << "-0x" << (text_start + text_size_rounded) << std::dec << ")" << std::endl;
+        } else {
+            std::cout << "[Patch64] SKIPPED .text protection for RLSwordigo (requires writable text)" << std::endl;
+        }
+    }
+
+    // =========================================================================
+    // [LEGACY] __cxa_guard_acquire / release / abort byte patcher
+    // =========================================================================
+    // ORIGINAL PURPOSE: The NDK's __cxa_guard_acquire uses LDXR/STXR internally
+    // for thread-safe C++ static initialisation. In Unicorn (broken exclusive
+    // monitor), the STXR inside __cxa_guard always fails, causing an infinite
+    // spin on the guard byte. Overwriting the function with LDRB/CBNZ/MOV/RET
+    // bypasses the LDXR/STXR path entirely.
+    //
+    // [YUZU-INSPIRED FIX] DISABLED for Dynarmic backend.
+    // With proper CAS semantics (MemoryWriteExclusive* in emulator_dynarmic64.cpp)
+    // the LDXR/STXR inside __cxa_guard_acquire succeeds immediately. The real
+    // NDK guard logic therefore runs correctly; no byte overwrite is needed.
+    // Yuzu ref: arm_dynarmic_64.cpp MemoryWriteExclusive* callbacks.
+    //
+    // UNICORN: Patcher still runs — guard LDXR/STXR would spin otherwise.
+    // Uses symbol lookup — works for any binary version.
+    // =========================================================================
+    // NOTE: Applied for ALL backends.
+    // Unicorn (CORRECTNESS): __cxa_guard_acquire uses LDXR/STXR internally — spins forever.
+    // Dynarmic (PERFORMANCE): simpler LDRB+CBNZ+RET is faster than the NDK
+    //   implementation which adds barrier overhead even with working CAS.
+    // Uses symbol lookup — works for any binary version.
+    /* LEGACY_CXA_GUARD_PATCHER_START
+     * Now runs for both Unicorn (correctness) and Dynarmic (performance).
+     * Do NOT remove.
+     */
+    {
+        uint64_t guard_acq = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "__cxa_guard_acquire");
+        uint64_t guard_rel = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "__cxa_guard_release");
+        uint64_t guard_abt = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "__cxa_guard_abort");
+        
+        if (guard_acq) {
+            *(uint32_t*)(g_guest_memory + guard_acq + 0)  = 0x39400001; // LDRB W1, [X0]
+            *(uint32_t*)(g_guest_memory + guard_acq + 4)  = 0x35000061; // CBNZ W1, #12
+            *(uint32_t*)(g_guest_memory + guard_acq + 8)  = 0x52800020; // MOV W0, #1
+            *(uint32_t*)(g_guest_memory + guard_acq + 12) = 0xD65F03C0; // RET
+            *(uint32_t*)(g_guest_memory + guard_acq + 16) = 0x52800000; // MOV W0, #0
+            *(uint32_t*)(g_guest_memory + guard_acq + 20) = 0xD65F03C0; // RET
+            std::cout << "[Patch64] __cxa_guard_acquire at 0x" << std::hex << guard_acq 
+                      << " → proper guard check" << std::dec << std::endl;
+        }
+        if (guard_rel) {
+            *(uint32_t*)(g_guest_memory + guard_rel + 0) = 0x52800021; // MOV W1, #1
+            *(uint32_t*)(g_guest_memory + guard_rel + 4) = 0x39000001; // STRB W1, [X0]
+            *(uint32_t*)(g_guest_memory + guard_rel + 8) = 0xD65F03C0; // RET
+            std::cout << "[Patch64] __cxa_guard_release at 0x" << std::hex << guard_rel 
+                      << " → set guard + RET" << std::dec << std::endl;
+        }
+        if (guard_abt) {
+            *(uint32_t*)(g_guest_memory + guard_abt) = 0xD65F03C0; // RET
+            std::cout << "[Patch64] __cxa_guard_abort at 0x" << std::hex << guard_abt
+                      << " \u2192 RET" << std::dec << std::endl;
+        }
+    }
+    /* LEGACY_CXA_GUARD_PATCHER_END */
+
+
+    // Debug: Check what's at the crash address 0x270
+    {
+        uint32_t code_at_270[4] = {0};
+        memcpy(code_at_270, g_guest_memory + 0x270, 16);
+        std::cout << "[Debug] Code at guest 0x270: " << std::hex 
+                  << code_at_270[0] << " " << code_at_270[1] << " " << code_at_270[2] << " " << code_at_270[3]
+                  << std::dec << std::endl;
+        // Check first few GOT entries near where PLT points
+        uint64_t got_sample[4] = {0};
+        // The GOT is typically at the start of the DATA segment
+        uint64_t got_vaddr = g_main_mod_64.data_bases.empty() ? 0 : g_main_mod_64.data_bases[0];
+        if (got_vaddr > 0) {
+            memcpy(got_sample, g_guest_memory + got_vaddr, 32);
+            std::cout << "[Debug] First GOT entries at 0x" << std::hex << got_vaddr << ": "
+                      << got_sample[0] << " " << got_sample[1] << " " << got_sample[2] << " " << got_sample[3]
+                      << std::dec << std::endl;
+        }
+    }
+    // (Duplicate STXR patcher removed — handled by patcher at line ~1745 above)
+
+
+    // =========================================================================
+    // SRE version module — Swordigo Runtime Engine (guest-side ARM64 library)
+    // =========================================================================
+    // Loads libsre12.so (1.4.12) / libsre13.so (1.4.13) into guest memory and
+    // installs hooks that redirect
+    // problematic functions in libswordigo.so to clean C reimplementations.
+    // This eliminates atomic spin loops (STXR), threading issues, and more.
+    //
+    // IMPORTANT: SRE hooks use hardcoded function offsets that are ONLY valid
+    // for v1.4.12 ARM64. Loading SRE for other versions would crash.
+    {
+        bool sre_compatible = g_use_sre && g_is_arm64;
+        
+        if (!sre_compatible) {
+            std::cerr << "\n============================================" << std::endl;
+            if (!g_use_sre) {
+                std::cerr << "  [SRE] Skipped — SRE disabled by user choice" << std::endl;
+            } else {
+                std::cerr << "  [SRE] Skipped — SRE only supports ARM64 instances" << std::endl;
+            }
+            std::cerr << "  Current binary: " << g_lib_name << std::endl;
+            std::cerr << "============================================\n" << std::endl;
+        } else {
+
+        std::cerr << "\n============================================" << std::endl;
+        std::cerr << "  [SRE] Swordigo Runtime Engine — Checking..." << std::endl;
+        std::cerr << "============================================" << std::endl;
+
+        std::string sre_path;
+        const char* lib_name = (swordi_abi == 13) ? "libsre13.so" : "libsre12.so";
+        const char* candidate_paths[] = {
+            (swordi_abi == 13) ? "bin/libs/libsre13.so" : "bin/libs/libsre12.so",
+            (swordi_abi == 13) ? "libs/libsre13.so" : "libs/libsre12.so",
+            lib_name,
+            nullptr
+        };
+        for (int i = 0; candidate_paths[i]; i++) {
+            if (access(candidate_paths[i], F_OK) == 0) {
+                sre_path = candidate_paths[i];
+                break;
+            }
+            std::string alt = get_data_path(candidate_paths[i]);
+            if (!alt.empty() && access(alt.c_str(), F_OK) == 0) {
+                sre_path = alt;
+                break;
+            }
+        }
+        if (false) {
+            // Swordigo 1.4.12 runtime = libsre12.so (the shared base infra is
+            // compiled INTO it; there is no separate libsre.so anymore).
+            sre_path = "bin/libs/libsre12.so";
+            if (access(sre_path.c_str(), F_OK) != 0) {
+                std::string alt_path = get_data_path("bin/libs/libsre12.so");
+                if (!alt_path.empty() && access(alt_path.c_str(), F_OK) == 0) {
+                    sre_path = alt_path;
+                } else if (access("libsre12.so", F_OK) == 0) {
+                    sre_path = "libsre12.so";
+                }
+            }
+        }
+
+        if (!sre_path.empty() && access(sre_path.c_str(), F_OK) == 0) {
+            std::cerr << "[SRE] FOUND: " << sre_path << std::endl;
+            std::cout << "\n======== [SRE] Loading Swordigo Runtime Engine ========" << std::endl;
+            std::cout << "[SRE] Path: " << sre_path << std::endl;
+
+            remove("/home/quantumcreeper/SwordigoDesktop/sre_hook_debug.txt");
+            // Load the SRE version module at a separate guest address (after libswordigo.so)
+            uint64_t sre_load_addr = 0x2000000;  // 32MB — well above swordigo's ~7MB
+
+            int sre_ret = g_loader_64->load(&g_sre_mod, sre_path, sre_load_addr);
+            if (sre_ret == 0) {
+                std::cout << "[SRE] Loaded at 0x" << std::hex << sre_load_addr 
+                          << " (text_size=0x" << g_sre_mod.text_size << ")" 
+                          << std::dec << std::endl;
+
+                // Relocate
+                g_loader_64->relocate(&g_sre_mod);
+                fprintf(stderr, "[DBG-FFI] after relocate: GOT[0x20b0930]=0x%lx (want 0x2064180)\n",
+                        *(uint64_t*)(g_guest_memory + 0x20b0930));
+
+                // Resolve imports (malloc, free, memcpy, strlen, etc.) through bridge
+                g_loader_64->resolve_all_to_bridge(&g_sre_mod, &g_bridge_64, GUEST_GLOBALS_BASE);
+                fprintf(stderr, "[DBG-FFI] after resolve_all_to_bridge: GOT[0x20b0930]=0x%lx (want 0x2064180)\n",
+                        *(uint64_t*)(g_guest_memory + 0x20b0930));
+
+                // ─── Run the SRE module's .init_array (constructors) ──────────
+                // The lawncher-derived hooks in libsre13.so (HOOK_SYMBOL /
+                // HOOK_OFFSET / DL_SYMBOL / G_DL_SYMBOL in sre13/hooks/*.c and
+                // core/{assets,saves}.c) register their installers/resolvers via
+                // __attribute__((constructor)) — which NEVER runs unless we walk
+                // the module's own .init_array here. The game binary's
+                // init_array is run later at boot; this one must run BEFORE
+                // sre_init() so init_hooks() (called inside sre_init) finds the
+                // registered installers and actually applies the lawncher hooks.
+                // ARM64 .init_array entries are 8-byte pointers (like the game's
+                // at [Boot64]). sre12's lib ships no init_array — no-op there.
+                if (g_sre_mod.init_array_vaddr != 0 && g_sre_mod.init_array_size > 0) {
+                    int sre_init_count = g_sre_mod.init_array_size / 8;
+                    std::cout << "[SRE] Executing " << sre_init_count
+                              << " module initializers..." << std::endl;
+                    uint64_t* sre_init_array =
+                        (uint64_t*)(g_guest_memory + g_sre_mod.init_array_vaddr);
+                    for (int i = 0; i < sre_init_count; i++) {
+                        uint64_t init_func = sre_init_array[i];
+                        if (init_func != 0)
+                            g_emulator_64->call(init_func, {});
+                    }
+                    std::cout << "[SRE] Module initializers completed" << std::endl;
+                }
+
+                // Record the exact executable range. Exception recovery must never
+                // accept writable libsre data merely because it is inside the broad
+                // 0x02000000 module allocation.
+                g_sre_runtime_text_base = g_sre_mod.text_base;
+                g_sre_runtime_text_end = g_sre_mod.text_base + g_sre_mod.text_size;
+
+                // SRE's recovery stack contains saved guest SP/LR values. Deferred
+                // pthreads run as nested independent CPU contexts in Dynarmic, so
+                // the backend snapshots this process-global guest state around each
+                // deferred thread to prevent cross-context longjmp corruption.
+                {
+                    uint64_t depth_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_sre_recovery_depth");
+                    uint64_t stack_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_sre_recovery_stack");
+                    uint64_t bytes_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_sre_recovery_stack_bytes");
+                    uint32_t stack_bytes = 0;
+                    if (bytes_addr && bytes_addr + sizeof(stack_bytes) <= GUEST_MEM_SIZE) {
+                        std::memcpy(&stack_bytes,
+                                    g_guest_memory + bytes_addr,
+                                    sizeof(stack_bytes));
+                    }
+                    g_emulator_64->configure_recovery_context(
+                        depth_addr, stack_addr, stack_bytes);
+                }
+
+                // ---- VFS pre-init ----
+                // Write VFS path globals and activate BEFORE sre_init so that
+                // sre_config_load_toml("/Assets/mini.toml") inside sre_init
+                // can resolve MiniPaths correctly.
+                {
+                    uint8_t* gm = g_emulator_64->get_memory_base();
+
+                    auto vfs_write_str = [&](const char* sym, const std::string& val, int maxlen) {
+                        uint64_t a = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym);
+                        if (!a) return;
+                        std::string norm = sre_normalize_vfs_path(val);
+                        strncpy((char*)(gm + a), norm.c_str(), maxlen - 1);
+                        ((char*)(gm + a))[maxlen - 1] = '\0';
+                    };
+                    auto vfs_write_int = [&](const char* sym, int val) {
+                        uint64_t a = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym);
+                        if (a) *(int*)(gm + a) = val;
+                    };
+
+                    std::string data_base = get_data_path("");
+                    if (!data_base.empty() && data_base.back() == '/')
+                        data_base.pop_back();
+
+                    vfs_write_str("g_sre_vfs_path_assets",   get_data_path(g_assets_dir), 512);
+                    vfs_write_str("g_sre_vfs_path_files",    g_save_dir,                  512);
+                    vfs_write_str("g_sre_vfs_path_external", data_base + "/external",     512);
+                    vfs_write_str("g_sre_vfs_path_cache",    g_cache_dir,                 512);
+                    vfs_write_str("g_sre_vfs_data_dir",      data_base,                   512);
+                    vfs_write_int("g_sre_vfs_active", 1);
+
+                    // Activate a mod for the 5-level VFS search hierarchy.
+                    // Priority: 1) launcher-selected mod  2) first valid mod in mods/
+                    // Priority: 1) launcher-selected mod  2) config mod_load_order  3) first valid enabled mod in mods/
+                    // Valid mod directories may contain properties.toml, resources/, mod.json, or libraries/
+                    extern std::string g_launcher_selected_mod;
+                    std::string mods_dir = data_base + "/mods/";
+                    bool mod_found = false;
+
+                    // 1. Try launcher-selected mod first
+                    if (!g_launcher_selected_mod.empty()) {
+                        fs::path mod_path = fs::path(mods_dir) / g_launcher_selected_mod;
+                        if (fs::exists(mod_path) && fs::is_directory(mod_path)) {
+                            vfs_write_str("g_sre_vfs_mod_name", g_launcher_selected_mod, 128);
+                            vfs_write_int("g_sre_vfs_hierarchy_enabled", 1);
+                            std::cout << "[SRE] VFS mod (launcher-selected): " << g_launcher_selected_mod << std::endl;
+                            set_active_mod_name(g_launcher_selected_mod);
+                            mod_found = true;
+                        } else {
+                            std::cout << "[SRE] VFS launcher-selected mod '" << g_launcher_selected_mod << "' not found, scanning..." << std::endl;
+                        }
+                    }
+
+                    // 2. Try launcher config mod_load_order
+                    if (!mod_found) {
+                        LauncherConfig lcfg = launcher_config_load();
+                        for (const auto& mid : lcfg.mod_load_order) {
+                            fs::path mod_path = fs::path(mods_dir) / mid;
+                            if (fs::exists(mod_path) && fs::is_directory(mod_path)) {
+                                vfs_write_str("g_sre_vfs_mod_name", mid, 128);
+                                vfs_write_int("g_sre_vfs_hierarchy_enabled", 1);
+                                std::cout << "[SRE] VFS mod (config load order): " << mid << std::endl;
+                                set_active_mod_name(mid);
+                                mod_found = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // 3. Fallback: scan mods/ for first valid enabled mod
+                    if (!mod_found && fs::exists(mods_dir) && fs::is_directory(mods_dir)) {
+                        for (const auto& me : fs::directory_iterator(mods_dir)) {
+                            if (me.is_directory()) {
+                                std::string mn = me.path().filename().string();
+                                if (!mn.empty() && mn[0] != '.') {
+                                    bool has_toml  = fs::exists(me.path() / "properties.toml");
+                                    bool has_res   = fs::is_directory(me.path() / "resources");
+                                    bool has_modjq = fs::exists(me.path() / "mod.json");
+                                    bool has_libs  = fs::is_directory(me.path() / "libraries");
+                                    if (!has_toml && !has_res && !has_modjq && !has_libs) {
+                                        std::cout << "[SRE] VFS skipping '" << mn << "' — not a mod" << std::endl;
+                                        continue;
+                                    }
+                                    vfs_write_str("g_sre_vfs_mod_name", mn, 128);
+                                    vfs_write_int("g_sre_vfs_hierarchy_enabled", 1);
+                                    std::cout << "[SRE] VFS fallback mod detected: " << mn << std::endl;
+                                    set_active_mod_name(mn);
+                                    mod_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!mod_found) {
+                        std::cout << "[SRE] VFS: no active mod found — vanilla mode" << std::endl;
+                    }
+                    std::cout << "[SRE] VFS pre-init: active=1 data_dir=" << data_base << std::endl;
+                }
+
+                // Call sre_init(swordigo_base, empty_sentinel_bss_offset)
+                uint64_t sre_init_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_init");
+                if (sre_init_addr) {
+                    std::cout << "[SRE] Calling sre_init(0x" << std::hex << load_addr 
+                              << ", 0x14880)" << std::dec << std::endl;
+                    g_emulator_64->call(sre_init_addr, {load_addr, 0x14880});
+                    std::cout << "[SRE] sre_init completed" << std::endl;
+
+                    // DEBUG: Dump ITextInputDelegate vtable to verify fix
+                    {
+                        uint8_t* mem = g_emulator_64->get_memory_base();
+                        uint64_t vtable_addr = load_addr + 0x7e1688;
+                        uint64_t entry0 = *(uint64_t*)(mem + vtable_addr);
+                        uint64_t entry1 = *(uint64_t*)(mem + vtable_addr + 8);
+                        std::cout << "[DEBUG] ITextInputDelegate vtable at 0x" << std::hex << vtable_addr
+                                  << ": [0]=0x" << entry0 << " [1]=0x" << entry1 
+                                  << std::dec << std::endl;
+                    }
+
+                    // ========= Safety RET-page for wild vtable jumps =========
+                    // Some vtable entries in GUITextFieldImpl (and possibly other
+                    // classes) have unrelocated/corrupt pointers. Instead of
+                    // chasing each individual entry, we fill the target page with
+                    // ARM64 RET instructions. Any wild vtable dispatch to this
+                    // address just returns cleanly to the caller.
+                    //
+                    // Known crash targets:
+                    //   0x2d6ce4c — GUITextFieldImpl vtable dispatch during drawApplication
+                    {
+                        uint64_t crash_page = 0x2d6c000;  // 0x2d6ce4c aligned to 4KB
+                        uint32_t ret_insn = 0xD65F03C0;   // ARM64 RET
+                        
+                        // Write directly to the shared guest memory buffer
+                        // (works for both Unicorn and Dynarmic backends)
+                        uint8_t* mem = g_emulator_64->get_memory_base();
+                        for (uint64_t off = 0; off < 0x1000; off += 4) {
+                            *(uint32_t*)(mem + crash_page + off) = ret_insn;
+                        }
+                        std::cout << "[Safety] Wrote RET-page at 0x" << std::hex 
+                                  << crash_page << std::dec << std::endl;
+                    }
+                }
+
+                // ========= Phase 1: Resolve Lua API symbols from libswordigo.so =========
+                // The engine compiles Lua 5.1 with C++ linkage, so symbols are mangled.
+                // Mangled names from SwMini's core/lua.c (ARM64 / __aarch64__).
+                struct LuaSymEntry { const char* name; const char* mangled; };
+                LuaSymEntry lua_syms[] = {
+                    {"lua_pcall",     "_Z9lua_pcallP9lua_Stateiii"},
+                    {"lua_resume",    "_Z10lua_resumeP9lua_Statei"},
+                    {"lua_settop",    "_Z10lua_settopP9lua_Statei"},
+                    {"lua_gettop",    "_Z10lua_gettopP9lua_State"},
+                    {"lua_tolstring", "_Z13lua_tolstringP9lua_StateiPm"},
+                    {"lua_call",      "_Z8lua_callP9lua_Stateii"},
+                    {"lua_pushstring","_Z14lua_pushstringP9lua_StatePKc"},
+                    {"lua_pushcclosure","_Z16lua_pushcclosureP9lua_StatePFiS0_Ei"},
+                    {"lua_setfield",  "_Z12lua_setfieldP9lua_StateiPKc"},
+                    {"lua_getfield",  "_Z12lua_getfieldP9lua_StateiPKc"},
+                    {"lua_createtable","_Z15lua_createtableP9lua_Stateii"},
+                    {"lua_pushnumber","_Z14lua_pushnumberP9lua_Stated"},
+                    {"lua_pushboolean","_Z15lua_pushbooleanP9lua_Statei"},
+                    {"lua_pushnil",   "_Z11lua_pushnilP9lua_State"},
+                    {"lua_tonumber",  "_Z12lua_tonumberP9lua_Statei"},
+                    {"lua_toboolean", "_Z13lua_tobooleanP9lua_Statei"},
+                    {"lua_type",      "_Z8lua_typeP9lua_Statei"},
+                    {"luaL_register", "_Z13luaL_registerP9lua_StatePKcPK8luaL_Reg"},
+                    {"lua_touserdata","_Z14lua_touserdataP9lua_Statei"},
+                    {"lua_pushlightuserdata","_Z21lua_pushlightuserdataP9lua_StatePv"},
+                    {"lua_error",     "_Z9lua_errorP9lua_State"},
+                    {"lua_topointer", "_Z13lua_topointerP9lua_Statei"},
+                    {"getSpeedMultiplier", "_ZNK5Caver11SceneObject21updateSpeedMultiplierEv"},
+                };
+                const int NUM_LUA_SYMS = sizeof(lua_syms) / sizeof(lua_syms[0]);
+                
+                // Allocate a struct in guest memory to pass addresses to sre_init_lua
+                // SreLuaAddrs: 22 × uint64_t = 176 bytes
+                uint64_t lua_addrs_guest = 0x48000;  // in our guest globals area
+                uint64_t* lua_addrs = (uint64_t*)(g_guest_memory + lua_addrs_guest);
+                
+                int lua_resolved = 0;
+                std::cout << "[SRE] Resolving " << NUM_LUA_SYMS << " Lua API symbols..." << std::endl;
+                for (int i = 0; i < NUM_LUA_SYMS; i++) {
+                    uint64_t addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, lua_syms[i].mangled);
+                    lua_addrs[i] = addr;
+                    if (addr) {
+                        lua_resolved++;
+                    } else {
+                        std::cerr << "[SRE] WARNING: Lua symbol not found: " << lua_syms[i].name 
+                                  << " (" << lua_syms[i].mangled << ")" << std::endl;
+                    }
+                }
+                std::cout << "[SRE] Resolved " << lua_resolved << "/" << NUM_LUA_SYMS 
+                          << " Lua symbols" << std::endl;
+                
+                // Call sre_init_lua() in the SRE module to pass the addresses
+                uint64_t sre_init_lua_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_init_lua");
+                if (sre_init_lua_addr && lua_resolved > 0) {
+                    g_emulator_64->call(sre_init_lua_addr, {lua_addrs_guest});
+                    std::cout << "[SRE] Lua API initialized" << std::endl;
+
+                    // ========= Phase 1b: Extended Lua API for standard libs =========
+                    // Additional symbols needed by sre_lua_libs.c (math, table, etc.)
+                    LuaSymEntry lua_ext_syms[] = {
+                        {"lua_pushvalue",   "_Z13lua_pushvalueP9lua_Statei"},
+                        {"lua_remove",      "_Z10lua_removeP9lua_Statei"},
+                        {"lua_insert",      "_Z10lua_insertP9lua_Statei"},
+                        {"lua_replace",     "_Z11lua_replaceP9lua_Statei"},
+                        {"lua_checkstack",  "_Z14lua_checkstackP9lua_Statei"},
+                        {"lua_rawget",      "_Z10lua_rawgetP9lua_Statei"},
+                        {"lua_rawset",      "_Z10lua_rawsetP9lua_Statei"},
+                        {"lua_rawgeti",     "_Z11lua_rawgetiP9lua_Stateii"},
+                        {"lua_rawseti",     "_Z11lua_rawsetiP9lua_Stateii"},
+                        {"lua_next",        "_Z8lua_nextP9lua_Statei"},
+                        {"lua_objlen",      "_Z10lua_objlenP9lua_Statei"},
+                        {"lua_settable",    "_Z12lua_settableP9lua_Statei"},
+                        {"lua_gettable",    "_Z12lua_gettableP9lua_Statei"},
+                        {"lua_isnumber",    "_Z12lua_isnumberP9lua_Statei"},
+                        {"lua_isstring",    "_Z12lua_isstringP9lua_Statei"},
+                        {"lua_tointeger",   "_Z13lua_tointegerP9lua_Statei"},
+                        {"lua_pushinteger", "_Z15lua_pushintegerP9lua_Statel"},
+                        {"lua_concat",      "_Z10lua_concatP9lua_Statei"},
+                        {"lua_pushlstring", "_Z15lua_pushlstringP9lua_StatePKcm"},
+                        {"lua_setmetatable","_Z16lua_setmetatableP9lua_Statei"},
+                        {"lua_close",       "_Z9lua_closeP9lua_State"},
+                        {"lua_dump",        "_Z8lua_dumpP9lua_StatePFiS0_PKvmPvES3_"},
+                        {"lua_atpanic",     "_Z11lua_atpanicP9lua_StatePFiS0_E"},
+                        {"lua_getmetatable","_Z16lua_getmetatableP9lua_Statei"},
+                        {"lua_rawequal",    "_Z12lua_rawequalP9lua_Stateii"},
+                        {"lua_equal",       "_Z9lua_equalP9lua_Stateii"},
+                        {"lua_lessthan",    "_Z12lua_lessthanP9lua_Stateii"},
+                        {"lua_isuserdata",  "_Z14lua_isuserdataP9lua_Statei"},
+                        {"lua_xmove",       "_Z9lua_xmoveP9lua_StateS0_i"},
+                        {"lua_newthread",   "_Z13lua_newthreadP9lua_State"},
+                        {"lua_pushthread",  "_Z14lua_pushthreadP9lua_State"},
+                        {"lua_sethook",     "_Z11lua_sethookP9lua_StatePFvS0_P9lua_DebugEii"},
+                        {"lua_newuserdata", "_Z15lua_newuserdataP9lua_Statem"},
+                    };
+                    const int NUM_LUA_EXT_SYMS = sizeof(lua_ext_syms) / sizeof(lua_ext_syms[0]);
+
+                    // SreLuaExtAddrs: 33 × uint64_t = 264 bytes
+                    uint64_t lua_ext_addrs_guest = 0x48200;  // after lua_addrs
+                    uint64_t* lua_ext_addrs = (uint64_t*)(g_guest_memory + lua_ext_addrs_guest);
+
+                    int ext_resolved = 0;
+                    for (int i = 0; i < NUM_LUA_EXT_SYMS; i++) {
+                        uint64_t addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, lua_ext_syms[i].mangled);
+                        lua_ext_addrs[i] = addr;
+                        if (addr) ext_resolved++;
+                        else std::cerr << "[SRE] WARNING: Ext Lua symbol not found: " << lua_ext_syms[i].name
+                                       << " (" << lua_ext_syms[i].mangled << ")" << std::endl;
+                    }
+                    std::cout << "[SRE] Extended Lua API: " << ext_resolved << "/" << NUM_LUA_EXT_SYMS 
+                              << " symbols resolved" << std::endl;
+
+                    uint64_t sre_init_lua_ext_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_init_lua_ext");
+                    if (sre_init_lua_ext_addr && ext_resolved > 0) {
+                        g_emulator_64->call(sre_init_lua_ext_addr, {lua_ext_addrs_guest});
+                        std::cout << "[SRE] Extended Lua API initialized" << std::endl;
+                    }
+
+                    // =============================================================
+                    // Optional addon: libsre-extras.so (ABI-aware — one module,
+                    // served to both 1.4.12 and 1.4.13). Mini.MemoryAddress +
+                    // Raijin signature FFI. Loaded ONLY when the file exists next
+                    // to the SRE library. Without it, SRE registers safe stubs
+                    // for the same Lua API (sre_extras_stubs.c / the sre13
+                    // equivalent). Version-dependent offsets are passed through
+                    // SreExtrasInit::abi (see sre_extras.h) and validated by
+                    // sre_extras_abi_validate() in the module.
+                    // =============================================================
+                    {
+                        std::string extras_path = "bin/libs/libsre-extras.so";
+                        if (access(extras_path.c_str(), F_OK) != 0) {
+                            std::string alt = get_data_path("bin/libs/libsre-extras.so");
+                            if (!alt.empty() && access(alt.c_str(), F_OK) == 0) {
+                                extras_path = alt;
+                            } else if (access("libsre-extras.so", F_OK) == 0) {
+                                extras_path = "libsre-extras.so";
+                            }
+                        }
+
+                        if (!extras_path.empty() && access(extras_path.c_str(), F_OK) == 0) {
+                            std::cout << "[SRE-Extras] FOUND: " << extras_path << std::endl;
+                            uint64_t extras_load_addr = 0x2400000;  // after the SRE module (0x2000000)
+                            int ex_ret = g_loader_64->load(&g_sre_extras_mod, extras_path, extras_load_addr);
+                            if (ex_ret == 0) {
+                                g_loader_64->relocate(&g_sre_extras_mod);
+                                g_loader_64->resolve_all_to_bridge(&g_sre_extras_mod, &g_bridge_64, GUEST_GLOBALS_BASE);
+                                g_sre_extras_loaded = true;
+                                std::cout << "[SRE-Extras] Loaded at 0x" << std::hex << extras_load_addr
+                                          << " (text_size=0x" << g_sre_extras_mod.text_size << ")" << std::dec << std::endl;
+                            } else {
+                                std::cerr << "[SRE-Extras] FAILED to load (ret=" << ex_ret << ") — using stubs" << std::endl;
+                            }
+                        } else {
+                            std::cerr << "[SRE-Extras] Not found — using stub memory/ffi API (SRE works without it)" << std::endl;
+                        }
+                    }
+
+                    // Build + write the SreExtrasInit struct into guest memory, then
+                    // call sre_extras_init(). Field order must match sre_extras.h.
+                    if (g_sre_extras_loaded) {
+                        uint64_t sre_extras_init_addr = g_loader_64->get_symbol_vaddr(&g_sre_extras_mod, "sre_extras_init");
+                        if (sre_extras_init_addr) {
+                            // Guest-side SreExtrasInit = { swordigo_base, resolve_fn,
+                            //   abi (24 bytes = 3 u64 slots), lua[33] }.
+                            // Field order MUST match sre_extras.h: SreExtrasAbi is
+                            // { u32 swordi_abi, u32 cppstring_data_off, u32
+                            //   cppstring_rep_len, u32 _reserved, u64 cwi_fn }
+                            // (24 bytes, 8-aligned), then SreExtrasLuaApi (33 u64s).
+                            const int EXTRAS_LUA_FIELDS = 33;
+                            const int EXTRAS_ABI_FIELDS  = 3;   /* 24 bytes of abi */
+                            const int EXTRAS_STRUCT_FIELDS = 2 + EXTRAS_ABI_FIELDS + EXTRAS_LUA_FIELDS;  // 38
+                            uint64_t extras_init_guest = 0x49000;
+                            uint64_t* extras_init = (uint64_t*)(g_guest_memory + extras_init_guest);
+
+                            // ComponentWithInterface guest vaddr — resolved from THIS
+                            // engine binary (same mangled symbol in 1.4.12 and 1.4.13,
+                            // verified via nm -D). Passed in the abi block so the
+                            // extras never hardcode the symbol/mangled name.
+                            uint64_t cwi_fn = g_loader_64->get_symbol_vaddr(
+                                &g_main_mod_64, "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl");
+
+                            auto lua_sym_addr = [&](const char* name) -> uint64_t {
+                                for (int i = 0; i < NUM_LUA_SYMS; i++)
+                                    if (strcmp(lua_syms[i].name, name) == 0) return lua_addrs[i];
+                                for (int i = 0; i < NUM_LUA_EXT_SYMS; i++)
+                                    if (strcmp(lua_ext_syms[i].name, name) == 0) return lua_ext_addrs[i];
+                                return 0;
+                            };
+
+                            const char* ex_lua_names[EXTRAS_LUA_FIELDS] = {
+                                "lua_gettop", "lua_settop", "lua_type", "lua_tonumber",
+                                "lua_toboolean", "lua_tolstring", "lua_touserdata", "lua_topointer",
+                                "lua_pushnumber", "lua_pushboolean", "lua_pushnil", "lua_pushstring",
+                                "lua_pushlstring", "lua_pushlightuserdata", "lua_pushcclosure", "lua_setfield",
+                                "lua_getfield", "lua_createtable", "lua_settable", "lua_gettable",
+                                "lua_rawseti", "lua_rawgeti", "lua_pushvalue", "lua_pushinteger",
+                                "lua_tointeger", "lua_getmetatable", "lua_setmetatable", "lua_rawequal",
+                                "lua_isuserdata", "lua_isnumber", "lua_isstring", "lua_newuserdata",
+                                "lua_error"
+                            };
+
+                            extras_init[0] = load_addr;                    /* swordigo_base */
+                            extras_init[1] = 0;                            /* resolve_fn (bridge import already wired) */
+
+                            /* abi block — packed per the SreExtrasAbi C layout:
+                             *   [2] = swordi_abi | (cppstring_data_off << 32)
+                             *   [3] = cppstring_rep_len | (_reserved << 32)
+                             *   [4] = component_with_interface_fn */
+                            extras_init[2] = (uint64_t)(uint32_t)swordi_abi
+                                           | ((uint64_t)0u << 32);   /* COW data ptr @0 */
+                            extras_init[3] = ((uint64_t)24u)        /* GNU COW _Rep header */
+                                           | ((uint64_t)0u << 32);
+                            extras_init[4] = cwi_fn;
+
+                            int ex_resolved = 0;
+                            for (int i = 0; i < EXTRAS_LUA_FIELDS; i++) {
+                                extras_init[2 + EXTRAS_ABI_FIELDS + i] = lua_sym_addr(ex_lua_names[i]);
+                                if (extras_init[2 + EXTRAS_ABI_FIELDS + i]) ex_resolved++;
+                            }
+                            std::cout << "[SRE-Extras] Lua API: " << ex_resolved << "/" << EXTRAS_LUA_FIELDS
+                                      << " symbols resolved" << std::endl;
+
+                            g_emulator_64->call(sre_extras_init_addr, {extras_init_guest});
+                            std::cout << "[SRE-Extras] sre_extras_init() called" << std::endl;
+
+                            // Wire SRE's stub-vs-real routing: store the extras'
+                            // miniLL_open_memory guest vaddr into the SRE module's global.
+                            uint64_t mini_ll_addr = g_loader_64->get_symbol_vaddr(
+                                &g_sre_extras_mod, "miniLL_open_memory");
+                            uint64_t sre_router = g_loader_64->get_symbol_vaddr(
+                                &g_sre_mod, "g_sre_extras_miniLL_open_memory");
+                            if (mini_ll_addr && sre_router) {
+                                *(uint64_t*)(g_guest_memory + sre_router) = mini_ll_addr;
+                                std::cout << "[SRE-Extras] miniLL_open_memory wired @ 0x"
+                                          << std::hex << mini_ll_addr << std::dec << std::endl;
+                            } else {
+                                std::cerr << "[SRE-Extras] WARNING: could not wire miniLL_open_memory"
+                                          << " (mini_ll=" << mini_ll_addr << " router=" << sre_router << ")" << std::endl;
+                            }
+                        } else {
+                            std::cerr << "[SRE-Extras] sre_extras_init symbol not found — using stubs" << std::endl;
+                        }
+                    }
+
+                    // === Late-install lua_call → sre_lua_call_safe trampoline ===
+                    // MUST be done AFTER sre_init_lua() so g_lua_pcall is populated.
+                    // This wraps ALL lua_call invocations engine-wide with pcall.
+                    // Fixes Wastelands crash: lua_call → error → panic → abort()
+                    {
+                        uint64_t lua_call_vaddr = g_loader_64->get_symbol_vaddr(
+                            &g_main_mod_64, "_Z8lua_callP9lua_Stateii");
+                        uint64_t safe_vaddr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "sre_lua_call_safe");
+                        if (lua_call_vaddr && safe_vaddr) {
+                            if (TrampolineMgr::instance().install_hook(
+                                    "lua_call_safe", lua_call_vaddr, safe_vaddr)) {
+                                std::cout << "[SRE] lua_call → sre_lua_call_safe @ 0x"
+                                          << std::hex << lua_call_vaddr << " → 0x" << safe_vaddr
+                                          << std::dec << " (LATE INSTALL — pcall ready)" << std::endl;
+                            }
+                        } else {
+                            std::cerr << "[SRE] WARNING: Could not install lua_call hook"
+                                      << " (lua_call=" << lua_call_vaddr 
+                                      << " safe=" << safe_vaddr << ")" << std::endl;
+                        }
+                    }
+
+                    // === Late-install lua_resume → sre_lua_resume_safe trampoline ===
+                    // BL-scanning doesn't work because ARM64 PIC calls go through PLT.
+                    // Instead: trampoline at lua_resume itself + relay stub for original.
+                    //
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // Initialize TrampolineMgr — owns all code-cave allocations.
+                    // This prevents cave overlaps (the old hard-coded address system
+                    // caused RenderingContext and updateApplication to share 0x3000300).
+                    // ═══════════════════════════════════════════════════════════════
+                    TrampolineMgr::instance().init(g_guest_memory, load_addr);
+
+                    // ─── lua_resume: first hook, gets the first arena slot ───────
+                    {
+                        uint64_t lua_resume_vaddr = g_loader_64->get_symbol_vaddr(
+                            &g_main_mod_64, "_Z10lua_resumeP9lua_Statei");
+                        uint64_t safe_resume_vaddr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "sre_lua_resume_safe");
+                        uint64_t g_lua_resume_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_lua_resume");
+
+                        if (lua_resume_vaddr && safe_resume_vaddr && g_lua_resume_addr) {
+                            TrampolineMgr::instance().install_hook(
+                                "lua_resume",
+                                lua_resume_vaddr,
+                                safe_resume_vaddr,
+                                g_lua_resume_addr,
+                                1, /*allow_replace=*/true);
+                        } else {
+                            std::cerr << "[SRE] WARNING: lua_resume trampoline skipped"
+                                      << " (resume=0x" << std::hex << lua_resume_vaddr
+                                      << " safe=0x" << safe_resume_vaddr
+                                      << " g_ptr=0x" << g_lua_resume_addr
+                                      << std::dec << ")" << std::endl;
+                        }
+                    }
+                }
+
+                // ========= Resolve ProgramState symbols for hook targets =========
+                // Map from SRE symbol name → libswordigo mangled symbol name
+                struct SymHookMap { const char* sre_sym; const char* engine_sym; };
+                
+                // 1.4.12 libstdc++ symbols
+                SymHookMap sym_hooks_12[] = {
+                    {"sre_ProgramState_destructor", "_ZN5Caver12ProgramStateD1Ev"},
+                    {"sre_ProgramState_Execute", "_ZN5Caver12ProgramState7ExecuteEi"},
+                    {"sre_ProgramState_Resume",  "_ZN5Caver12ProgramState6ResumeEi"},
+                    {"sre_ProgramState_Update",  "_ZN5Caver12ProgramState6UpdateEf"},
+                    {"sre_CameraController_Update", "_ZN5Caver16CameraController6UpdateEf"},
+                    {"sre_SceneGrid_UpdateVisibleAreasWithCamera", "_ZN5Caver9SceneGrid28UpdateVisibleAreasWithCameraEPNS_6CameraE"},
+                    {"sre_GUIView_Update",             "_ZN5Caver7GUIView6UpdateEf"},
+                    {"sre_AchievementsManager_Update", "_ZN5Caver19AchievementsManager6UpdateEf"},
+                    {"sre_SetResourcesPath",           "_ZN5Caver16SetResourcesPathERKSs"},
+                    {"sre_IsAndroidAssetsPath",        "_ZN5Caver19IsAndroidAssetsPathERKSs"},
+                    {"sre_AudioSystem_EndAudioInterruptionIfNecessary", "_ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv"},
+                    {"sre_stack_chk_fail",             "__stack_chk_fail"},
+                    {"sre_GameOverViewController_ShowAdMaybe", "_ZN5Caver22GameOverViewController11ShowAdMaybeEv"},
+                    // Core Lua functions
+                    {"lua_pcall",     "_Z9lua_pcallP9lua_Stateiii"},
+                    {"lua_resume",    "_Z10lua_resumeP9lua_Statei"},
+                    {"lua_settop",    "_Z10lua_settopP9lua_Statei"},
+                    {"lua_gettop",    "_Z10lua_gettopP9lua_State"},
+                    {"lua_tolstring", "_Z13lua_tolstringP9lua_StateiPm"},
+                    {"lua_call",      "_Z8lua_callP9lua_Stateii"},
+                    {"lua_pushstring","_Z14lua_pushstringP9lua_StatePKc"},
+                    {"lua_pushcclosure","_Z16lua_pushcclosureP9lua_StatePFiS0_Ei"},
+                    {"lua_setfield",  "_Z12lua_setfieldP9lua_StateiPKc"},
+                    {"lua_getfield",  "_Z12lua_getfieldP9lua_StateiPKc"},
+                    {"lua_createtable","_Z15lua_createtableP9lua_Stateii"},
+                    {"lua_pushnumber","_Z14lua_pushnumberP9lua_Stated"},
+                    {"lua_pushboolean","_Z15lua_pushbooleanP9lua_Statei"},
+                    {"lua_pushnil",   "_Z11lua_pushnilP9lua_State"},
+                    {"lua_tonumber",  "_Z12lua_tonumberP9lua_Statei"},
+                    {"lua_toboolean", "_Z13lua_tobooleanP9lua_Statei"},
+                    {"lua_type",      "_Z8lua_typeP9lua_Statei"},
+                    {"luaL_register", "_Z13luaL_registerP9lua_StatePKcPK8luaL_Reg"},
+                    {"lua_touserdata","_Z14lua_touserdataP9lua_Statei"},
+                    {"lua_pushlightuserdata","_Z21lua_pushlightuserdataP9lua_StatePv"},
+                    {"lua_error",     "_Z9lua_errorP9lua_State"},
+                    // Extended Lua functions
+                    {"lua_pushvalue",   "_Z13lua_pushvalueP9lua_Statei"},
+                    {"lua_remove",      "_Z10lua_removeP9lua_Statei"},
+                    {"lua_insert",      "_Z10lua_insertP9lua_Statei"},
+                    {"lua_replace",     "_Z11lua_replaceP9lua_Statei"},
+                    {"lua_checkstack",  "_Z14lua_checkstackP9lua_Statei"},
+                    {"lua_rawget",      "_Z10lua_rawgetP9lua_Statei"},
+                    {"lua_rawset",      "_Z10lua_rawsetP9lua_Statei"},
+                    {"lua_rawgeti",     "_Z11lua_rawgetiP9lua_Stateii"},
+                    {"lua_rawseti",     "_Z11lua_rawsetiP9lua_Stateii"},
+                    {"lua_next",        "_Z8lua_nextP9lua_Statei"},
+                    {"lua_objlen",      "_Z10lua_objlenP9lua_Statei"},
+                    {"lua_settable",    "_Z12lua_settableP9lua_Statei"},
+                    {"lua_gettable",    "_Z12lua_gettableP9lua_Statei"},
+                    {"lua_isnumber",    "_Z12lua_isnumberP9lua_Statei"},
+                    {"lua_isstring",    "_Z12lua_isstringP9lua_Statei"},
+                    {"lua_tointeger",   "_Z13lua_tointegerP9lua_Statei"},
+                    {"lua_pushinteger", "_Z15lua_pushintegerP9lua_Statel"},
+                    {"lua_concat",      "_Z10lua_concatP9lua_Statei"},
+                    {"lua_pushlstring", "_Z15lua_pushlstringP9lua_StatePKcm"},
+                    {"lua_setmetatable","_Z16lua_setmetatableP9lua_Statei"},
+                    {"sre_lua_close",    "_Z9lua_closeP9lua_State"},
+                    {"lua_dump",        "_Z8lua_dumpP9lua_StatePFiS0_PKvmPvES3_"},
+                    {"lua_atpanic",     "_Z11lua_atpanicP9lua_StatePFiS0_E"},
+                    {"lua_getmetatable","_Z16lua_getmetatableP9lua_Statei"},
+                    {"lua_rawequal",    "_Z12lua_rawequalP9lua_Stateii"},
+                    {"lua_equal",       "_Z9lua_equalP9lua_Stateii"},
+                    {"lua_lessthan",    "_Z12lua_lessthanP9lua_Stateii"},
+                    {"lua_isuserdata",  "_Z14lua_isuserdataP9lua_Statei"},
+                    // New standard Lua/LuaL functions
+                    {"sre_luaL_newstate", "_Z13luaL_newstatev"},
+                    {"luaL_loadstring", "_Z15luaL_loadstringP9lua_StatePKc"},
+                    {"luaL_loadbuffer", "_Z15luaL_loadbufferP9lua_StatePKcmS2_"},
+                    {"luaL_loadfile",   "_Z13luaL_loadfileP9lua_StatePKc"},
+                    {"luaopen_base",    "_Z12luaopen_baseP9lua_State"},
+                    {"luaopen_package", "_Z15luaopen_packageP9lua_State"},
+                    {"luaopen_table",   "_Z13luaopen_tableP9lua_State"},
+                    {"luaopen_io",      "_Z10luaopen_ioP9lua_State"},
+                    {"luaopen_os",      "_Z10luaopen_osP9lua_State"},
+                    {"luaopen_string",  "_Z14luaopen_stringP9lua_State"},
+                    {"luaopen_math",    "_Z12luaopen_mathP9lua_State"},
+                    {"luaopen_debug",   "_Z13luaopen_debugP9lua_State"},
+                    {"luaL_openlibs",   "_Z13luaL_openlibsP9lua_State"},
+                    {"lua_newthread",   "_Z13lua_newthreadP9lua_State"},
+                    {"lua_tothread",    "_Z12lua_tothreadP9lua_Statei"},
+                    {"lua_pushthread",  "_Z14lua_pushthreadP9lua_State"},
+                    {"lua_status",      "_Z10lua_statusP9lua_State"},
+                    {"lua_gc",          "_Z6lua_gcP9lua_Stateii"},
+                    {"sre_GameOverlayView_SetControlsHidden", "_ZN5Caver15GameOverlayView17SetControlsHiddenEb"},
+                    // GUINavigationController safety hooks
+                    {"sre_GUINavigationController_Update",           "_ZN5Caver23GUINavigationController6UpdateEf"},
+                    {"sre_GUINavigationController_VCLoaded",         "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_20GUIViewControllerE"},
+                    {"sre_GUINavigationController_FinishTransition", "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE"},
+                    {"sre_OrbitControllerComponent_FollowObject",    "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE"},
+                    {"sre_HeroEquipmentManager_ApplyArmorTrinket",   "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE"},
+                    {"sre_HeroEquipmentManager_ApplyWeaponTrinket",  "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE"},
+                };
+
+                // 1.4.13 libc++ symbols
+                SymHookMap sym_hooks_13[] = {
+                    {"sre_ProgramState_destructor", "_ZN5Caver12ProgramStateD1Ev"},
+                    {"sre_ProgramState_Execute", "_ZN5Caver12ProgramState7ExecuteEi"},
+                    {"sre_ProgramState_Resume",  "_ZN5Caver12ProgramState6ResumeEi"},
+                    {"sre_ProgramState_Update",  "_ZN5Caver12ProgramState6UpdateEf"},
+                    {"sre_AudioSystem_EndAudioInterruptionIfNecessary", "_ZN5Caver11AudioSystem31EndAudioInterruptionIfNecessaryEv"},
+                    {"sre_stack_chk_fail",             "__stack_chk_fail"},
+                    {"sre_GameOverViewController_ShowAdMaybe", "_ZN5Caver22GameOverViewController11ShowAdMaybeEv"},
+                    // 1.4.13 Clang INLINED ShowAdMaybe into GameOverVC::Update
+                    // (IDA: ShowAdMaybe callers = 0) — hook Update for the real
+                    // death-screen timer gate (respawn queue, see sre13_safety.c).
+                    {"sre_GameOverViewController_Update", "_ZN5Caver22GameOverViewController6UpdateEf"},
+                    // Frame master tick - live Lua console per-frame service
+                    {"sre13_CaverShell_Update", "_ZN5Caver10CaverShell6UpdateEf"},
+                    // Scene Loading & Transition
+                    {"sre_SceneLoadingView_InitWithGameState", "_ZN5Caver16SceneLoadingView17InitWithGameStateERKN5boost10shared_ptrINS_9GameStateEEERKNS2_INS_7MapNodeEEE"},
+                    {"sre_SceneLoadingView_Update",            "_ZN5Caver16SceneLoadingView6UpdateEf"},
+                    {"sre_Scene_FinishLoad",                   "_ZN5Caver5Scene10FinishLoadEv"},
+                    {"sre_SceneObjectGroup_FinishLoad",        "_ZN5Caver16SceneObjectGroup10FinishLoadEv"},
+                    {"sre_ComponentOutletBase_Connect",        "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE"},
+                    {"sre_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl"},
+                    {"sre_GameData_Clear",                     "_ZN5Caver5Proto8GameData5ClearEv"},
+                    {"sre_Proto_SceneObject_Clear",            "_ZN5Caver5Proto11SceneObject5ClearEv"},
+                    // OpenAL Music & Audio Controls
+                    {"sre_PlayMusicWithName",                  "_ZN5Caver11MusicPlayer17PlayMusicWithNameERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEb"},
+                    {"sre_MusicPlayer_FadeIn",                 "_ZN5Caver11MusicPlayer6FadeInEf"},
+                    {"sre_MusicPlayer_FadeOut",                "_ZN5Caver11MusicPlayer7FadeOutEf"},
+                    {"sre_MusicPlayer_Update",                 "_ZN5Caver11MusicPlayer6UpdateEf"},
+                    {"sre_AudioSystem_SetMusicVolume",         "_ZN5Caver11AudioSystem14SetMusicVolumeEf"},
+                    {"sre_MusicPlayer_SetEnabled",             "_ZN5Caver11MusicPlayer10SetEnabledEb"},
+                    {"sre_MusicPlayer_SetSuspended",           "_ZN5Caver11MusicPlayer12SetSuspendedEb"},
+                    // UI & Input
+                    {"sre_StartTextInputWithDelegate",         "_ZN5Caver26StartTextInputWithDelegateEPNS_18ITextInputDelegateERKNSt6__ndk112basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEE"},
+                    {"sre_StopTextInputWithDelegate",          "_ZN5Caver25StopTextInputWithDelegateEPNS_18ITextInputDelegateE"},
+                    {"sre_textInputTextDidChange",             "Java_com_touchfoo_swordigo_Native_textInputTextDidChange"},
+                    {"sre_textInputDidFinish",                 "Java_com_touchfoo_swordigo_Native_textInputDidFinish"},
+                    // VFS
+                    {"sre_SetResourcesPath",                   "_ZN5Caver16SetResourcesPathERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE"},
+                    {"sre_IsAndroidAssetsPath",                "_ZN5Caver19IsAndroidAssetsPathERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE"},
+                    // Core Lua functions
+                    {"lua_pcall",     "_Z9lua_pcallP9lua_Stateiii"},
+                    {"lua_resume",    "_Z10lua_resumeP9lua_Statei"},
+                    {"lua_settop",    "_Z10lua_settopP9lua_Statei"},
+                    {"lua_gettop",    "_Z10lua_gettopP9lua_State"},
+                    {"lua_tolstring", "_Z13lua_tolstringP9lua_StateiPm"},
+                    {"lua_call",      "_Z8lua_callP9lua_Stateii"},
+                    {"lua_pushstring","_Z14lua_pushstringP9lua_StatePKc"},
+                    {"lua_pushcclosure","_Z16lua_pushcclosureP9lua_StatePFiS0_Ei"},
+                    {"lua_setfield",  "_Z12lua_setfieldP9lua_StateiPKc"},
+                    {"lua_getfield",  "_Z12lua_getfieldP9lua_StateiPKc"},
+                    {"lua_createtable","_Z15lua_createtableP9lua_Stateii"},
+                    {"lua_pushnumber","_Z14lua_pushnumberP9lua_Stated"},
+                    {"lua_pushboolean","_Z15lua_pushbooleanP9lua_Statei"},
+                    {"lua_pushnil",   "_Z11lua_pushnilP9lua_State"},
+                    {"lua_tonumber",  "_Z12lua_tonumberP9lua_Statei"},
+                    {"lua_toboolean", "_Z13lua_tobooleanP9lua_Statei"},
+                    {"lua_type",      "_Z8lua_typeP9lua_Statei"},
+                    {"luaL_register", "_Z13luaL_registerP9lua_StatePKcPK8luaL_Reg"},
+                    {"lua_touserdata","_Z14lua_touserdataP9lua_Statei"},
+                    {"lua_pushlightuserdata","_Z21lua_pushlightuserdataP9lua_StatePv"},
+                    {"lua_error",     "_Z9lua_errorP9lua_State"},
+                    {"lua_pushvalue",   "_Z13lua_pushvalueP9lua_Statei"},
+                    {"lua_remove",      "_Z10lua_removeP9lua_Statei"},
+                    {"lua_insert",      "_Z10lua_insertP9lua_Statei"},
+                    {"lua_replace",     "_Z11lua_replaceP9lua_Statei"},
+                    {"lua_checkstack",  "_Z14lua_checkstackP9lua_Statei"},
+                    {"lua_rawget",      "_Z10lua_rawgetP9lua_Statei"},
+                    {"lua_rawset",      "_Z10lua_rawsetP9lua_Statei"},
+                    {"lua_rawgeti",     "_Z11lua_rawgetiP9lua_Stateii"},
+                    {"lua_rawseti",     "_Z11lua_rawsetiP9lua_Stateii"},
+                    {"lua_next",        "_Z8lua_nextP9lua_Statei"},
+                    {"lua_objlen",      "_Z10lua_objlenP9lua_Statei"},
+                    {"lua_settable",    "_Z12lua_settableP9lua_Statei"},
+                    {"lua_gettable",    "_Z12lua_gettableP9lua_Statei"},
+                    {"lua_isnumber",    "_Z12lua_isnumberP9lua_Statei"},
+                    {"lua_isstring",    "_Z12lua_isstringP9lua_Statei"},
+                    {"lua_tointeger",   "_Z13lua_tointegerP9lua_Statei"},
+                    {"lua_pushinteger", "_Z15lua_pushintegerP9lua_Statel"},
+                    {"lua_concat",      "_Z10lua_concatP9lua_Statei"},
+                    {"lua_pushlstring", "_Z15lua_pushlstringP9lua_StatePKcm"},
+                    {"lua_setmetatable","_Z16lua_setmetatableP9lua_Statei"},
+                    {"sre_lua_close",    "_Z9lua_closeP9lua_State"},
+                    {"lua_dump",        "_Z8lua_dumpP9lua_StatePFiS0_PKvmPvES3_"},
+                    {"lua_atpanic",     "_Z11lua_atpanicP9lua_StatePFiS0_E"},
+                    {"lua_getmetatable","_Z16lua_getmetatableP9lua_Statei"},
+                    {"lua_rawequal",    "_Z12lua_rawequalP9lua_Stateii"},
+                    {"lua_equal",       "_Z9lua_equalP9lua_Stateii"},
+                    {"lua_lessthan",    "_Z12lua_lessthanP9lua_Stateii"},
+                    {"lua_isuserdata",  "_Z14lua_isuserdataP9lua_Statei"},
+                    {"sre_luaL_newstate", "_Z13luaL_newstatev"},
+                    {"luaL_loadstring", "_Z15luaL_loadstringP9lua_StatePKc"},
+                    {"luaL_loadbuffer", "_Z15luaL_loadbufferP9lua_StatePKcmS2_"},
+                    {"luaL_loadfile",   "_Z13luaL_loadfileP9lua_StatePKc"},
+                    {"luaopen_base",    "_Z12luaopen_baseP9lua_State"},
+                    {"luaopen_package", "_Z15luaopen_packageP9lua_State"},
+                    {"luaopen_table",   "_Z13luaopen_tableP9lua_State"},
+                    {"luaopen_io",      "_Z10luaopen_ioP9lua_State"},
+                    {"luaopen_os",      "_Z10luaopen_osP9lua_State"},
+                    {"luaopen_string",  "_Z14luaopen_stringP9lua_State"},
+                    {"luaopen_math",    "_Z12luaopen_mathP9lua_State"},
+                    {"luaopen_debug",   "_Z13luaopen_debugP9lua_State"},
+                    {"luaL_openlibs",   "_Z13luaL_openlibsP9lua_State"},
+                    {"lua_newthread",   "_Z13lua_newthreadP9lua_State"},
+                    {"lua_tothread",    "_Z12lua_tothreadP9lua_Statei"},
+                    {"lua_pushthread",  "_Z14lua_pushthreadP9lua_State"},
+                    {"lua_status",      "_Z10lua_statusP9lua_State"},
+                    {"lua_gc",          "_Z6lua_gcP9lua_Stateii"},
+                };
+
+                const SymHookMap* sym_hooks = (swordi_abi == 13) ? sym_hooks_13 : sym_hooks_12;
+                const int NUM_SYM_HOOKS = (swordi_abi == 13) ? (sizeof(sym_hooks_13) / sizeof(sym_hooks_13[0]))
+                                                             : (sizeof(sym_hooks_12) / sizeof(sym_hooks_12[0]));
+
+                // Read the hook table from the SRE module and install trampolines
+                uint64_t table_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_hook_table");
+                uint64_t count_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_hook_count");
+
+                if (table_addr && count_addr) {
+                    int hook_count = *(int32_t*)(g_guest_memory + count_addr);
+                    std::cout << "[SRE] Installing " << hook_count << " hooks..." << std::endl;
+
+                    struct GuestHookEntry {
+                        uint64_t target_offset;
+                        uint64_t symbol_name_ptr;
+                        uint64_t orig_func;      // reserved for future relay stubs
+                    };
+
+                    // ─── Pre-save relays via TrampolineMgr (no magic addresses) ─
+                    // OLD: Hard-coded 0x3000040, 0x3000080, 0x3000300 etc.
+                    // NEW: TrampolineMgr allocs sequentially, no overlaps possible.
+                    uint64_t cxa_throw_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "__cxa_throw");
+                    if (!cxa_throw_vaddr && swordi_abi == 12) {
+                        cxa_throw_vaddr = load_addr + 0x51e108;
+                    }
+                    uint64_t CXA_RELAY = 0;
+                    uint64_t g_orig_cxa_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_original_cxa_throw");
+                    if (g_orig_cxa_addr && TrampolineMgr::instance().install_relay(
+                            "__cxa_throw_relay", cxa_throw_vaddr, g_orig_cxa_addr)) {
+                        CXA_RELAY = *(uint64_t*)(g_guest_memory + g_orig_cxa_addr);
+                    }
+
+                    // ─── Destructor relay ────────────────────────────────────────
+                    uint64_t destructor_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver12ProgramStateD1Ev");
+                    if (destructor_vaddr) {
+                        uint64_t g_orig_destructor_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_ProgramState_destructor");
+                        TrampolineMgr::instance().install_hook(
+                            "ProgramState_destructor",
+                            destructor_vaddr,
+                            g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_ProgramState_destructor"),
+                            g_orig_destructor_addr, 1, /*allow_replace=*/true);
+                    }
+
+                    // ─── luaL_newstate / lua_close orig pointers ────────────────
+                    // The engine's luaL_newstate is patched to jump to
+                    // sre_luaL_newstate (state-registry wrapper). That wrapper must
+                    // call libsre's OWN vendored luaL_newstate (never patched), not
+                    // the engine's patched copy (which would recurse forever).
+                    // Resolve libsre's vendored implementation and store it in the
+                    // g_orig_* globals the wrapper calls through.
+                    {
+                        uint64_t g_orig_ns = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_luaL_newstate");
+                        uint64_t vendored_ns = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "luaL_newstate");
+                        if (g_orig_ns && vendored_ns) {
+                            *(uint64_t*)(g_guest_memory + g_orig_ns) = vendored_ns;
+                            std::cout << "[SRE] g_orig_luaL_newstate → libsre vendored @ 0x"
+                                      << std::hex << vendored_ns << std::dec << std::endl;
+                        } else {
+                            std::cerr << "[SRE] WARNING: g_orig_luaL_newstate not resolved"
+                                      << " (orig=0x" << std::hex << g_orig_ns
+                                      << " vendored=0x" << vendored_ns << std::dec << ")" << std::endl;
+                        }
+                        uint64_t g_orig_lc = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_lua_close");
+                        uint64_t vendored_lc = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "lua_close");
+                        if (g_orig_lc && vendored_lc) {
+                            *(uint64_t*)(g_guest_memory + g_orig_lc) = vendored_lc;
+                            std::cout << "[SRE] g_orig_lua_close → libsre vendored @ 0x"
+                                      << std::hex << vendored_lc << std::dec << std::endl;
+                        } else {
+                            std::cerr << "[SRE] WARNING: g_orig_lua_close not resolved"
+                                      << " (orig=0x" << std::hex << g_orig_lc
+                                      << " vendored=0x" << vendored_lc << std::dec << ")" << std::endl;
+                        }
+                    }
+
+                    // ─── CameraController::Update relay ──────────────────────────
+                    uint64_t cam_update_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver16CameraController6UpdateEf");
+                    if (cam_update_vaddr) {
+                        uint64_t g_orig_cam_update_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_CameraController_Update");
+                        TrampolineMgr::instance().install_relay(
+                            "CameraController_Update_relay", cam_update_vaddr,
+                            g_orig_cam_update_addr);
+                    }
+
+                    // ─── SceneGrid::UpdateVisibleAreasWithCamera relay ───────────
+                    uint64_t scenegrid_update_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver9SceneGrid28UpdateVisibleAreasWithCameraEPNS_6CameraE");
+                    if (scenegrid_update_vaddr) {
+                        uint64_t g_orig_sg_update_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_SceneGrid_UpdateVisibleAreasWithCamera");
+                        TrampolineMgr::instance().install_relay(
+                            "SceneGrid_UpdateVis_relay", scenegrid_update_vaddr,
+                            g_orig_sg_update_addr);
+                    }
+
+                    // ─── GameOverlayView::SetControlsHidden relay ────────────────
+                    uint64_t set_controls_hidden_vaddr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver15GameOverlayView17SetControlsHiddenEb");
+                    if (set_controls_hidden_vaddr) {
+                        uint64_t g_orig_sch_addr = g_loader_64->get_symbol_vaddr(
+                            &g_sre_mod, "g_orig_GameOverlayView_SetControlsHidden");
+                        TrampolineMgr::instance().install_relay(
+                            "GameOverlayView_SetControlsHidden_relay",
+                            set_controls_hidden_vaddr, g_orig_sch_addr);
+                    }
+
+
+
+                    // ─── Relay Initialization ───────────────────────────────────────
+                    if (swordi_abi == 13) {
+                        struct RelayMap13 { const char* engine_sym; const char* sre_orig_sym; };
+                        const RelayMap13 relays_13[] = {
+                            {"_ZN5Caver16SceneLoadingView17InitWithGameStateERKN5boost10shared_ptrINS_9GameStateEEERKNS2_INS_7MapNodeEEE", "g_orig_SceneLoadingView_InitWithGameState"},
+                            {"_ZN5Caver16SceneLoadingView6UpdateEf", "g_orig_SceneLoadingView_Update"},
+                            {"_ZN5Caver16SceneLoadingView9AnimateInEv", "g_orig_SceneLoadingView_AnimateIn"},
+                            {"_ZN5Caver5Scene10FinishLoadEv", "g_orig_Scene_FinishLoad"},
+                            {"_ZN5Caver16SceneObjectGroup10FinishLoadEv", "g_orig_SceneObjectGroup_FinishLoad"},
+                            {"_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE", "g_orig_ComponentOutletBase_Connect"},
+                            {"_ZN5Caver5Proto8GameData5ClearEv", "g_orig_GameData_Clear"},
+                            {"_ZN5Caver5Proto11SceneObject5ClearEv", "g_orig_Proto_SceneObject_Clear"},
+                            {"_ZN5Caver22GameOverViewController6UpdateEf", "g_orig_GameOverViewController_Update"},
+                            {"_ZN5Caver10CaverShell6UpdateEf", "g_orig_CaverShell_Update"},
+                        };
+                        for (const auto& r : relays_13) {
+                            uint64_t fn_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, r.engine_sym);
+                            uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, r.sre_orig_sym);
+                            if (fn_vaddr && orig_addr) {
+                                TrampolineMgr::instance().install_relay(r.sre_orig_sym, fn_vaddr, orig_addr);
+                            }
+                        }
+                    } else {
+                        // ─── GUINavigationController relay caves (1.4.12) ───────────────
+                        struct GUINavRelay {
+                            uint64_t    nm_offset;
+                            const char* engine_sym;
+                            const char* sre_orig_sym;
+                        };
+                        const GUINavRelay nav_relays[] = {
+                            { 0x34ed2c, "_ZN5Caver13GameSceneView6UpdateEf", "g_orig_GameSceneView_Update_fn" },
+                            { 0x49923c, "_ZN5Caver23GUINavigationController6UpdateEf", "g_orig_GUINavigationController_Update" },
+                            { 0x499288, "_ZN5Caver23GUINavigationController24ViewControllerViewLoadedEPNS_17GUIViewControllerE", "g_orig_GUINavigationController_VCLoaded" },
+                            { 0x49a42c, "_ZN5Caver23GUINavigationController32FinishTransitionToViewControllerERKN5boost10shared_ptrINS_17GUIViewControllerEEEPvPNS_8GUIEventE", "g_orig_GUINavigationController_Finish" },
+                            { 0, "_ZN5Caver24OrbitControllerComponent12FollowObjectERKN5boost13intrusive_ptrINS_11SceneObjectEEE", "g_orig_OrbitController_FollowObject" },
+                            { 0, "_ZN5Caver20HeroEquipmentManager17ApplyArmorTrinketERKN5boost10shared_ptrINS_4ItemEEE", "g_orig_HeroEquipmentManager_ApplyArmorTrinket" },
+                            { 0, "_ZN5Caver20HeroEquipmentManager18ApplyWeaponTrinketERKN5boost10shared_ptrINS_4ItemEEE", "g_orig_HeroEquipmentManager_ApplyWeaponTrinket" },
+                            { 0x2e6d60, "_ZN5Caver5Proto8GameData5ClearEv", "g_orig_GameData_Clear" },
+                            { 0x2fc030, "_ZN5Caver5Proto11SceneObject5ClearEv", "g_orig_Proto_SceneObject_Clear" },
+                            { 0x2fe23c, "_ZN5Caver5Proto11SceneObjectD1Ev", "g_orig_Proto_SceneObject_Destroy" },
+                            { 0x247c48, "_ZN5Caver19ComponentOutletBase7ConnectEPKNS_9ComponentE", "g_orig_ComponentOutletBase_Connect" },
+                            { 0x2fd374, "_ZN5Caver5Proto13ObjectLibrary5ClearEv", "g_orig_Proto_ObjectLibrary_Clear" },
+                            { 0x4642a8, "_ZN5Caver5Scene10FinishLoadEv", "g_orig_Scene_FinishLoad" },
+                            { 0x470ec4, "_ZN5Caver11SceneObject10FinishLoadEv", "g_orig_SceneObject_FinishLoad" },
+                            { 0x475498, "_ZN5Caver16SceneObjectGroup10FinishLoadEv", "g_orig_SceneObjectGroup_FinishLoad" },
+                            { 0x4358dc, "_ZN5Caver16SceneLoadingView17InitWithGameStateERKN5boost10shared_ptrINS_9GameStateEEERKNS2_INS_7MapNodeEEE", "g_orig_SceneLoadingView_InitWithGameState" },
+                            { 0x4c0f18, "_ZN5Caver21RegisterProgramLibraryERKSsPFvPNS_12ProgramStateEE", "g_orig_RegisterProgramLibrary" },
+                        };
+                        for (const auto& nr : nav_relays) {
+                            uint64_t fn_vaddr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, nr.engine_sym);
+                            if (!fn_vaddr && nr.nm_offset != 0) {
+                                fn_vaddr = load_addr + nr.nm_offset;
+                            }
+                            if (!fn_vaddr) {
+                                std::cerr << "[SRE] WARNING: GUINav relay not found: " << nr.engine_sym << std::endl;
+                                continue;
+                            }
+                            uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, nr.sre_orig_sym);
+                            if (!TrampolineMgr::instance().install_relay(
+                                    nr.sre_orig_sym, fn_vaddr, orig_addr)) {
+                                std::cerr << "[SRE] WARNING: relay unavailable for "
+                                          << nr.sre_orig_sym << std::endl;
+                            }
+                        }
+
+                        // ─── GUI relay stubs (1.4.12) ──
+                        struct GuiRelay {
+                            uint64_t    nm_offset;
+                            const char* orig_sym;
+                        };
+                        const GuiRelay gui_relays[] = {
+                            { 0x4a28bc, "g_orig_GUIWindow_DrawRect"    },
+                            { 0x49f310, "g_orig_GUIView_DrawRect"      },
+                            { 0x49565c, "g_orig_GUIButton_DrawRect"    },
+                            { 0x497aa0, "g_orig_GUILabel_DrawRect"     },
+                            { 0x497658, "g_orig_GUIFrameView_DrawRect" },
+                            { 0x491b54, "g_orig_GUIAlertView_DrawRect" },
+                            { 0x49cd40, "g_orig_GUISlider_DrawRect"    },
+                            { 0x42bae4, "g_orig_NewMenuView_DrawRect"  },
+                            { 0x393094, "g_orig_MainMenuView_ButtonPressed" },
+                            { 0x48afb0, "g_orig_RenderingContext_C1"   },
+                        };
+                        for (const auto& r : gui_relays) {
+                            uint64_t vaddr = g_main_mod_64.base_addr + r.nm_offset;
+                            uint64_t orig_sym_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, r.orig_sym);
+                            if (!TrampolineMgr::instance().install_relay(
+                                    r.orig_sym, vaddr, orig_sym_addr)) {
+                                std::cerr << "[SRE] WARNING: GUI relay unavailable for "
+                                          << r.orig_sym << std::endl;
+                            }
+                        }
+                    }
+
+                    int installed = 0;
+                    for (int i = 0; i < hook_count; i++) {
+                        GuestHookEntry* entry = (GuestHookEntry*)(g_guest_memory + table_addr) + i;
+                        uint64_t target_offset = entry->target_offset;
+                        if (entry->symbol_name_ptr == 0) continue; // skip sentinel
+                        const char* sym_name = (const char*)(g_guest_memory + entry->symbol_name_ptr);
+
+                        // If target_offset is 0, resolve by symbol name from libswordigo.so
+                        if (target_offset == 0) {
+                            // Find matching engine symbol
+                            bool found = false;
+                            for (int j = 0; j < NUM_SYM_HOOKS; j++) {
+                                if (strcmp(sym_name, sym_hooks[j].sre_sym) == 0) {
+                                    uint64_t engine_vaddr = g_loader_64->get_symbol_vaddr(
+                                        &g_main_mod_64, sym_hooks[j].engine_sym);
+                                    if (engine_vaddr) {
+                                        target_offset = engine_vaddr - load_addr;
+                                        found = true;
+                                    } else {
+                                        std::cerr << "[SRE] WARNING: Engine symbol not found: " 
+                                                  << sym_hooks[j].engine_sym << std::endl;
+                                    }
+                                    break;
+                                }
+                            }
+                            if (!found || target_offset == 0) {
+                                std::cerr << "[SRE] SKIP: No engine offset for " << sym_name << std::endl;
+                                continue;
+                            }
+                        }
+
+                        uint64_t target_addr = load_addr + target_offset;
+                        entry->orig_func = target_addr;
+
+                        // Look up the replacement function in the SRE module
+                        uint64_t replacement = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym_name);
+                        {
+                            FILE* f = fopen("/home/quantumcreeper/SwordigoDesktop/sre_hook_debug.txt", "a");
+                            if (f) {
+                                uint32_t* insns = (uint32_t*)(g_guest_memory + target_addr);
+                                fprintf(f, "Hook: %s | target_addr=0x%lx | base_addr=0x%lx | replacement=0x%lx\n",
+                                        sym_name, target_addr, g_sre_mod.base_addr, replacement);
+                                fprintf(f, "  Original instructions: %08x %08x %08x %08x\n",
+                                        insns[0], insns[1], insns[2], insns[3]);
+                                fclose(f);
+                            }
+                        }
+                        if (!replacement) {
+                            continue;
+                        }
+
+                        // Hooks that call through to the original must be installed
+                        // atomically: relocate first, publish g_orig, then patch.
+                        const char* relay_orig_sym = nullptr;
+                        if (strcmp(sym_name, "sre_ProgramState_destructor") == 0)
+                            relay_orig_sym = "g_orig_ProgramState_destructor";
+                        else if (strcmp(sym_name, "sre_CameraController_Update") == 0)
+                            relay_orig_sym = "g_orig_CameraController_Update";
+                        else if (strcmp(sym_name, "sre_SceneGrid_UpdateVisibleAreasWithCamera") == 0)
+                            relay_orig_sym = "g_orig_SceneGrid_UpdateVisibleAreasWithCamera";
+                        else if (strcmp(sym_name, "sre_GameOverlayView_SetControlsHidden") == 0)
+                            relay_orig_sym = "g_orig_GameOverlayView_SetControlsHidden";
+                        else if (strcmp(sym_name, "sre_SceneLoadingView_Update") == 0)
+                            relay_orig_sym = "g_orig_SceneLoadingView_Update";
+                        else if (strcmp(sym_name, "sre_GameOverViewController_Update") == 0)
+                            relay_orig_sym = "g_orig_GameOverViewController_Update";
+                        else if (strcmp(sym_name, "sre13_CaverShell_Update") == 0)
+                            relay_orig_sym = "g_orig_CaverShell_Update";
+                        else if (strcmp(sym_name, "sre_SceneLoadingView_AnimateIn") == 0)
+                            relay_orig_sym = "g_orig_SceneLoadingView_AnimateIn";
+                        else if (strcmp(sym_name, "sre_Scene_FinishLoad") == 0)
+                            relay_orig_sym = "g_orig_Scene_FinishLoad";
+                        else if (strcmp(sym_name, "sre_SceneObject_FinishLoad") == 0)
+                            relay_orig_sym = "g_orig_SceneObject_FinishLoad";
+                        else if (strcmp(sym_name, "sre_SceneObjectGroup_FinishLoad") == 0)
+                            relay_orig_sym = "g_orig_SceneObjectGroup_FinishLoad";
+                        else if (strcmp(sym_name, "sre_GUINavigationController_Update") == 0)
+                            relay_orig_sym = "g_orig_GUINavigationController_Update";
+                        else if (strcmp(sym_name, "sre_GUINavigationController_VCLoaded") == 0)
+                            relay_orig_sym = "g_orig_GUINavigationController_VCLoaded";
+                        else if (strcmp(sym_name, "sre_GUINavigationController_FinishTransition") == 0)
+                            relay_orig_sym = "g_orig_GUINavigationController_Finish";
+                        else if (strcmp(sym_name, "sre_GameData_Clear") == 0)
+                            relay_orig_sym = "g_orig_GameData_Clear";
+                        else if (strcmp(sym_name, "sre_Proto_SceneObject_Clear") == 0)
+                            relay_orig_sym = "g_orig_Proto_SceneObject_Clear";
+                        else if (strcmp(sym_name, "sre_Proto_SceneObject_Destroy") == 0)
+                            relay_orig_sym = "g_orig_Proto_SceneObject_Destroy";
+                        else if (strcmp(sym_name, "sre_Proto_ObjectLibrary_Clear") == 0)
+                            relay_orig_sym = "g_orig_Proto_ObjectLibrary_Clear";
+                        else if (strcmp(sym_name, "sre_ComponentOutletBase_Connect") == 0)
+                            relay_orig_sym = "g_orig_ComponentOutletBase_Connect";
+                        else if (strcmp(sym_name, "sre_RenderingContext_C1") == 0)
+                            relay_orig_sym = "g_orig_RenderingContext_C1";
+                        else if (strcmp(sym_name, "sre_ProfileSelectionView_LoadProfiles") == 0)
+                            relay_orig_sym = "g_orig_ProfileSelectionView_LoadProfiles";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_InitWithProfile") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_InitWithProfile";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_Update") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_Update";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_DrawRect") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_DrawRect";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_LayoutSubviews") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_LayoutSubviews";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_AnimateIn") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_AnimateIn";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_AnimateOut") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_AnimateOut";
+                        else if (strcmp(sym_name, "sre_ProfilePanelView_ButtonPressed") == 0)
+                            relay_orig_sym = "g_orig_ProfilePanelView_ButtonPressed";
+
+                        if (relay_orig_sym) {
+                            uint64_t orig_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, relay_orig_sym);
+                            if (!orig_addr) {
+                                std::cerr << "[SRE] SKIP: Missing relay pointer " << relay_orig_sym << std::endl;
+                                continue;
+                            }
+                            if (TrampolineMgr::instance().install_hook(
+                                    sym_name, target_addr, replacement, orig_addr, 1)) {
+                                installed++;
+                            }
+                            continue;
+                        }
+
+                        // All redirects go through TrampolineMgr. This validates the
+                        // AArch64 branch range, records original bytes, and prevents a
+                        // later table entry from silently overwriting a safety hook.
+                        if (TrampolineMgr::instance().install_hook(
+                                sym_name, target_addr, replacement)) {
+                            std::cout << "[SRE] Hook: 0x" << std::hex << target_offset
+                                      << " -> " << sym_name << " @ 0x" << replacement
+                                      << std::dec << std::endl;
+                            installed++;
+                        }
+                    }
+
+                    // Set g_original_cxa_throw to point to the relay stub
+                    if (g_orig_cxa_addr && CXA_RELAY) {
+                        *(uint64_t*)(g_guest_memory + g_orig_cxa_addr) = CXA_RELAY;
+                        std::cout << "[SRE] g_original_cxa_throw → relay @ 0x" 
+                                  << std::hex << CXA_RELAY << std::dec << std::endl;
+                    }
+
+                    // Set g_OverlayTextComponent_Interface_addr in libsre.so
+                    uint64_t g_ot_iface_sym_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "g_OverlayTextComponent_Interface_addr");
+                    uint64_t ot_iface_engine_addr = g_loader_64->get_symbol_vaddr(
+                        &g_main_mod_64, "_ZN5Caver20OverlayTextComponent9InterfaceEv");
+                    if (g_ot_iface_sym_addr && ot_iface_engine_addr) {
+                        *(uint64_t*)(g_guest_memory + g_ot_iface_sym_addr) = ot_iface_engine_addr;
+                        std::cout << "[SRE] Resolved g_OverlayTextComponent_Interface_addr → 0x"
+                                  << std::hex << ot_iface_engine_addr << std::dec << std::endl;
+                    }
+
+                    // Dynamic Interface Resolver for all components
+                    const char* component_classes[] = {
+                        "GlowComponent", "ManaComponent", "LightComponent", "ModelComponent",
+                        "ShapeComponent", "SkillComponent", "SpellComponent", "SwingComponent",
+                        "AttackComponent", "DamageComponent", "EntityComponent", "HealthComponent",
+                        "PortalComponent", "ShadowComponent", "SpriteComponent", "OverlayComponent",
+                        "ProgramComponent", "ShatterComponent", "ItemDropComponent", "ParticleComponent",
+                        "AnimationComponent", "MagicBoltComponent", "MagicBombComponent", "TouchableComponent",
+                        "TransformComponent", "WaterMeshComponent", "BackgroundComponent", "EntityInfoComponent",
+                        "FireBreathComponent", "GroundMeshComponent", "HeroEntityComponent", "PropertiesComponent",
+                        "SimpleGlowComponent", "SpawnPointComponent", "TextBubbleComponent", "WeaponGlowComponent",
+                        "FireEmitterComponent", "OverlayTextComponent", "SoundEffectComponent", "WeaponTrailComponent",
+                        "EntityActionComponent", "PortalEffectComponent", "ShadowVolumeComponent", "UtilityShapeComponent",
+                        "GroundPolygonComponent", "HookshotTrailComponent", "MagicHookshotComponent", "MonsterEntityComponent",
+                        "ParticleFieldComponent", "PhysicsObjectComponent", "BlendAnimationComponent", "BushControllerComponent",
+                        "CharControllerComponent", "CollisionShapeComponent", "DimensionSpellComponent", "DoorControllerComponent",
+                        "MagicExplosionComponent", "MagicSpellCastComponent", "ObjectModifierComponent", "ParticleObjectComponent",
+                        "TextureMappingComponent", "BreakableObjectComponent", "CollectableItemComponent", "DimensionObjectComponent",
+                        "OrbitControllerComponent", "ParticleEmitterComponent", "PhysicsPlatformComponent", "PressureTriggerComponent",
+                        "SwingableWeaponComponent", "EntityControllerComponent", "KeyframeAnimationComponent", "MonsterControllerComponent",
+                        "CharAnimControllerComponent", "ElevatorControllerComponent", "OverlayTargetArrowComponent", "RotatingBackgroundComponent",
+                        "AnimationControllerComponent", "GroundMeshGeneratorComponent", "TransformControllerComponent", "BatMonsterControllerComponent",
+                        "MagicParticleEmitterComponent", "ObjectLinkControllerComponent", "ProjectileControllerComponent", "MonsterDeathControllerComponent",
+                        "SkellyMonsterControllerComponent", "StaticMonsterControllerComponent", "GenericMonsterControllerComponent", "LeapingMonsterControllerComponent",
+                        "ModelTransformControllerComponent", "WalkingMonsterControllerComponent", "BouncingMonsterControllerComponent", "ChargingMonsterControllerComponent",
+                        "ShootingMonsterControllerComponent", "SnappingMonsterControllerComponent", "SwingableWeaponControllerComponent", "ProjectileMonsterControllerComponent",
+                        "BoneControlledCollisionShapeComponent"
+                    };
+
+                    int resolved_interfaces = 0;
+                    int na_interfaces = 0;  // module exports no such global (abi 13 lawncher path)
+                    for (const char* cls : component_classes) {
+                        std::string sre_var_name = std::string(cls) + "_Interface";
+                        std::string mangled_sym = "_ZN5Caver" + std::to_string(strlen(cls)) + cls + "9InterfaceEv";
+
+                        uint64_t sre_var_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, sre_var_name.c_str());
+                        // The sre12 ABI exports <Class>_Interface globals for the host to
+                        // fill; sre13 (lawncher port) resolves the same interfaces internally
+                        // via its G_DL_SYMBOL tables, so an absent global is NOT an error.
+                        if (!sre_var_addr) { na_interfaces++; continue; }
+
+                        uint64_t engine_fn_addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, mangled_sym.c_str());
+
+                        if (engine_fn_addr) {
+                            uint64_t iface_id_ptr = g_emulator_64->call(engine_fn_addr, {});
+                            *(uint64_t*)(g_guest_memory + sre_var_addr) = iface_id_ptr;
+                            resolved_interfaces++;
+                        } else {
+                            std::cerr << "[SRE-Resolver] Failed to find engine symbol for: " << cls << std::endl;
+                        }
+                    }
+                    std::string iface_summary = "[SRE-Resolver] Dynamically resolved "
+                                                + std::to_string(resolved_interfaces) + " component interfaces";
+                    if (na_interfaces)
+                        iface_summary += " (" + std::to_string(na_interfaces) + " N/A for this ABI)";
+                    std::cout << iface_summary << "." << std::endl;
+ 
+                    // Resolve other global engine functions to SRE globals
+                    struct DynamicFns {
+                        const char* sre_var_name;
+                        const char* engine_mangled;
+                    };
+                    const DynamicFns dynamic_fns[] = {
+                        { "g_Camera_SetPerspectiveProjection", "_ZN5Caver6Camera24SetPerspectiveProjectionEffff" },
+                        { "g_Camera_EvaluateViewMatrix", "_ZN5Caver6Camera18EvaluateViewMatrixEv" },
+                        { "g_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl" },
+                        { "g_SceneObject_InitWithTemplate", "_ZN5Caver11SceneObject16InitWithTemplateERKN5boost13intrusive_ptrINS_14ObjectTemplateEEE" },
+                        { "g_ProgramState_FromLuaState", "_ZN5Caver12ProgramState12FromLuaStateEP9lua_State" },
+                        { "g_sre_CreateHeroObjectAt", "_ZN5Caver19GameSceneController18CreateHeroObjectAtERKNS_7Vector3Eib" },
+                        { "g_sre_GameOverVC_DidContinue", "_ZN5Caver22GameOverViewController23GameOverViewDidContinueEPNS_12GameOverViewE" },
+                        { "g_sre_TextBubble_SetHandleTouches", "_ZN5Caver19TextBubbleComponent16SetHandleTouchesEb" },
+                        { "g_sre_TextBubble_IsTextFinishedShowing", "_ZN5Caver19TextBubbleComponent21IsTextFinishedShowingEv" },
+                        { "g_sre_TextBubble_ShowText", "_ZN5Caver19TextBubbleComponent8ShowTextERKSsf" },
+                        { "g_sre_HealthBar_SetMaxHealth", "_ZN5Caver9HealthBar12SetMaxHealthEi" },
+                        { "g_sre_HealthBar_SetCurrentHealth", "_ZN5Caver9HealthBar16SetCurrentHealthEi" },
+                        { "g_sre_ManaBar_SetMaxMana", "_ZN5Caver7ManaBar10SetMaxManaEi" },
+                        { "g_sre_ManaBar_SetCurrentMana", "_ZN5Caver7ManaBar14SetCurrentManaEi" },
+                        { "g_sre_CoinBar_SetCurrentCoins", "_ZN5Caver7CoinBar15SetCurrentCoinsEi" },
+                        { "g_sre_GameOverlayView_SetControlsHidden", "_ZN5Caver15GameOverlayView17SetControlsHiddenEb" },
+                        { "g_sre_GameOverlayView_SetShowsUseButton", "_ZN5Caver15GameOverlayView17SetShowsUseButtonEb" },
+                        { "g_sre_GameOverlayView_SetSkillButtonDisabled", "_ZN5Caver15GameOverlayView22SetSkillButtonDisabledEb" },
+                        { "g_sre_GUIEffect_FadeOut", "_ZN5Caver9GUIEffect7FadeOutEf" },
+                        { "g_sre_GUIEffect_FadeIn", "_ZN5Caver9GUIEffect6FadeInEf" },
+                        { "g_sre_GUIEffect_Update", "_ZN5Caver9GUIEffect6UpdateEf" },
+                        { "g_sre_GUIView_Update", "_ZN5Caver7GUIView6UpdateEf" },
+                        { "g_sre_CharController_CanUse", "_ZN5Caver23CharControllerComponent6CanUseEv" },
+                        { "g_sre_CharController_CanPickup", "_ZN5Caver23CharControllerComponent9CanPickupEv" },
+                        { "g_sre_CharController_StartMovingToDirection", "_ZN5Caver23CharControllerComponent22StartMovingToDirectionEi" },
+                        { "g_sre_CharController_StopMovingToDirection", "_ZN5Caver23CharControllerComponent21StopMovingToDirectionEi" },
+                        { "g_sre_CharController_StartJumping", "_ZN5Caver23CharControllerComponent12StartJumpingEv" },
+                        { "g_sre_CharController_StopJumping", "_ZN5Caver23CharControllerComponent11StopJumpingEv" },
+                        { "g_sre_CharController_CanJump", "_ZN5Caver23CharControllerComponent7CanJumpEv" },
+                        { "g_sre_CharController_CanDoSomething", "_ZN5Caver23CharControllerComponent14CanDoSomethingEv" },
+                        { "g_sre_CharController_CanBeginCasting", "_ZN5Caver23CharControllerComponent15CanBeginCastingEv" },
+                        { "g_sre_CharController_Use", "_ZN5Caver23CharControllerComponent3UseEv" },
+                        { "g_sre_CharController_Die", "_ZN5Caver23CharControllerComponent3DieEv" },
+                        { "g_sre_CharController_Hurt", "_ZN5Caver23CharControllerComponent4HurtEv" },
+                        { "g_sre_CharController_Swing", "_ZN5Caver23CharControllerComponent5SwingEv" },
+                        { "g_sre_CharController_StopSwing", "_ZN5Caver23CharControllerComponent9StopSwingEv" },
+                        { "g_sre_CharController_DropQuickly", "_ZN5Caver23CharControllerComponent11DropQuicklyEv" },
+                        { "g_sre_CharController_CancelCasting", "_ZN5Caver23CharControllerComponent13CancelCastingEv" },
+                        { "g_sre_CharController_FinishCasting", "_ZN5Caver23CharControllerComponent13FinishCastingEv" },
+                        { "g_sre_CharController_CanSwing", "_ZN5Caver23CharControllerComponent8CanSwingEv" },
+                        { "g_sre_GameSceneController_CanCastSkill", "_ZN5Caver19GameSceneController12CanCastSkillERKN5boost10shared_ptrINS_5SkillEEE" },
+                        { "g_sre_GameSceneView_HideCinematicSkipButton", "_ZN5Caver13GameSceneView23HideCinematicSkipButtonEb" },
+                        /* Mini.SetModelName — ModelComponent::setModelName(component, std::string&) */
+                        { "g_sre_ModelComponent_setModelName", "_ZN5Caver14ModelComponent12setModelNameERKSs" },
+                        /* Mini.SetObjectSpeed — EntityControllerComponent::SetMoveSpeed(component, float) */
+                        { "g_sre_EntityControllerComponent_SetMoveSpeed", "_ZN5Caver25EntityControllerComponent12SetMoveSpeedEf" }
+                    };
+
+                    int fn_resolved = 0;
+                    int fn_na = 0;  // libsre13 does not export this g_sre_* global
+                    for (const auto& fn : dynamic_fns) {
+                        uint64_t sre_var_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, fn.sre_var_name);
+                        // sre13 (lawncher port) keeps its function pointers in static
+                        // G_DL_SYMBOL slots resolved via srehost_get_symbol, not in
+                        // host-writable g_sre_* globals. Absent global == N/A, not error.
+                        if (!sre_var_addr) { fn_na++; continue; }
+
+                        uint64_t engine_fn_addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, fn.engine_mangled);
+                        if (engine_fn_addr) {
+                            *(uint64_t*)(g_guest_memory + sre_var_addr) = engine_fn_addr;
+                            fn_resolved++;
+                        } else {
+                            std::cerr << "[SRE-Resolver] Failed to resolve fn: " << fn.sre_var_name << std::endl;
+                        }
+                    }
+                    std::string fn_summary = "[SRE-Resolver] Dynamically resolved "
+                                             + std::to_string(fn_resolved) + " global engine functions";
+                    if (fn_na)
+                        fn_summary += " (" + std::to_string(fn_na) + " N/A for this ABI)";
+                    std::cout << fn_summary << "." << std::endl;
+
+                    // Resolve helper functions dynamically
+                    struct HelperFn {
+                        const char* sre_var_name;
+                        const char* mangled_name;
+                    };
+                    const HelperFn helpers[] = {
+                        { "g_SceneObject_ComponentWithInterface", "_ZNK5Caver11SceneObject22ComponentWithInterfaceEl" },
+                        { "g_ProgramState_FromLuaState", "_ZN5Caver12ProgramState12FromLuaStateEP9lua_State" },
+                        { "g_SwingableWeapon_SetGlowIntensity", "_ZN5Caver24SwingableWeaponComponent16SetGlowIntensityEf" },
+                        { "g_SwingableWeapon_SetGlowColor", "_ZN5Caver24SwingableWeaponComponent12SetGlowColorENS_10FloatColorE" }
+                    };
+                    for (const auto& h : helpers) {
+                        uint64_t sre_var_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, h.sre_var_name);
+                        if (!sre_var_addr) continue;  // global absent in this SRE module (N/A)
+                        uint64_t engine_func_addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, h.mangled_name);
+                        if (engine_func_addr) {
+                            *(uint64_t*)(g_guest_memory + sre_var_addr) = engine_func_addr;
+                        } else {
+                            std::cerr << "[SRE-Resolver] WARNING: Could not resolve helper " << h.sre_var_name << std::endl;
+                        }
+                    }
+
+                    // Resolve all component interfaces dynamically to prevent hard-coded offsets crash
+                    const char* interface_names[] = {
+                        "GlowComponent", "ManaComponent", "LightComponent", "ModelComponent", "ShapeComponent",
+                        "SkillComponent", "SpellComponent", "SwingComponent", "AttackComponent", "DamageComponent",
+                        "EntityComponent", "HealthComponent", "PortalComponent", "ShadowComponent", "SpriteComponent",
+                        "OverlayComponent", "ProgramComponent", "ShatterComponent", "ItemDropComponent", "ParticleComponent",
+                        "AnimationComponent", "MagicBoltComponent", "MagicBombComponent", "TouchableComponent", "TransformComponent",
+                        "WaterMeshComponent", "BackgroundComponent", "EntityInfoComponent", "FireBreathComponent", "GroundMeshComponent",
+                        "HeroEntityComponent", "PropertiesComponent", "SimpleGlowComponent", "SpawnPointComponent", "TextBubbleComponent",
+                        "WeaponGlowComponent", "FireEmitterComponent", "OverlayTextComponent", "SoundEffectComponent", "WeaponTrailComponent",
+                        "EntityActionComponent", "PortalEffectComponent", "ShadowVolumeComponent", "UtilityShapeComponent", "GroundPolygonComponent",
+                        "HookshotTrailComponent", "MonsterEntityComponent", "ParticleFieldComponent", "PhysicsObjectComponent", "BlendAnimationComponent",
+                        "BushControllerComponent", "CharControllerComponent", "CollisionShapeComponent", "DimensionSpellComponent", "DoorControllerComponent",
+                        "MagicExplosionComponent", "MagicSpellCastComponent", "ObjectModifierComponent", "ParticleObjectComponent", "TextureMappingComponent",
+                        "BreakableObjectComponent", "CollectableItemComponent", "DimensionObjectComponent", "OrbitControllerComponent", "ParticleEmitterComponent",
+                        "PhysicsPlatformComponent", "PressureTriggerComponent", "SwingableWeaponComponent", "EntityControllerComponent", "KeyframeAnimationComponent",
+                        "MonsterControllerComponent", "CharAnimControllerComponent", "ElevatorControllerComponent", "OverlayTargetArrowComponent", "RotatingBackgroundComponent",
+                        "AnimationControllerComponent", "GroundMeshGeneratorComponent", "TransformControllerComponent", "BatMonsterControllerComponent", "MagicParticleEmitterComponent",
+                        "ObjectLinkControllerComponent", "ProjectileControllerComponent", "MonsterDeathControllerComponent", "SkellyMonsterControllerComponent", "StaticMonsterControllerComponent",
+                        "GenericMonsterControllerComponent", "LeapingMonsterControllerComponent", "ModelTransformControllerComponent", "WalkingMonsterControllerComponent", "BouncingMonsterControllerComponent",
+                        "ChargingMonsterControllerComponent", "ShootingMonsterControllerComponent", "SnappingMonsterControllerComponent", "SwingableWeaponControllerComponent", "ProjectileMonsterControllerComponent",
+                        "BoneControlledCollisionShapeComponent", "MagicHookshotComponent"
+                    };
+                    int iface_resolved = 0;
+                    for (const char* name : interface_names) {
+                        std::string var_name = std::string(name) + "_Interface";
+                        uint64_t sre_var_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, var_name.c_str());
+                        if (!sre_var_addr) continue;
+                        
+                        std::string mangled = "_ZN5Caver" + std::to_string(strlen(name)) + name + "9InterfaceEv";
+                        uint64_t engine_func_addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, mangled.c_str());
+                        if (engine_func_addr) {
+                            uint64_t iface_ptr = g_emulator_64->call(engine_func_addr, {});
+                            *(uint64_t*)(g_guest_memory + sre_var_addr) = iface_ptr;
+                            iface_resolved++;
+                        } else {
+                            std::cerr << "[SRE-Resolver] WARNING: Could not resolve engine interface for " << name << std::endl;
+                        }
+                    }
+                    std::cout << "[SRE-Resolver] Dynamically resolved " << iface_resolved << " component interfaces." << std::endl;
+
+                    // ─── libsre-extras.so component interfaces ───────────────────
+                    // The optional addon exports its own <Class>_Interface globals
+                    // (same names as libsre12.so / libsre13.so). Fill them from the
+                    // same engine Interface() calls so Mini.GetComponentAddress
+                    // works when the extras module is loaded (both ABIs export the
+                    // 122 _ZN5Caver*9InterfaceEv weak symbols, verified via nm -D).
+                    if (g_sre_extras_loaded && g_sre_extras_mod.dynstr && g_sre_extras_mod.dynsym) {
+                        int extras_iface_resolved = 0;
+                        for (const char* cls : component_classes) {
+                            std::string sre_var_name = std::string(cls) + "_Interface";
+                            std::string mangled_sym = "_ZN5Caver" + std::to_string(strlen(cls)) + cls + "9InterfaceEv";
+
+                            uint64_t extras_var_addr = g_loader_64->get_symbol_vaddr(&g_sre_extras_mod, sre_var_name.c_str());
+                            uint64_t engine_fn_addr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, mangled_sym.c_str());
+
+                            if (extras_var_addr && engine_fn_addr) {
+                                uint64_t iface_id_ptr = g_emulator_64->call(engine_fn_addr, {});
+                                *(uint64_t*)(g_guest_memory + extras_var_addr) = iface_id_ptr;
+                                extras_iface_resolved++;
+                            }
+                        }
+                        std::cout << "[SRE-Extras] Resolved " << extras_iface_resolved
+                                  << " component interfaces for libsre-extras.so" << std::endl;
+                    }
+
+                    // updateApplication is a full replacement, not a relay. Its
+                    // original CBZ is therefore never relocated; the hook table
+                    // installs a single direct B to sre_updateApplication.
+
+                    // ─── Final diagnostics ───────────────────────────────────────
+                    TrampolineMgr::instance().check_conflicts();
+                    TrampolineMgr::instance().dump();
+                    std::cout << "[SRE] Installed " << installed << "/" << hook_count
+                              << " hooks successfully" << std::endl;
+                } else {
+                    std::cerr << "[SRE] WARNING: Could not find hook table symbols" << std::endl;
+                }
+
+                // ========= Lua Console Setup =========
+                // Console uses Lua's own loadstring() via pcall — no luaL_loadbuffer needed.
+                // lua_getfield is resolved above as part of the Lua API symbols.
+                
+                // Store guest addresses of console buffers for main loop access
+                g_lua_console_buf_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_buf");
+                g_lua_console_result_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_result");
+                g_lua_console_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_pending");
+                g_lua_console_status_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_status");
+                
+                std::cout << "[SRE] Console addrs: buf=0x" << std::hex << g_lua_console_buf_addr
+                          << " result=0x" << g_lua_console_result_addr 
+                          << " pending=0x" << g_lua_console_pending_addr
+                          << " status=0x" << g_lua_console_status_addr 
+                          << std::dec << std::endl;
+                
+                g_lua_console_print_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_print_buf");
+
+                if (g_lua_console_buf_addr) {
+                    g_lua_console_ready = true;
+                    // Initialize the ImGui console in SwordfareGUI
+                    g_swordfare_gui.init_lua_console(
+                        g_guest_memory,
+                        g_lua_console_buf_addr,
+                        g_lua_console_result_addr,
+                        g_lua_console_pending_addr,
+                        g_lua_console_status_addr,
+                        g_lua_console_print_addr);
+                    std::cout << "[SRE] Lua console ready — backtick (`) to open ImGui terminal" << std::endl;
+                    // Debug aid: auto-start the TCP Lua console when SWORDFARE_TCP_PORT is set
+                    // (lets the agent probe the guest Lua state without manual `openport`).
+                    if (const char* tcp_env = getenv("SWORDFARE_TCP_PORT")) {
+                        int tcp_port = atoi(tcp_env);
+                        if (tcp_port > 0) {
+                            g_swordfare_gui.auto_start_tcp_server(tcp_port);
+                            std::cout << "[SRE] TCP console auto-started on port " << tcp_port << " (SWORDFARE_TCP_PORT)" << std::endl;
+                        }
+                    }
+                }
+
+                // Wire Scene Shifter into SwordfareGUI
+                uint64_t ss_count_va   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_list_count");
+                uint64_t ss_list_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_list");
+                uint64_t ss_pend_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_pending");
+                uint64_t ss_targ_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_target");
+                uint64_t ss_spwn_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_spawn");
+                uint64_t ss_err_va     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_last_error");
+                uint64_t ss_act_va     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_active");
+                uint64_t ss_cur_va     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_current_scene_name");
+
+                if (ss_count_va && ss_list_va && ss_pend_va && ss_targ_va) {
+                    std::string assets_dir_path = get_data_path(g_assets_dir);
+                    g_swordfare_gui.init_scene_shifter(
+                        g_guest_memory,
+                        ss_count_va, ss_list_va, ss_pend_va, ss_targ_va,
+                        ss_spwn_va, ss_err_va, ss_act_va, ss_cur_va,
+                        assets_dir_path);
+                    std::cout << "[SRE] Scene Shifter initialized in GUI" << std::endl;
+                }
+
+                // ── Memory Research Tab ────────────────────────────────────
+                // Init after the RecoveryCatalog is ready (called in main()
+                // before load_and_boot_arm64) and g_guest_memory is valid.
+                resolve_arm64_research_symbols();
+                g_swordfare_gui.init_research_tab(g_guest_memory, GUEST_MEM_SIZE);
+                // Tell the research engine where the loaded images live.  Without
+                // this every hit reports "unmapped": true, but useless, because a
+                // runtime address with no static home cannot carry identity.
+                if (g_main_mod_64.base_addr) {
+                    g_swordfare_gui.set_research_module(
+                        "libswordigo.so", g_main_mod_64.base_addr, 0,
+                        g_main_mod_64.mem_size ? g_main_mod_64.mem_size : 0x800000,
+                        "sre13-1.4.13-arm64");
+                    // The image is unstripped (~17.7k dynamic symbols), so hand
+                    // over its symbol table.  This is EVIDENCE for describing a
+                    // static site ("Caver::Update+0x18"), never part of any
+                    // identity: the researcher's handle stays a short, stable
+                    // g_VAR_#### that a rebuild cannot invalidate.
+                    if (g_main_mod_64.dynsym && g_main_mod_64.dynstr &&
+                        g_main_mod_64.num_dynsym > 0) {
+                        g_swordfare_gui.set_research_module_symbols(
+                            "libswordigo.so", g_main_mod_64.dynsym,
+                            (size_t)g_main_mod_64.num_dynsym, g_main_mod_64.dynstr,
+                            g_main_mod_64.dynstr_size, true);
+                    }
+                    // Section headers + the loader's copy of the section-name
+                    // table.  A symbol table has a hole below its lowest symbol,
+                    // and that hole is exactly where a module-scoped scan floods
+                    // (measured: 8 of 12 hits for a common value landed inside
+                    // .dynsym / .rela.plt).  Sections name those blocks, and mark
+                    // them so a scan can skip them.
+                    if (g_main_mod_64.shdr && g_main_mod_64.ehdr &&
+                        g_main_mod_64.ehdr->e_shnum > 0) {
+                        g_swordfare_gui.set_research_module_sections(
+                            "libswordigo.so", g_main_mod_64.shdr,
+                            (size_t)g_main_mod_64.ehdr->e_shnum,
+                            g_main_mod_64.shstrtab.data(), g_main_mod_64.shstrtab.size(),
+                            true);
+                    }
+                }
+                for (so_module_arm64* m : g_mod_libraries_64) {
+                    if (!m || !m->base_addr || !m->ehdr) continue;
+                    g_swordfare_gui.set_research_module(
+                        "libswordigo_dep.so", m->base_addr, 0,
+                        m->mem_size ? m->mem_size : 0x100000, "sre13-1.4.13-arm64");
+                    if (m->dynsym && m->dynstr && m->num_dynsym > 0) {
+                        // Keyed by the image's own soname so the dependency
+                        // modules do not all overwrite one symbol bucket.
+                        const std::string depkey =
+                            m->soname.empty() ? std::string("libswordigo_dep.so") : m->soname;
+                        g_swordfare_gui.set_research_module_symbols(
+                            depkey, m->dynsym, (size_t)m->num_dynsym, m->dynstr,
+                            m->dynstr_size, true);
+                        if (m->shdr && m->ehdr && m->ehdr->e_shnum > 0) {
+                            g_swordfare_gui.set_research_module_sections(
+                                depkey, m->shdr, (size_t)m->ehdr->e_shnum,
+                                m->shstrtab.data(), m->shstrtab.size(), true);
+                        }
+                    }
+                }
+                std::cout << "[Research] Memory Research tab initialized" << std::endl;
+
+                // Mirror the shifter VAs for the engine-pod "Run scene" command
+                // (ruby sends target+spawn over stdin; the same tick performs
+                // the GotoLevel, so the flow is identical to the GUI panel).
+                g_ss_ready = (ss_pend_va && ss_targ_va && ss_spwn_va);
+                g_ss_pend_va = ss_pend_va;
+                g_ss_targ_va = ss_targ_va;
+                g_ss_spwn_va = ss_spwn_va;
+                g_ss_err_va  = ss_err_va;
+                g_ss_act_va  = ss_act_va;
+                g_ss_cur_va  = ss_cur_va;
+
+                // Resolve lua_resume error monitoring symbols
+                g_sre_resume_err_count_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_resume_err_count");
+                g_sre_resume_last_err_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_resume_last_err");
+                if (g_sre_resume_err_count_addr) {
+                    std::cout << "[SRE] lua_resume error monitoring active"
+                              << " (count=0x" << std::hex << g_sre_resume_err_count_addr
+                              << " msg=0x" << g_sre_resume_last_err_addr
+                              << std::dec << ")" << std::endl;
+                }
+
+                // Resolve __cxa_throw caller diagnostic symbols
+                g_sre_cxa_caller_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cxa_throw_caller");
+                g_sre_cxa_unrecovered_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cxa_throw_unrecovered");
+                if (g_sre_cxa_caller_addr) {
+                    std::cout << "[SRE] __cxa_throw caller diagnostics active"
+                              << " (caller=0x" << std::hex << g_sre_cxa_caller_addr
+                              << " count=0x" << g_sre_cxa_unrecovered_addr
+                              << std::dec << ")" << std::endl;
+                }
+
+                // Resolve lua_call_safe error monitoring symbols
+                g_sre_lua_error_buf_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_last_lua_error");
+                g_sre_lua_error_count_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_lua_error_count");
+                if (g_sre_lua_error_count_addr) {
+                    std::cout << "[SRE] lua_call_safe error monitoring active"
+                              << " (buf=0x" << std::hex << g_sre_lua_error_buf_addr
+                              << " count=0x" << g_sre_lua_error_count_addr
+                              << std::dec << ")" << std::endl;
+                }
+
+                // Resolve achievement popup symbols
+                {
+                    uint64_t ach_pending = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_achievement_pending");
+                    uint64_t ach_title = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_achievement_pending_title");
+                    uint64_t ach_desc = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_achievement_pending_desc");
+                    if (ach_pending && ach_title && ach_desc) {
+                        mod_achievement_set_offsets(ach_pending, ach_title, ach_desc);
+                        std::cout << "[SRE] Achievement popup active (pending=0x" << std::hex 
+                                  << ach_pending << ")" << std::dec << std::endl;
+                    }
+                }
+
+                // Resolve developer overlay request symbols
+                g_sre_toggle_debug_info_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_request_toggle_debug_info");
+                g_sre_toggle_collision_shapes_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_request_toggle_collision_shapes");
+                g_sre_toggle_combat_wireframe_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_request_toggle_combat_wireframe");
+                if (g_sre_toggle_debug_info_addr) {
+                    std::cout << "[SRE] Developer debug overlays active (HUD=0x" << std::hex 
+                              << g_sre_toggle_debug_info_addr << " Shapes=0x" 
+                              << g_sre_toggle_collision_shapes_addr << " Combat=0x" 
+                              << g_sre_toggle_combat_wireframe_addr << std::dec << ")" << std::endl;
+                }
+
+
+                // Resolve game notification symbols
+                g_sre_game_notification_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_game_notification");
+                g_sre_game_notification_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_game_notification_pending");
+                if (g_sre_game_notification_addr && g_sre_game_notification_pending_addr) {
+                    std::cout << "[SRE] Game notification polling active (buf=0x" << std::hex
+                              << g_sre_game_notification_addr << " pending=0x"
+                              << g_sre_game_notification_pending_addr << ")" << std::dec << std::endl;
+                }
+
+                // ========= Background Renderer Setup =========
+                // Our SRE re-implements BackgroundComponent::Draw using
+                // engine building blocks: SetMatrix, SetColor, Sprite::Draw
+                uint64_t sre_init_bg_addr = g_loader_64->get_symbol_vaddr(
+                    &g_sre_mod, "sre_init_background");
+                if (sre_init_bg_addr) {
+                    // SreBgAddrs struct: 4 × uint64_t = 32 bytes
+                    uint64_t bg_addrs_guest = 0x48100;  // in our guest globals area
+                    uint64_t* bg_addrs = (uint64_t*)(g_guest_memory + bg_addrs_guest);
+                    
+                    // Addresses from: nm -D libswordigo.so | grep RenderingContext/Sprite
+                    bg_addrs[0] = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                        "_ZN5Caver16RenderingContext9SetMatrixERKNS_7Matrix4E");
+                    bg_addrs[1] = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                        "_ZN5Caver16RenderingContext8SetColorERKNS_5ColorE");
+                    bg_addrs[2] = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                        "_ZNK5Caver6Sprite4DrawEPNS_16RenderingContextE");
+                    // glDepthMask PLT entry: 0x1fb820 (from objdump -d -j .plt)
+                    bg_addrs[3] = g_main_mod_64.base_addr + 0x1fb820;
+                    
+                    g_emulator_64->call(sre_init_bg_addr, {bg_addrs_guest});
+                    
+                    std::cout << "[SRE] Background renderer: SetMatrix=0x" << std::hex << bg_addrs[0]
+                              << " SetColor=0x" << bg_addrs[1]
+                              << " Sprite::Draw=0x" << bg_addrs[2] 
+                              << " glDepthMask=0x" << bg_addrs[3]
+                              << std::dec << std::endl;
+                }
+                
+                // ========= GUI Subsystem Setup =========
+                // Resolve SRE GUI init and pass all engine GUI function addresses
+                uint64_t sre_init_gui_addr = g_loader_64->get_symbol_vaddr(
+                    &g_sre_mod, "sre_init_gui");
+                if (sre_init_gui_addr) {
+                    // SreGuiAddrs struct: 49 × uint64_t = 392 bytes
+                    uint64_t gui_addrs_guest = 0x48400;  // after lua_ext_addrs (0x48200 + 152 = 0x48298)
+                    uint64_t* ga = (uint64_t*)(g_guest_memory + gui_addrs_guest);
+                    uint64_t B = g_main_mod_64.base_addr;  // base for brevity
+                    
+                    // [0-12] RenderingContext
+                    ga[0]  = B + 0x48b184;  // SetProjectionMatrix
+                    ga[1]  = B + 0x48c6a0;  // FillRect(rect, color, alpha)
+                    ga[2]  = B + 0x48c9f8;  // DrawRect(rect, color, alpha)
+                    ga[3]  = B + 0x48b8d8;  // SetBlendingEnabled
+                    ga[4]  = B + 0x48b900;  // SetTexturingEnabled
+                    ga[5]  = B + 0x48b934;  // SetLightingEnabled
+                    ga[6]  = B + 0x48b990;  // SetDepthTestEnabled
+                    ga[7]  = B + 0x48b9b8;  // SetDepthWriteEnabled
+                    ga[8]  = B + 0x48b4bc;  // SetAlpha
+                    ga[9]  = B + 0x48bfa4;  // BindTexture
+                    ga[10] = B + 0x48c330;  // DrawArrays
+                    ga[11] = B + 0x48bcec;  // UseProgram
+                    ga[12] = B + 0x48c2bc;  // SetVertexAttribPointer
+                    ga[13] = 0;             // reserved
+                    
+                    // [14-19] FontText
+                    ga[14] = B + 0x4c66dc;  // Draw
+                    ga[15] = B + 0x4c53e4;  // AddText(str, fontSize, pos)
+                    ga[16] = B + 0x4c5124;  // Clear
+                    ga[17] = B + 0x4c5170;  // SetColor
+                    ga[18] = B + 0x4c6210;  // Translate
+                    ga[19] = B + 0x4c6280;  // AlignHorizontally
+                    
+                    // [20-22] GUILabel
+                    ga[20] = B + 0x497fdc;  // AddText(str)
+                    ga[21] = B + 0x4980fc;  // AddText(str, color)
+                    ga[22] = B + 0x497b54;  // UpdateText
+                    
+                    // [23-26] GUIButton
+                    ga[23] = B + 0x4950a4;  // Constructor(type)
+                    ga[24] = B + 0x495a74;  // SetTitle(str)
+                    ga[25] = B + 0x495b00;  // SetImage(str)
+                    ga[26] = B + 0x33f9e4;  // titleLabel()
+                    
+                    // [27-29] GUIView
+                    ga[27] = B + 0x49f5c8;  // SetFrame(rect)
+                    ga[28] = B + 0x49f6ec;  // AddSubview(shared_ptr)
+                    ga[29] = B + 0x49fa60;  // RemoveFromSuperview
+                    
+                    // [30-33] GUIWindow
+                    ga[30] = B + 0x4a21ec;  // mainWindow()
+                    ga[31] = B + 0x4a31b4;  // PresentModalView(shared_ptr, bool)
+                    ga[32] = B + 0x4a3540;  // DismissModalView(view)
+                    ga[33] = B + 0x4a3590;  // Dismiss
+                    
+                    // [34-36] GUIAlertView
+                    ga[34] = B + 0x490628;  // SetTitle(str)
+                    ga[35] = B + 0x490850;  // SetMessage(str)
+                    ga[36] = B + 0x490bf4;  // AddButton(shared_ptr)
+                    
+                    // [37-43] GameInterfaceBuilder
+                    ga[37] = B + 0x33ea24;  // NormalLabel(str, color, color)
+                    ga[38] = B + 0x33ee2c;  // SmallLabel(str, color, color)
+                    ga[39] = B + 0x33ff98;  // FramedButtonWithTitle(str, bool)
+                    ga[40] = B + 0x340504;  // MainMenuButtonWithTitle(str)
+                    ga[41] = B + 0x3408e0;  // AlertView(str, str, int, str*, int)
+                    ga[42] = B + 0x341108;  // Slider(float, float)
+                    ga[43] = B + 0x34188c;  // Switch()
+                    
+                    // [44-45] TextureLibrary
+                    ga[44] = B + 0x4cc308;  // sharedLibrary()
+                    ga[45] = B + 0x4cc494;  // TextureForName(str, bool)
+                    
+                    // [46-48] FontLibrary
+                    ga[46] = B + 0x4c33b0;  // sharedLibrary()
+                    ga[47] = B + 0x4c4364;  // DefaultFont()
+                    ga[48] = B + 0x4c44a8;  // SmallDefaultFont()
+                    
+                    g_emulator_64->call(sre_init_gui_addr, {gui_addrs_guest});
+                    std::cout << "[SRE] GUI subsystem initialized (49 functions resolved)"
+                              << std::endl;
+                }
+                
+                // === Native GUI init (GUIRoundedRect, GUITexturedRect, GL) ===
+                uint64_t sre_init_gui_native_addr = g_loader_64->get_symbol_vaddr(
+                    &g_sre_mod, "sre_init_gui_native");
+                if (sre_init_gui_native_addr) {
+                    // SreGuiNativeAddrs: 6 x uint64_t = 48 bytes
+                    uint64_t native_addrs_guest = 0x3001000;
+                    uint64_t* na = (uint64_t*)(g_guest_memory + native_addrs_guest);
+                    uint64_t B = g_main_mod_64.base_addr;
+                    na[0] = B + 0x4a9c2c;  // GUIRoundedRect::Draw
+                    na[1] = B + 0x4a9bdc;  // GUIRoundedRect::SetColor
+                    na[2] = B + 0x4ab308;  // GUITexturedRect::Draw
+                    na[3] = 0;  // glEnable — PLT TBD, scissor optional
+                    na[4] = 0;  // glDisable — PLT TBD, scissor optional
+                    na[5] = 0;  // glScissor — PLT TBD, scissor optional
+                    g_emulator_64->call(sre_init_gui_native_addr, {native_addrs_guest});
+                    std::cout << "[SRE] Native GUI renderer initialized (3 draw + 0 GL)"
+                              << std::endl;
+                }
+
+                // =============================================================
+                // MOD SYSTEM: Read mod configs and pass to SRE
+                // =============================================================
+                {
+                    uint64_t sre_init_mods_addr = g_loader_64->get_symbol_vaddr(
+                        &g_sre_mod, "sre_init_mods");
+                    
+                    // Guest address for mod config block (0x49000, 8KB)
+                    const uint64_t MOD_CONFIG_GUEST = 0x49000;
+                    const uint32_t MOD_MAGIC   = 0x4D4F4453; // "MODS"
+                    const uint32_t MOD_VERSION = 1;
+                    
+                    // Clear config block
+                    memset(g_guest_memory + MOD_CONFIG_GUEST, 0, 0x2000);
+                    
+                    // Scan mods directory
+                    std::string mods_dir = get_user_data_dir() + "/mods";
+                    uint32_t music_count = 0;
+                    uint32_t scene_count = 0;
+                    uint32_t bg_count = 0;
+                    uint32_t total_mods = 0;
+                    
+                    if (std::filesystem::exists(mods_dir)) {
+                        for (auto& entry : std::filesystem::directory_iterator(mods_dir)) {
+                            if (!entry.is_directory()) continue;
+                            // Skip disabled mods (dot-prefixed folders)
+                            std::string dirname = entry.path().filename().string();
+                            if (!dirname.empty() && dirname[0] == '.') continue;
+                            std::string mod_json_path = entry.path().string() + "/mod.json";
+                            if (!std::filesystem::exists(mod_json_path)) continue;
+                            
+                            // Read mod.json
+                            std::ifstream f(mod_json_path);
+                            if (!f.is_open()) continue;
+                            std::string content((std::istreambuf_iterator<char>(f)),
+                                                std::istreambuf_iterator<char>());
+                            f.close();
+                            
+                            // Check if mod is enabled (default: enabled)
+                            // For now, all mods in the directory are active
+                            total_mods++;
+                            
+                            // Simple JSON parser: find "type" field
+                            auto json_get = [&](const std::string& key) -> std::string {
+                                std::string search = "\"" + key + "\"";
+                                size_t pos = content.find(search);
+                                if (pos == std::string::npos) return "";
+                                pos = content.find("\"", pos + search.length() + 1);
+                                if (pos == std::string::npos) return "";
+                                size_t end = content.find("\"", pos + 1);
+                                if (end == std::string::npos) return "";
+                                return content.substr(pos + 1, end - pos - 1);
+                            };
+                            
+                            std::string mod_type = json_get("type");
+                            std::string mod_name = json_get("name");
+                            
+                            if (mod_type == "music") {
+                                // Parse music replacements from "replace" object
+                                // Simple: find "replace" block, extract key:value pairs
+                                size_t repl_pos = content.find("\"replace\"");
+                                if (repl_pos != std::string::npos) {
+                                    size_t brace = content.find("{", repl_pos);
+                                    size_t end_brace = content.find("}", brace);
+                                    if (brace != std::string::npos && end_brace != std::string::npos) {
+                                        std::string block = content.substr(brace + 1, end_brace - brace - 1);
+                                        // Parse key:value pairs
+                                        size_t scan = 0;
+                                        while (scan < block.size() && music_count < 32) {
+                                            size_t ks = block.find("\"", scan);
+                                            if (ks == std::string::npos) break;
+                                            size_t ke = block.find("\"", ks + 1);
+                                            if (ke == std::string::npos) break;
+                                            size_t vs = block.find("\"", ke + 1);
+                                            if (vs == std::string::npos) break;
+                                            size_t ve = block.find("\"", vs + 1);
+                                            if (ve == std::string::npos) break;
+                                            
+                                            std::string orig = block.substr(ks + 1, ke - ks - 1);
+                                            std::string repl = block.substr(vs + 1, ve - vs - 1);
+                                            
+                                            // Write to guest memory (music entries at 0x40, 64 bytes each)
+                                            uint64_t entry_addr = MOD_CONFIG_GUEST + 0x40 + music_count * 64;
+                                            strncpy((char*)(g_guest_memory + entry_addr), orig.c_str(), 31);
+                                            strncpy((char*)(g_guest_memory + entry_addr + 32), repl.c_str(), 31);
+                                            music_count++;
+                                            
+                                            scan = ve + 1;
+                                        }
+                                    }
+                                }
+                                std::cout << "[MOD] Loaded music mod: " << mod_name 
+                                          << " (" << music_count << " replacements)" << std::endl;
+                            } else if (mod_type == "scene" || mod_type == "asset") {
+                                // Parse scene/asset replacements from "replace" object
+                                size_t repl_pos = content.find("\"replace\"");
+                                if (repl_pos != std::string::npos) {
+                                    size_t brace = content.find("{", repl_pos);
+                                    size_t end_brace = content.find("}", brace);
+                                    if (brace != std::string::npos && end_brace != std::string::npos) {
+                                        std::string block = content.substr(brace + 1, end_brace - brace - 1);
+                                        size_t scan = 0;
+                                        while (scan < block.size() && scene_count < 16) {
+                                            size_t ks = block.find("\"", scan);
+                                            if (ks == std::string::npos) break;
+                                            size_t ke = block.find("\"", ks + 1);
+                                            if (ke == std::string::npos) break;
+                                            size_t vs = block.find("\"", ke + 1);
+                                            if (vs == std::string::npos) break;
+                                            size_t ve = block.find("\"", vs + 1);
+                                            if (ve == std::string::npos) break;
+                                            
+                                            std::string orig = block.substr(ks + 1, ke - ks - 1);
+                                            std::string repl = block.substr(vs + 1, ve - vs - 1);
+                                            
+                                            // Write to guest memory (scene entries at 0x840, 128 bytes each)
+                                            uint64_t entry_addr = MOD_CONFIG_GUEST + 0x840 + scene_count * 128;
+                                            strncpy((char*)(g_guest_memory + entry_addr), orig.c_str(), 63);
+                                            strncpy((char*)(g_guest_memory + entry_addr + 64), repl.c_str(), 63);
+                                            scene_count++;
+                                            
+                                            scan = ve + 1;
+                                        }
+                                    }
+                                }
+                                std::cout << "[MOD] Loaded scene mod: " << mod_name 
+                                          << " (" << scene_count << " replacements)" << std::endl;
+                            } else if (mod_type == "background") {
+                                // Parse background replacements from "replace" object
+                                size_t repl_pos = content.find("\"replace\"");
+                                if (repl_pos != std::string::npos) {
+                                    size_t brace = content.find("{", repl_pos);
+                                    size_t end_brace = content.find("}", brace);
+                                    if (brace != std::string::npos && end_brace != std::string::npos) {
+                                        std::string block = content.substr(brace + 1, end_brace - brace - 1);
+                                        size_t scan = 0;
+                                        while (scan < block.size() && bg_count < 16) {
+                                            size_t ks = block.find("\"", scan);
+                                            if (ks == std::string::npos) break;
+                                            size_t ke = block.find("\"", ks + 1);
+                                            if (ke == std::string::npos) break;
+                                            size_t vs = block.find("\"", ke + 1);
+                                            if (vs == std::string::npos) break;
+                                            size_t ve = block.find("\"", vs + 1);
+                                            if (ve == std::string::npos) break;
+                                            
+                                            std::string orig = block.substr(ks + 1, ke - ks - 1);
+                                            std::string repl = block.substr(vs + 1, ve - vs - 1);
+                                            
+                                            // Write to guest memory (bg entries at 0x1040, 128 bytes each)
+                                            uint64_t entry_addr = MOD_CONFIG_GUEST + 0x1040 + bg_count * 128;
+                                            strncpy((char*)(g_guest_memory + entry_addr), orig.c_str(), 63);
+                                            strncpy((char*)(g_guest_memory + entry_addr + 64), repl.c_str(), 63);
+                                            bg_count++;
+                                            
+                                            scan = ve + 1;
+                                        }
+                                    }
+                                }
+                                std::cout << "[MOD] Loaded background mod: " << mod_name 
+                                          << " (" << bg_count << " replacements)" << std::endl;
+                            }
+                            // Log unknown types
+                            if (mod_type != "music" && mod_type != "scene" && mod_type != "asset" && mod_type != "background") {
+                                std::cout << "[MOD] Unknown mod type '" << mod_type << "' for: " << mod_name << std::endl;
+                            }
+                        }
+                    }
+                    
+                    // Write header
+                    uint32_t* hdr = (uint32_t*)(g_guest_memory + MOD_CONFIG_GUEST);
+                    hdr[0] = MOD_MAGIC;
+                    hdr[1] = MOD_VERSION;
+                    hdr[2] = music_count;
+                    hdr[3] = scene_count;
+                    hdr[4] = bg_count;
+                    hdr[5] = 0; // flags
+                    hdr[6] = total_mods;
+                    
+                    // Call sre_init_mods
+                    if (sre_init_mods_addr) {
+                        g_emulator_64->call(sre_init_mods_addr, {MOD_CONFIG_GUEST});
+                        std::cout << "[MOD] SRE mod system initialized: " << total_mods 
+                                  << " mods, " << music_count << " music replacements"
+                                  << std::endl;
+                    } else {
+                        if (swordi_abi == 13) {
+                            std::cout << "[MOD] SRE13 active — using VFS & native modloader" << std::endl;
+                        } else {
+                            std::cout << "[MOD] sre_init_mods not found — mod support disabled"
+                                      << std::endl;
+                        }
+                    }
+                }
+
+                // Load native mod libraries for the active mod (e.g. mods/<id>/libraries/arm64-v8a/*.so)
+                if (swordi_abi == 13) {
+                    load_guest_mod_libraries(get_active_mod_name());
+                } else {
+                    std::cout << "[ModLoader] Native .so mod loading disabled for ABI " << swordi_abi << " (requires ABI 13)" << std::endl;
+                }
+
+                // Resolve GUI overlay state addresses
+                static uint64_t gui_overlay_addr = 0;
+                static uint64_t gui_screen_w_addr = 0;
+                static uint64_t gui_screen_h_addr = 0;
+                gui_overlay_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gui_overlay_enabled");
+                gui_screen_w_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gui_screen_w");
+                gui_screen_h_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gui_screen_h");
+
+                
+                // Resolve bg_mode address for F11 toggle
+                bg_mode_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_bg_mode");
+                bg_brightness_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_bg_brightness");
+                bg_depth_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_bg_depth");
+                bg_scale_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_bg_scale");
+                bg_cam_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_bg_cam_z");
+                
+                // Resolve effect hook addresses
+                portal_active_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_active");
+                portal_x_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_x");
+                portal_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_y");
+                portal_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_z");
+                portal_count_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_count");
+                portal_color_r_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_color_r");
+                portal_color_g_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_color_g");
+                portal_color_b_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_color_b");
+                portal_vp_matrix_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_portal_vp_matrix");
+                effect_frame_reset_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_effects_frame_reset");
+                
+                std::cout << "[SRE] Effects: portal=" << std::hex 
+                          << portal_active_addr << " reset=" << effect_frame_reset_addr
+                          << std::dec << std::endl;
+                
+                // Resolve SRE music command interface addresses
+                sre_music_load_name_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_load_name");
+                sre_music_load_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_load_pending");
+                sre_music_play_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_play_pending");
+                sre_music_pause_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_pause_pending");
+                sre_music_stop_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_stop_pending");
+                sre_music_volume_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_volume");
+                sre_music_volume_dirty_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_volume_dirty");
+                sre_music_master_volume_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_master_volume");
+                sre_music_looping_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_looping");
+                sre_music_looping_dirty_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_music_looping_dirty");
+                
+                // Resolve SRE LNI command interface addresses
+                sre_lni_command_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_lni_command");
+                sre_lni_arg1_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_lni_arg1");
+                sre_lni_arg2_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_lni_arg2");
+                sre_lni_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_lni_pending");
+                sre_controls_hidden_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_controls_hidden");
+
+                // Resolve player position for GLES2 lighting
+                g_sre_hero_pos_x_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_pos_x");
+                g_sre_hero_pos_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_pos_y");
+                g_sre_hero_pos_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_pos_z");
+                
+                // Resolve camera coordinates
+                g_sre_cam_x_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_x");
+                g_sre_cam_y_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_y");
+                g_sre_cam_z_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_cam_z");
+                g_sre_z_walk_axis_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_z_walk_axis");
+                g_sre_x_walk_axis_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_x_walk_axis");
+                g_sre_zwalk_f5l_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_zwalk_f5l");
+                g_sre_host_dt_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_host_dt");
+
+                std::cout << "[SRE] Music: load_name=0x" << std::hex << sre_music_load_name_addr
+                          << " load_pending=0x" << sre_music_load_pending_addr
+                          << " LNI: cmd=0x" << sre_lni_command_addr
+                          << " pending=0x" << sre_lni_pending_addr
+                          << " controls_hidden=0x" << sre_controls_hidden_addr
+                          << std::dec << std::endl;
+                
+                // Resolve SRE GUI player stat addresses
+                sre_player_hp_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_hp");
+                sre_player_max_hp_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_max_hp");
+                sre_player_mana_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_mana");
+                sre_player_max_mana_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_max_mana");
+                sre_player_coins_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_coins");
+                sre_player_xp_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_xp");
+                sre_player_level_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_level");
+                sre_player_atk_level_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_player_atk_level");
+                sre_gui_scene_active_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gui_scene_active");
+                sre_gamestate_ptr_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gamestate_ptr");
+                sre_menu_active_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_menu_active");
+                if (sre_menu_active_addr)
+                    std::cout << "[SRE] Menu detection: 0x" << std::hex << sre_menu_active_addr << std::dec << std::endl;
+                
+                sre_text_input_active_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_text_input_active");
+                if (sre_text_input_active_addr)
+                    std::cout << "[SRE] TextInput detection: 0x" << std::hex << sre_text_input_active_addr << std::dec << std::endl;
+                g_vaddr_sre_text_input_init_val = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_text_input_init_val");
+
+                
+                // Hard mode — controls frame limiter + ProgramState double-tick
+                sre_hardmode_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hardmode");
+                if (sre_hardmode_addr)
+                    std::cout << "[SRE] Hardmode flag: 0x" << std::hex << sre_hardmode_addr << std::dec << std::endl;
+
+                sre_char_set_pending_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_char_set_pending");
+                sre_char_set_field_addr   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_char_set_field");
+                sre_char_set_value_addr   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_char_set_value");
+                sre_hero_obj_addr         = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_obj");
+                sre_hero_health_comp_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_health_comp");
+                sre_hero_mana_comp_addr   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_hero_mana_comp");
+
+                if (sre_char_set_pending_addr)
+                    std::cout << "[SRE] Lua write-back: pending=0x" << std::hex << sre_char_set_pending_addr
+                              << " field=0x" << sre_char_set_field_addr
+                              << " value=0x" << sre_char_set_value_addr << std::dec << std::endl;
+                else
+                    std::cout << "[SRE] WARNING: g_sre_char_set_pending not found — Lua stat setters will be no-ops" << std::endl;
+
+
+                // ButtonController — SRE-side button and overlay array for host rendering + hit-testing
+                sre_btn_array_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_buttons");
+                sre_overlay_array_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_overlays");
+                sre_btn_globally_hidden_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_btn_globally_hidden");
+                if (sre_btn_array_addr) {
+                    std::cout << "[SRE] ButtonController: array=0x" << std::hex << sre_btn_array_addr
+                              << " overlays=0x" << sre_overlay_array_addr
+                              << " hidden=0x" << sre_btn_globally_hidden_addr << std::dec << std::endl;
+                    std::cout << "[SRE/Host] SreBtnSlot size=" << sizeof(SreBtnSlot)
+                              << " offsets: id=" << offsetof(SreBtnSlot, id)
+                              << " label=" << offsetof(SreBtnSlot, label)
+                              << " x=" << offsetof(SreBtnSlot, x)
+                              << " y=" << offsetof(SreBtnSlot, y)
+                              << " w=" << offsetof(SreBtnSlot, w)
+                              << " h=" << offsetof(SreBtnSlot, h)
+                              << " alpha=" << offsetof(SreBtnSlot, alpha)
+                              << " text_color=" << offsetof(SreBtnSlot, text_color)
+                              << " hidden=" << offsetof(SreBtnSlot, hidden)
+                              << " overlay_id=" << offsetof(SreBtnSlot, overlay_id)
+                              << " confined=" << offsetof(SreBtnSlot, confined)
+                              << " pressed=" << offsetof(SreBtnSlot, pressed)
+                              << " released=" << offsetof(SreBtnSlot, released)
+                              << " dragging=" << offsetof(SreBtnSlot, dragging)
+                              << " cur_x=" << offsetof(SreBtnSlot, cur_x)
+                              << " active=" << offsetof(SreBtnSlot, active)
+                              << " dirty=" << offsetof(SreBtnSlot, dirty)
+                              << std::endl;
+                }
+                
+                // VFS MiniPath globals — populate so SRE can translate
+                // /ExternalFiles/, /Files/, /Cache/ without calling getenv
+                {
+                    auto write_vfs_path = [&](const char* sym, const std::string& path) {
+                        uint64_t addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym);
+                        if (addr) {
+                            std::string norm = sre_normalize_vfs_path(path);
+                            strncpy((char*)(g_guest_memory + addr), norm.c_str(), 511);
+                            ((char*)(g_guest_memory + addr))[511] = '\0';
+                            std::cout << "[SRE] VFS " << sym << " = " << norm << std::endl;
+                        }
+                    };
+                    std::string data_base = get_data_path("");
+                    // Remove trailing separator if present (both '/' and '\\' —
+                    // Windows get_data_path may end with a backslash)
+                    while (!data_base.empty() && (data_base.back() == '/' || data_base.back() == '\\'))
+                        data_base.pop_back();
+                    
+                    write_vfs_path("g_sre_vfs_path_external", data_base + "/external");
+                    write_vfs_path("g_sre_vfs_path_files",    g_save_dir);
+                    write_vfs_path("g_sre_vfs_path_cache",    g_cache_dir);
+                    write_vfs_path("g_sre_vfs_path_assets",   get_data_path(g_assets_dir));
+                    
+                    // Also write data_dir and re-validate mod detection.
+                    // The first VFS pre-init block (before sre_init) already set these,
+                    // but we re-validate here in case the launcher changes the mod after init.
+                    {
+                        auto vfs_write_str2 = [&](const char* sym, const std::string& val, int maxlen) {
+                            uint64_t a = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym);
+                            if (!a) return;
+                            std::string norm = sre_normalize_vfs_path(val);
+                            strncpy((char*)(g_guest_memory + a), norm.c_str(), maxlen - 1);
+                            ((char*)(g_guest_memory + a))[maxlen - 1] = '\0';
+                        };
+                        auto vfs_write_int2 = [&](const char* sym, int val) {
+                            uint64_t a = g_loader_64->get_symbol_vaddr(&g_sre_mod, sym);
+                            if (a) *(int*)(g_guest_memory + a) = val;
+                        };
+                        vfs_write_str2("g_sre_vfs_data_dir", data_base, 512);
+                        // Re-validate mod selection — use launcher-selected if available
+                        extern std::string g_launcher_selected_mod;
+                        std::string mods_dir = data_base + "/mods/";
+                        bool mod_found2 = false;
+
+                        if (!g_launcher_selected_mod.empty()) {
+                            fs::path mod_path = fs::path(mods_dir) / g_launcher_selected_mod;
+                            if (fs::exists(mod_path) && fs::is_directory(mod_path)) {
+                                vfs_write_str2("g_sre_vfs_mod_name", g_launcher_selected_mod, 128);
+                                vfs_write_int2("g_sre_vfs_hierarchy_enabled", 1);
+                                std::cout << "[SRE] VFS mod (post-init, launcher): " << g_launcher_selected_mod << std::endl;
+                                set_active_mod_name(g_launcher_selected_mod);
+                                mod_found2 = true;
+                            }
+                        }
+                        if (!mod_found2) {
+                            LauncherConfig lcfg = launcher_config_load();
+                            for (const auto& mid : lcfg.mod_load_order) {
+                                fs::path mod_path = fs::path(mods_dir) / mid;
+                                if (fs::exists(mod_path) && fs::is_directory(mod_path)) {
+                                    vfs_write_str2("g_sre_vfs_mod_name", mid, 128);
+                                    vfs_write_int2("g_sre_vfs_hierarchy_enabled", 1);
+                                    std::cout << "[SRE] VFS mod (post-init, config): " << mid << std::endl;
+                                    set_active_mod_name(mid);
+                                    mod_found2 = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!mod_found2 && fs::exists(mods_dir) && fs::is_directory(mods_dir)) {
+                            for (const auto& me : fs::directory_iterator(mods_dir)) {
+                                if (me.is_directory()) {
+                                    std::string mn = me.path().filename().string();
+                                    if (!mn.empty() && mn[0] != '.') {
+                                        bool has_toml  = fs::exists(me.path() / "properties.toml");
+                                        bool has_res   = fs::is_directory(me.path() / "resources");
+                                        bool has_modjq = fs::exists(me.path() / "mod.json");
+                                        bool has_libs  = fs::is_directory(me.path() / "libraries");
+                                        if (!has_toml && !has_res && !has_modjq && !has_libs) continue;
+                                        vfs_write_str2("g_sre_vfs_mod_name", mn, 128);
+                                        vfs_write_int2("g_sre_vfs_hierarchy_enabled", 1);
+                                        std::cout << "[SRE] VFS mod (post-init): " << mn << std::endl;
+                                        set_active_mod_name(mn);
+                                        mod_found2 = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (!mod_found2) {
+                            std::cout << "[SRE] VFS post-init: no active mod found — vanilla" << std::endl;
+                        }
+                    }
+                    
+                    // Create required directories if missing (std::filesystem is
+                    // portable — POSIX mkdir(path, mode) has no Windows equivalent;
+                    // error_code overload keeps the old mkdir's silent-failure
+                    // semantics instead of throwing filesystem_error on boot).
+                    std::string ext_dir = data_base + "/external";
+                    std::error_code ec;
+                    fs::create_directories(ext_dir, ec);
+                    fs::create_directories(g_save_dir, ec);
+                    fs::create_directories(g_save_dir + "/Documents", ec);
+                    fs::create_directories(g_cache_dir, ec);
+                    
+                    // Populate guest profile ID globals with the active save UUID.
+                    // g_sre_mod_profile_id → Mini.GetProfileID()
+                    // g_sre_vfs_profile_id → VFS levels 1 & 3 (profile-specific resources)
+                    uint64_t profile_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_mod_profile_id");
+                    uint64_t vfs_profile_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_vfs_profile_id");
+                    g_sre_profile_addr = profile_addr;
+                    g_sre_vfs_profile_addr = vfs_profile_addr;
+                    if (profile_addr || vfs_profile_addr) {
+                        std::string docs = g_save_dir + "/Documents";
+                        if (fs::exists(docs) && fs::is_directory(docs)) {
+                            // Pick the BEST .gplayer file: prefer clean UUID names,
+                            // skip copies/backups. Files like "5eb0... (Copy).gplayer"
+                            // produce broken profile IDs with spaces/parens.
+                            std::string best_path;
+                            for (const auto& entry : fs::directory_iterator(docs)) {
+                                if (entry.path().extension() != ".gplayer") continue;
+                                std::string stem = entry.path().stem().string();
+                                // Skip files with (Copy), (Copy N), .bak etc.
+                                if (stem.find("(Copy") != std::string::npos) continue;
+                                if (stem.find(".bak") != std::string::npos) continue;
+                                best_path = entry.path().string();
+                                break;  // first clean UUID file wins
+                            }
+                            if (!best_path.empty()) {
+                                SaveFile sf;
+                                if (save_load(best_path, sf)) {
+                                    std::string id = sf.identifier.empty()
+                                        ? fs::path(best_path).stem().string()
+                                        : sf.identifier;
+                                    // Sanitize: strip trailing spaces/parens from ID
+                                    while (!id.empty() && (id.back() == ' ' || id.back() == ')'))
+                                        id.pop_back();
+                                    if (profile_addr) {
+                                        strncpy((char*)(g_guest_memory + profile_addr), id.c_str(), 63);
+                                        ((char*)(g_guest_memory + profile_addr))[63] = '\0';
+                                    }
+                                    if (vfs_profile_addr) {
+                                        strncpy((char*)(g_guest_memory + vfs_profile_addr), id.c_str(), 63);
+                                        ((char*)(g_guest_memory + vfs_profile_addr))[63] = '\0';
+                                    }
+                                    std::cout << "[SRE] Profile ID = " << id << std::endl;
+                                    set_active_profile_id(id);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                std::cout << "[SRE] GUI: hp=0x" << std::hex << sre_player_hp_addr
+                          << " coins=0x" << sre_player_coins_addr
+                          << std::dec << std::endl;
+                
+                std::cout << "======== [SRE] Runtime Engine Ready ========\n" << std::endl;
+            } else {
+                std::cerr << "[SRE] Failed to load SRE library (error " << sre_ret << ")" << std::endl;
+            }
+        } else {
+            const char* expected = (swordi_abi == 13) ? "bin/libs/libsre13.so"
+                                                      : "bin/libs/libsre12.so";
+            std::cerr << "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" << std::endl;
+            std::cerr << "  [SRE] WARNING: SRE library NOT FOUND!" << std::endl;
+            std::cerr << "  SRE is REQUIRED for ARM64 instances." << std::endl;
+            std::cerr << "  (libsre12.so for 1.4.12, libsre13.so for 1.4.13)" << std::endl;
+            std::cerr << "  Without it, atomic spin loops and threading" << std::endl;
+            std::cerr << "  issues WILL cause hangs and crashes." << std::endl;
+            std::cerr << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" << std::endl;
+            std::cerr << "[SRE] Expected at: " << expected << std::endl;
+            std::cerr << "[SRE] Fix: run './run_swordigo.sh' to build and install the SRE library" << std::endl;
+            std::cerr << "============================================\n" << std::endl;
+        }
+        } // else (sre_compatible)
+    }
+
+    // Run dynamic initializers (.init_array) — entries are uint64_t (8 bytes each)
+    if (g_main_mod_64.init_array_vaddr != 0 && g_main_mod_64.init_array_size > 0) {
+        int count = g_main_mod_64.init_array_size / 8;
+        std::cout << "[Boot64] Executing " << count << " dynamic initializers..." << std::endl;
+        uint64_t* init_array = (uint64_t*)(g_guest_memory + g_main_mod_64.init_array_vaddr);
+        for (int i = 0; i < count; i++) {
+            uint64_t init_func = init_array[i];
+            if (init_func != 0) {
+                if (i % 50 == 0 || i == count - 1) {
+                    std::cout << "  -> Initializer " << i << "/" << count << " at 0x" << std::hex << init_func << std::dec << std::endl;
+                }
+                g_emulator_64->call(init_func, {});
+            }
+        }
+        std::cout << "[Boot64] Dynamic initializers completed successfully." << std::endl;
+    }
+
+    // 4. Boot Sequence — resolve symbols (all addresses are uint64_t)
+    uint64_t setFilesDir = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_setFilesDir");
+    uint64_t setCacheDir = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_setCacheDir");
+    uint64_t setAssetMgr = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_setAssetManager");
+    uint64_t googleSignInCompleted = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_googleSignInCompleted");
+    uint64_t handleAppLaunch = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_handleApplicationLaunch");
+    uint64_t initMusicPlayer = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_MusicPlayer_initMusicPlayer");
+    uint64_t setupNative = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_setupNativeInterface");
+    uint64_t setupApp = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_setupApplication");
+    uint64_t setApplicationViewSize = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_setApplicationViewSize");
+    uint64_t applicationDidBecomeActive = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_applicationDidBecomeActive");
+
+    // Resolve FWKeyboard API symbols (mangled C++ names from the Caver engine)
+    // Note: ARM64 uses different mangling for some types but symbol names are the same
+    g_fw_sharedKeyboard = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver10FWKeyboard14sharedKeyboardEv");
+    g_fw_sendKeyDown    = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver10FWKeyboard16SendKeyDownEventEjjd");
+    g_fw_sendKeyUp      = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver10FWKeyboard14SendKeyUpEventEjjd");
+    g_fw_sendKeyChar    = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver10FWKeyboard16SendKeyCharEventEjd");
+    g_fw_handleMenuBtn  = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_handleMenuButtonPress");
+
+    // Resolve text input callback symbols (native JNI functions the game exports)
+    g_fw_textInputDidChange = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_textInputTextDidChange");
+    g_fw_textInputDidFinish = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_textInputDidFinish");
+
+    // Direct control native symbol resolutions
+    g_vaddr_StartMovingToDirection = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent22StartMovingToDirectionEi");
+    g_vaddr_StopMovingToDirection = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent21StopMovingToDirectionEi");
+    g_vaddr_StartJumping = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent12StartJumpingEv");
+    g_vaddr_StopJumping = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent11StopJumpingEv");
+    g_vaddr_Swing = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent5SwingEv");
+    g_vaddr_StopSwing = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent9StopSwingEv");
+    g_vaddr_Use = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent3UseEv");
+    g_vaddr_BeginCasting = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver23CharControllerComponent12BeginCastingERKN5boost13intrusive_ptrINS_14SkillComponentEEE");
+    g_vaddr_sre_gamesceneview_ptr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gamesceneview_ptr");
+
+    std::cout << "[Boot64] Direct Native Control API Symbols: " << std::hex
+              << "StartMove=0x" << g_vaddr_StartMovingToDirection
+              << " StopMove=0x" << g_vaddr_StopMovingToDirection
+              << " StartJump=0x" << g_vaddr_StartJumping
+              << " StopJump=0x" << g_vaddr_StopJumping
+              << " Swing=0x" << g_vaddr_Swing
+              << " StopSwing=0x" << g_vaddr_StopSwing
+              << " Use=0x" << g_vaddr_Use
+              << " BeginCasting=0x" << g_vaddr_BeginCasting
+              << " GameSceneViewPtr=0x" << g_vaddr_sre_gamesceneview_ptr
+              << std::dec << std::endl;
+
+
+    std::cout << "[Boot64] FWKeyboard API: sharedKeyboard=0x" << std::hex << g_fw_sharedKeyboard
+              << " sendDown=0x" << g_fw_sendKeyDown << " sendUp=0x" << g_fw_sendKeyUp
+              << " sendChar=0x" << g_fw_sendKeyChar << " menuBtn=0x" << g_fw_handleMenuBtn
+              << std::dec << std::endl;
+    std::cout << "[Boot64] TextInput API: didChange=0x" << std::hex << g_fw_textInputDidChange
+              << " didFinish=0x" << g_fw_textInputDidFinish << std::dec << std::endl;
+
+    // Setup fake JNI structures in guest memory (64-bit)
+    uint64_t env_ptr = setup_jni_env_arm64(g_guest_memory);
+    std::cout << "[Debug64] env_ptr = 0x" << std::hex << env_ptr << " vtable_ptr = 0x" << *(uint64_t*)(g_guest_memory + env_ptr) << std::dec << std::endl;
+
+    // Allocate some strings in guest memory for paths.
+    // Use 0x10000000 (256 MB) — safely in the 475MB unused memory gap well below guest heap (0x20000000)
+    // and well above loaded modules (0x01000000 - 0x02200000).
+    uint32_t path_ptr = 0x10000000;
+    uint32_t files_dir = path_ptr;
+    std::string files_dir_norm = sre_normalize_vfs_path(g_save_dir);
+    strncpy((char*)(g_guest_memory + files_dir), files_dir_norm.c_str(), 255);
+    ((char*)(g_guest_memory + files_dir))[255] = '\0';
+    path_ptr += 256;
+    
+    uint32_t cache_dir = path_ptr;
+    std::string cache_dir_norm = sre_normalize_vfs_path(g_cache_dir);
+    strncpy((char*)(g_guest_memory + cache_dir), cache_dir_norm.c_str(), 255);
+    ((char*)(g_guest_memory + cache_dir))[255] = '\0';
+    path_ptr += 256;
+
+    // Reload controls for ARM64 (separate from ARM32 due to different scaling)
+    g_input_config.load(g_save_dir + "/controls_arm64.ini");
+    std::cout << "[Input64] Loaded ARM64 controls config (" << g_input_config.button_count() << " buttons)" << std::endl;
+
+    if (setFilesDir) {
+        std::cout << "[Boot64] Calling setFilesDir" << std::endl;
+        g_emulator_64->call(setFilesDir, {env_ptr, 0, (uint64_t)files_dir});
+    }
+    if (setCacheDir) {
+        std::cout << "[Boot64] Calling setCacheDir" << std::endl;
+        g_emulator_64->call(setCacheDir, {env_ptr, 0, (uint64_t)cache_dir});
+    }
+    if (setAssetMgr) {
+        std::cout << "[Boot64] Calling setAssetManager" << std::endl;
+        g_emulator_64->call(setAssetMgr, {env_ptr, 0, 0x55555555});
+    }
+    // NOTE: Do NOT call googleSignInCompleted here — it would set byte_6E9C7C=1,
+    // causing setApplicationViewSize to call HandleGoogleSignInCompleted() DURING
+    // CaverShell::Update(0.0f) when main-menu sign-in listeners are still
+    // null-initialized (boost::function at offset+32 == 0). That triggers
+    // boost::throw_exception<bad_function_call> -> sre_cxa_throw with recovery_depth=0
+    // -> returns -> call at address 0x8 -> Dynarmic null-ptr halt -> silent freeze.
+    // The correct call is deferred to after applicationDidBecomeActive (below).
+    if (handleAppLaunch) {
+        std::cout << "[Boot64] Calling handleApplicationLaunch" << std::endl;
+        g_emulator_64->call(handleAppLaunch, {env_ptr, 0});
+    }
+    if (initMusicPlayer) {
+        std::cout << "[Boot64] Calling initMusicPlayer" << std::endl;
+        g_emulator_64->call(initMusicPlayer, {env_ptr, 0x22222222});
+    }
+    if (setupNative) {
+        std::cout << "[Boot64] Calling setupNativeInterface" << std::endl;
+        g_emulator_64->call(setupNative, {env_ptr, 0});
+    }
+    if (setupApp) {
+        std::cout << "[Boot64] Calling setupApplication" << std::endl;
+        g_emulator_64->call(setupApp, {env_ptr, 0});
+
+        if (!g_boot_scene.empty()) {
+            std::string sc = g_boot_scene;
+            if (sc.size() > 6 && sc.substr(sc.size() - 6) == ".scene") {
+                sc = sc.substr(0, sc.size() - 6);
+            }
+            uint64_t caver_shell_offset = (swordi_abi == 13) ? 0x651700ULL : 0x6E9C20ULL;
+            uint64_t caver_shell_slot = g_main_mod_64.base_addr + caver_shell_offset;
+            uint64_t shell_ptr = *(uint64_t*)(g_guest_memory + caver_shell_slot);
+            if (shell_ptr >= 0x20000000ULL && shell_ptr < 0xE0000000ULL) {
+                // In ARM64 libc++, CaverShell+104 is std::string for initial scene.
+                // SSO layout: byte 0 = (len << 1), bytes 1..len = chars, followed by '\0'.
+                char* str_slot = (char*)(g_guest_memory + shell_ptr + 104);
+                size_t len = sc.length();
+                if (len <= 22) {
+                    memset(str_slot, 0, 24);
+                    str_slot[0] = (char)(len << 1);
+                    memcpy(str_slot + 1, sc.c_str(), len);
+                    str_slot[1 + len] = '\0';
+                    std::cout << "[Boot64] Direct scene boot: Injected '" << sc << "' into CaverShell" << std::endl;
+                } else {
+                    std::cerr << "[Boot64] Direct scene boot warning: scene name exceeds SSO length (22): '" << sc << "'" << std::endl;
+                }
+            } else {
+                std::cerr << "[Boot64] Direct scene boot error: CaverShell pointer invalid: 0x"
+                          << std::hex << shell_ptr << std::dec << std::endl;
+            }
+        }
+    }
+    if (setApplicationViewSize) {
+        std::cout << "[Boot64] Calling setApplicationViewSize" << std::endl;
+        g_emulator_64->call(setApplicationViewSize, {env_ptr, 0, (uint64_t)GAME_W, (uint64_t)GAME_H, 1});
+        /* Store for apply_render_preset() so the preset system can re-call without
+         * going through a full re-boot sequence. */
+        g_setApplicationViewSize_addr = setApplicationViewSize;
+        g_apply_viewsize_env_ptr      = env_ptr;
+    }
+    if (applicationDidBecomeActive) {
+        BOOT_LOADING(0.95f, "Starting game");
+        std::cout << "[Boot64] Calling applicationDidBecomeActive" << std::endl;
+        g_emulator_64->call(applicationDidBecomeActive, {env_ptr, 0});
+    }
+    std::cout << "[Diag64] Post-applicationDidBecomeActive" << std::endl;
+
+    // ── Profile-panel PVR prefetch (profile-screen fix, rec 5) ─────────────
+    // The hero-selection screen (LoadProfiles → one ProfilePanelView per
+    // save) loads the same hero texture set on its first panel; warm the
+    // content-hash PVR decode cache now, while the main menu is still booting,
+    // so the guest's first panel build never pays the decompression. Defined
+    // in jni_bridge_arm64.cpp; no-op with SRE_NO_PVR_PREFETCH=1.
+    {
+        extern void sre_prefetch_profile_panel_assets(void);
+        sre_prefetch_profile_panel_assets();
+    }
+
+    std::cout.flush();
+
+    // Boot is complete — the game will render its own frames from here on.
+    // Finish and tear down the loading screen (frees its ImGui context so the
+    // in-game GUI's context becomes current cleanly).
+    if (g_loading_screen) {
+        g_loading_screen->finish();
+        g_loading_screen->frame();
+        g_loading_screen->shutdown();
+        delete g_loading_screen;
+        g_loading_screen = nullptr;
+    }
+
+    // ========================================================================
+    // Store and ads on desktop (ARM64): there is no Google Play Billing and no
+    // ad SDK. Every in-app product counts as NOT purchased, so no paid content
+    // is unlocked and the game never waits for a billing service that does not
+    // exist here. "Remove Ads" is not faked either: ad requests are answered
+    // as "no ad available" (ShowInterstitialAd returns without showing
+    // anything), and the death screen continues through the engine's own
+    // GameOverViewDidContinue via the SRE ShowAdMaybe hook (sre13_safety.c,
+    // sre12 sre_gui_native.c).
+    // ========================================================================
+    {
+        uint8_t* memory = g_emulator_64->get_memory_base();
+
+        // Patch IsNoAdsUnlockedCheck() -> return false (MOV W0, #0; RET)
+        uint64_t noAdsCheck = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+            "_ZN5Caver15StoreController20IsNoAdsUnlockedCheckEv");
+        if (noAdsCheck) {
+            *(uint32_t*)(memory + noAdsCheck + 0) = 0x52800000; // MOV W0, #0
+            *(uint32_t*)(memory + noAdsCheck + 4) = 0xD65F03C0; // RET
+            std::cout << "[Store64] Patched IsNoAdsUnlockedCheck at 0x" << std::hex << noAdsCheck
+                      << " -> return false (not purchased; no store on desktop)" << std::dec << std::endl;
+        }
+
+        // Patch IsProductPurchased -> return false for every product
+        uint64_t isPurchased = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+            "_ZN5Caver23StoreController_Android18IsProductPurchasedERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE");
+        if (!isPurchased) {
+            isPurchased = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                "_ZN5Caver23StoreController_Android18IsProductPurchasedERKSs");
+        }
+        if (!isPurchased) {
+            isPurchased = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                "_ZN5Caver15StoreController18IsProductPurchasedERKSs");
+        }
+        if (isPurchased) {
+            *(uint32_t*)(memory + isPurchased + 0) = 0x52800000; // MOV W0, #0
+            *(uint32_t*)(memory + isPurchased + 4) = 0xD65F03C0; // RET
+            std::cout << "[Store64] Patched IsProductPurchased at 0x" << std::hex << isPurchased
+                      << " -> return false (not purchased; no store on desktop)" << std::dec << std::endl;
+        }
+
+        // Patch ShowInterstitialAd to return immediately ("no ad available") —
+        // the ad state machine can't be replicated on non-Android (same issue
+        // as the PS Vita port).
+        uint64_t showAd = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+            "_ZN5Caver24OnlineController_Android18ShowInterstitialAdERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEif");
+        if (!showAd) {
+            showAd = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+                "_ZN5Caver24OnlineController_Android18ShowInterstitialAdERKSsif");
+        }
+        if (showAd) {
+            *(uint32_t*)(memory + showAd) = 0xD65F03C0; // RET
+            std::cout << "[Fix64] Patched ShowInterstitialAd at 0x" << std::hex << showAd
+                      << " -> ret" << std::dec << std::endl;
+        }
+        uint64_t showAd2 = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+            "_ZN5Caver25AndroidShowInterstitialAdEd");
+        if (showAd2) {
+            *(uint32_t*)(memory + showAd2) = 0xD65F03C0; // RET
+            std::cout << "[Fix64] Patched AndroidShowInterstitialAd at 0x" << std::hex << showAd2
+                      << " -> ret" << std::dec << std::endl;
+        }
+        // NOTE (1.4.13): No raw RET on ShowAdMaybe here anymore. The SRE
+        // trampoline (installed earlier at the same address) must stay intact:
+        // sre13 hooks ShowAdMaybe AND GameOverViewController::Update to queue a
+        // deferred respawn that calls GameOverViewDidContinue directly, so the
+        // death screen advances without the ad SDK. A RET here clobbered the
+        // SRE hook branch and left the death screen frozen.
+
+        // Coin limit patches (ARM64, 1.4.12 only)
+        // Lua coin limit check 1 & 2: offsets 0x35e25c, 0x35e260
+        // Game event limit check 3 & 4: offsets 0x3597a0, 0x3597a4
+        // Too rich patch: 0x3597ac, 0x3597b4, 0x3597b8
+        if (swordi_abi == 12) {
+            uint64_t base_addr = g_main_mod_64.base_addr;
+            if (base_addr) {
+                extern int g_sre_coin_limit;
+                uint16_t limit = (uint16_t)g_sre_coin_limit;
+
+                // Instruction helper functions inlined
+                auto emit_mov_wide_immediate = [](uint16_t imm16, uint8_t rd) -> uint32_t {
+                    // mov w[rd], #imm16
+                    return 0x52800000 | (imm16 << 5) | rd;
+                };
+                auto emit_cmp_shifted_register = [](uint8_t rn, uint8_t rm) -> uint32_t {
+                    // cmp w[rn], w[rm] -> subs wzr, w[rn], w[rm]
+                    return 0x6B00001F | (rm << 16) | (rn << 5);
+                };
+
+                // Lua path:
+                // mov w8, #limit -> cmp w0, w8
+                *(uint32_t*)(memory + base_addr + 0x35e25c) = emit_mov_wide_immediate(limit, 8);
+                *(uint32_t*)(memory + base_addr + 0x35e260) = emit_cmp_shifted_register(0, 8);
+
+                // Game event path:
+                // mov w10, #limit -> cmp w8, w10
+                *(uint32_t*)(memory + base_addr + 0x3597a0) = emit_mov_wide_immediate(limit, 10);
+                *(uint32_t*)(memory + base_addr + 0x3597a4) = emit_cmp_shifted_register(8, 10);
+
+                // Too rich achievement threshold patch:
+                // NOP at 0x3597ac
+                // mov w11, #(limit - 1) at 0x3597b4
+                // cmp w8, w11 at 0x3597b8
+                *(uint32_t*)(memory + base_addr + 0x3597ac) = 0xD503201F; // NOP
+                *(uint32_t*)(memory + base_addr + 0x3597b4) = emit_mov_wide_immediate(limit - 1, 11);
+                *(uint32_t*)(memory + base_addr + 0x3597b8) = emit_cmp_shifted_register(8, 11);
+
+                std::cout << "[CoinLimit64] Applied ARM64 coin limit patches (limit=" << limit << ")" << std::endl;
+            }
+        }
+    }
+
+    // Resolve adVisibilityChanged (kept for death detection countdown fallback)
+    uint64_t adVisibilityChanged = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+        "Java_com_touchfoo_swordigo_Native_interstitialAdVisibilityChanged");
+
+    // 5. Game Loop
+    uint64_t updateApp = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_updateApplication");
+    uint64_t drawApp = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_drawApplication");
+    uint64_t handleTouchEvent = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_handleTouchEvent");
+    uint64_t handleBackButtonPress = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_handleBackButtonPress");
+    // Route confirmation to the actual modal view, not the stale gameplay HUD.
+    const uint64_t gameover_vtable_symbol = swordi_abi == 13
+        ? g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZTVN5Caver22GameOverViewControllerE") : 0;
+    const uint64_t gameover_key_handler = swordi_abi == 13
+        ? g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver12GameOverView19HandleKeyboardEventERKNS_16GUIKeyboardEventE") : 0;
+    g_touch_64_handle = handleTouchEvent;   // for pod_touch_direct()
+    uint64_t snapshotLoaded = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "Java_com_touchfoo_swordigo_Native_snapshotLoaded");
+    uint64_t sre_scene_shifter_tick_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_scene_shifter_tick") : 0;
+    uint64_t sre_gameover_respawn_tick_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "sre_gameover_respawn_tick") : 0;
+    uint64_t sre_gameover_respawn_controller_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(
+              &g_sre_mod, "g_sre_gameover_respawn_controller") : 0;
+    uint64_t sre_update_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_update_application_ticks") : 0;
+    uint64_t sre_frame_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_frame_update_ticks") : 0;
+    uint64_t sre_shell_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_frame_shell_ticks") : 0;
+    uint64_t sre_scene_poll_ticks_addr = g_use_sre
+        ? g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shifter_poll_ticks") : 0;
+    
+    // Tell the game Google Sign-In succeeded so snapshot system is enabled.
+    // This is called AFTER applicationDidBecomeActive so that the main-menu
+    // sign-in listener (registered during CaverShell::Update(0.0f) inside
+    // setApplicationViewSize) is fully initialized with a valid boost::function
+    // callback before HandleGoogleSignInCompleted fires.
+    if (googleSignInCompleted) {
+        std::cout << "[Boot64] Calling googleSignInCompleted(true) — enable snapshots" << std::endl;
+        std::cout.flush();
+        g_emulator_64->call(googleSignInCompleted, {env_ptr, 0, 1}); // true = signed in
+        std::cout << "[Diag64] Post-googleSignInCompleted" << std::endl;
+        std::cout.flush();
+    }
+
+    bool g_hide_touch_hud = true;
+    g_gl_hide_hud = g_hide_touch_hud;
+
+    std::cout << "[Diag64] Entering game loop. updateApp=0x" << std::hex << updateApp
+              << " drawApp=0x" << drawApp << std::dec << std::endl;
+    std::cout.flush();
+
+    if (updateApp && drawApp) {
+        Uint64 last_ticks = SDL_GetTicks();
+        double accumulated_time = 0.0;
+        bool gui_visible = false;
+        bool debug_visible = false;
+        bool hint_shown = false;
+        Uint64 hint_start_time = SDL_GetTicks();
+        float fps = 0.0f;
+        Uint64 fps_last_time = SDL_GetTicks();
+        int fps_frame_count = 0;
+        
+        const int TARGET_FRAMES = g_display_active ? 0 : 1000;
+        int completed_frames = 0;
+        
+        uint32_t total_draw_calls = 0;
+        uint32_t total_tex_binds = 0;
+        uint32_t total_tex_uploads = 0;
+        uint32_t total_matrix_ops = 0;
+        uint32_t total_state_changes = 0;
+        uint32_t total_asset_opens = 0;
+        uint64_t host_scene_poll_calls = 0;
+
+        std::cout << "\n========================================" << std::endl;
+        if (g_display_active) {
+            std::cout << "[Loop64] Starting visual game loop (close window to stop)" << std::endl;
+        } else {
+            std::cout << "[Loop64] Starting " << TARGET_FRAMES << "-frame stability test" << std::endl;
+        }
+        std::cout << "========================================\n" << std::endl;
+
+        extern Display* g_display_ptr;
+
+        int mouse_x = 0;
+        int mouse_y = 0;
+        bool mouse_pressed = false;
+        bool click_swallowed_by_gui = false;
+        float last_mouse_x = -1.0f;
+        float last_mouse_y = -1.0f;
+
+        bool key_left = false;
+        bool key_right = false;
+        bool key_jump = false;
+        bool key_z_forward = false;
+        bool key_z_backward = false;
+        bool key_attack = false;
+        bool key_magic = false;
+        bool key_use_item = false;
+        bool key_menu = false;
+
+        bool arrow_left  = false;
+        bool arrow_right = false;
+        bool arrow_up    = false;
+        bool arrow_down  = false;
+        bool cam_key_pgup  = false;
+        bool cam_key_pgdn  = false;
+
+        bool running = true;
+        while (running) {
+            g_frame_stats.reset();
+            
+            Uint64 now_ticks = SDL_GetTicks();
+            Uint64 start_counter = SDL_GetPerformanceCounter();
+            float dt_seconds = (now_ticks - last_ticks) / 1000.0f;
+            if (dt_seconds > 0.1f) dt_seconds = 0.016666668f;
+            if (dt_seconds < 0.001f) dt_seconds = 0.016666668f;
+            last_ticks = now_ticks;
+            accumulated_time += dt_seconds;
+
+            // ── Engine-pod control (Ruby GG dock) ──────────────────────
+            // Drain stdin commands, then freeze the whole guest while the
+            // ruby pause button is held (no update, no draw, no frame out).
+            if (g_pod_enabled) {
+                if (g_pod_ring && g_pod_ring->state() == pod::kStateBooting)
+                    g_pod_ring->set_state(pod::kStateRunning);
+                pod_process_commands(running);
+                if (!running) break;
+                if (g_pod_paused) {
+                    SDL_Delay(12);
+                    continue;
+                }
+            }
+            
+            if (completed_frames < 150) {
+                g_emulator_64->quiet_mode = false;
+            } else {
+                g_emulator_64->quiet_mode = true;
+            }
+            
+            // Touch held buttons — ARM64 AAPCS64 calling convention:
+            // Integer args: X0=env, X1=obj, X2=action, X3=id, X4=tapCount
+            // Float args (separate sequence): D0=time, S1=x, S2=y, S3=oldX, S4=oldY
+            static int touch_debug_count = 0;
+            auto call_touch_64 = [&](int action, int id, double time_val, float x, float y, float old_x, float old_y, int tap_count) {
+                if (!handleTouchEvent) return;
+                
+                // Check if touch input is disabled globally by Lua scripts
+                extern volatile int g_sre_controls_disabled;
+                if (g_sre_controls_disabled) {
+                    return;
+                }
+
+                // Never feed touch events into an already-faulted guest — the
+                // guest CPU state is corrupt and dispatching handleTouchEvent
+                // would run against a broken scene (corrupted branch target).
+                if (g_emulator_64->has_faulted()) return;
+                
+                // Scale from legacy 960×544 touch space to actual game resolution
+                // (same as ARM32 call_handle_touch_event)
+                x     *= TOUCH_SCALE_X;  y     *= TOUCH_SCALE_Y;
+                old_x *= TOUCH_SCALE_X;  old_y *= TOUCH_SCALE_Y;
+                
+                if (touch_debug_count < 5) {
+                    std::cout << "[Touch64] action=" << action << " id=" << id
+                              << " x=" << x << " y=" << y << std::endl;
+                }
+                // Set float/double args (AAPCS64: D0=1st FP, S1=2nd FP, S2=3rd FP, etc.)
+                g_emulator_64->set_dreg(0, time_val);
+                g_emulator_64->set_sreg(1, x);
+                g_emulator_64->set_sreg(2, y);
+                g_emulator_64->set_sreg(3, old_x);
+                g_emulator_64->set_sreg(4, old_y);
+                
+                if (touch_debug_count < 5) {
+                    std::cout << "[Touch64-Verify] D0=" << g_emulator_64->get_dreg(0)
+                              << " S1=" << g_emulator_64->get_sreg(1)
+                              << " S2=" << g_emulator_64->get_sreg(2)
+                              << " S3=" << g_emulator_64->get_sreg(3)
+                              << " S4=" << g_emulator_64->get_sreg(4) << std::endl;
+                    touch_debug_count++;
+                }
+                // Integer args via call()
+                g_emulator_64->call(handleTouchEvent, {env_ptr, 0, (uint64_t)action, (uint64_t)id, (uint64_t)tap_count});
+            };
+
+            auto dispatch_gameover_key = [&](int native_key) -> bool {
+                if (!gameover_vtable_symbol || !gameover_key_handler || !g_guest_memory ||
+                    g_emulator_64->has_faulted()) return false;
+                // Verified 1.4.13 navigation layout, shared with the scene shifter.
+                uint64_t shell = *(uint64_t*)(g_guest_memory + g_main_mod_64.base_addr + 0x651700);
+                if (!is_valid_guest_ptr(shell)) return false;
+                uint64_t nav = *(uint64_t*)(g_guest_memory + shell + 0x90);
+                if (!is_valid_guest_ptr(nav)) return false;
+                uint64_t controller = *(uint64_t*)(g_guest_memory + nav + 0x50);
+                if (!is_valid_guest_ptr(controller) ||
+                    *(uint64_t*)(g_guest_memory + controller) != gameover_vtable_symbol + 16) return false;
+                uint64_t view = *(uint64_t*)(g_guest_memory + controller + 0x18);
+                if (!is_valid_guest_ptr(view)) return false;
+                constexpr uint64_t event_address = 0x3F800;
+                std::memset(g_guest_memory + event_address, 0, 128);
+                *(int*)(g_guest_memory + event_address + 0x0c) = 1;
+                *(int*)(g_guest_memory + event_address + 0x10) = native_key;
+                g_emulator_64->call(gameover_key_handler, {view, event_address});
+                return true;
+            };
+
+            auto dispatch_gameplay_button = [&](const std::string& name, bool is_down) -> bool {
+                if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory && g_emulator_64) {
+                    uint64_t gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
+                    if (is_valid_guest_ptr(gamesceneview)) {
+                        uint64_t overlay = *(uint64_t*)(g_guest_memory + gamesceneview + 0x100);
+                        if (is_valid_guest_ptr(overlay)) {
+                            int native_key = 0;
+                            if      (name == "left")     native_key = 0x25; // VK_LEFT (37)
+                            else if (name == "right")    native_key = 0x27; // VK_RIGHT (39)
+                            else if (name == "jump")     native_key = 0x26; // VK_UP / JUMP (38)
+                            else if (name == "attack")   native_key = 0x11; // VK_CONTROL / ATTACK (17)
+                            else if (name == "magic")    native_key = 0x41; // VK_A / MAGIC (65)
+                            else if (name == "use_item") native_key = 0x31; // VK_1 / SPELL PICKER (49)
+
+                            if (native_key > 0) {
+                                // Write a GUIKeyboardEvent in guest scratch memory (e.g. 0x3F800)
+                                uint32_t guest_event_addr = 0x3F800;
+                                std::memset(g_guest_memory + guest_event_addr, 0, 128);
+                                *(int*)(g_guest_memory + guest_event_addr + 0xc) = is_down ? 1 : 2;  // Action (1=down, 2=up)
+                                *(int*)(g_guest_memory + guest_event_addr + 0x10) = native_key;       // Native VK code
+                                
+                                // Resolve GameOverlayView::HandleKeyboardEvent dynamically from the object's vtable (offset 0x28)
+                                uint64_t vtable = *(uint64_t*)(g_guest_memory + overlay);
+                                uint64_t handle_keyboard_event = *(uint64_t*)(g_guest_memory + vtable + 0x28);
+                                g_emulator_64->call(handle_keyboard_event, {overlay, (uint64_t)guest_event_addr});
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            };
+
+
+            // Per-frame camera movement
+            if (g_cam_active) {
+                bool any_cam_key = arrow_left || arrow_right || arrow_up || arrow_down || cam_key_pgup || cam_key_pgdn;
+                if (any_cam_key) {
+                    float dx = 0, dy = 0, dz = 0;
+                    if (arrow_left)   dx -= 1.0f;
+                    if (arrow_right)  dx += 1.0f;
+                    if (arrow_up)     dy += 1.0f;
+                    if (arrow_down)   dy -= 1.0f;
+                    if (cam_key_pgup) dz -= 1.0f;
+                    if (cam_key_pgdn) dz += 1.0f;
+                    cam_move_scaled(dx, dy, dz, dt_seconds);
+                } else {
+                    cam_reset_accel();
+                }
+                extern void cam_write_to_guest();
+                cam_write_to_guest();
+            }
+
+            float game_dt = dt_seconds * g_game_speed;
+            /* Frame dt for the guest z-walk poll (Mini.HostDt) — lets the
+             * Z stepping run in units/sec instead of units/frame. */
+            if (g_sre_host_dt_addr && g_guest_memory) {
+                float host_dt = game_dt > 0.0001f ? game_dt : 0.016f;
+                *(float*)(g_guest_memory + g_sre_host_dt_addr) = host_dt;
+            }
+            if (g_sre_z_walk_axis_addr && g_guest_memory) {
+                extern bool g_sre_overlay_blocking;
+                const bool z_input_blocked = g_sre_overlay_blocking || g_typing_mode ||
+                    g_swordfare_gui.is_lua_console_open() || g_text_input_active ||
+                    g_sre_controls_disabled;
+                const bool* held_keys = SDL_GetKeyboardState(nullptr);
+                if (z_input_blocked || !held_keys) {
+                    key_z_forward = false;
+                    key_z_backward = false;
+                } else {
+                    key_z_forward = held_keys[SDL_SCANCODE_W];
+                    key_z_backward = held_keys[SDL_SCANCODE_S];
+                }
+                float z_axis = (key_z_forward ? 1.0f : 0.0f) - (key_z_backward ? 1.0f : 0.0f);
+                *(float*)(g_guest_memory + g_sre_z_walk_axis_addr) = z_axis;
+            }
+            /* X-axis (A/D strafe) for the z-walk — same input blocking */
+            if (g_sre_x_walk_axis_addr && g_guest_memory) {
+                extern bool g_sre_overlay_blocking;
+                const bool x_input_blocked = g_sre_overlay_blocking || g_typing_mode ||
+                    g_swordfare_gui.is_lua_console_open() || g_text_input_active ||
+                    g_sre_controls_disabled;
+                const bool* held_keys = SDL_GetKeyboardState(nullptr);
+                bool key_x_left  = false;
+                bool key_x_right = false;
+                if (!x_input_blocked && held_keys) {
+                    key_x_left  = held_keys[SDL_SCANCODE_A];
+                    key_x_right = held_keys[SDL_SCANCODE_D];
+                }
+                float x_axis = (key_x_right ? 1.0f : 0.0f) - (key_x_left ? 1.0f : 0.0f);
+                *(float*)(g_guest_memory + g_sre_x_walk_axis_addr) = x_axis;
+            }
+            /* WASD (z-walk) mode latch — L unlocks it, but ONLY while the
+             * freecam (camera override, F5) is active: "L = z-unlock when
+             * camera is on". Turning the camera off auto-clears the latch.
+             * The guest poll only acts when Thronfield is detected OR this
+             * latch is set, so vanilla (no F5→L) is never touched. */
+            if (g_sre_zwalk_f5l_addr && g_guest_memory) {
+                extern bool g_sre_overlay_blocking;
+                const bool key_blocked = g_sre_overlay_blocking || g_typing_mode ||
+                    g_swordfare_gui.is_lua_console_open() || g_text_input_active ||
+                    g_sre_controls_disabled;
+                const bool* held_keys = SDL_GetKeyboardState(nullptr);
+                bool l_down = false;
+                if (!key_blocked && held_keys) {
+                    l_down = held_keys[SDL_SCANCODE_L];
+                }
+                static bool s_zwalk_f5l = false;
+                static bool s_prev_l = false;
+                /* z-unlock only exists while the camera is on */
+                if (!g_cam_active) {
+                    s_zwalk_f5l = false;
+                } else if (l_down && !s_prev_l) {
+                    s_zwalk_f5l = !s_zwalk_f5l;
+                    mod_toast(s_zwalk_f5l ? "Z-Mode: ON  (WASD 3D)" : "Z-Mode: OFF", 1.5f);
+                    std::cout << "[ZWalk] WASD mode " << (s_zwalk_f5l ? "ENABLED" : "DISABLED")
+                              << " (camera active)" << std::endl;
+                }
+                s_prev_l = l_down;
+                *(int*)(g_guest_memory + g_sre_zwalk_f5l_addr) = s_zwalk_f5l ? 1 : 0;
+            }
+            uint32_t dt_hex;
+            memcpy(&dt_hex, &game_dt, 4);
+
+            if (!g_game_paused || g_step_one_frame) {
+                // Advance virtual clock for gettimeofday/clock_gettime hooks
+                advance_guest_virtual_clock(game_dt);
+
+                // Reset active gamesceneview ptr so we only detect active play if update updates it
+                if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
+                    *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr) = 0;
+                }
+
+                // ARM64 AAPCS: float dt goes in S0, not X2
+                //
+                // Step A (non-permanent guest faults): a guest fault used to
+                // permanently isolate the guest — updateApp was never called
+                // again, so the screen stayed black forever (draws=0). Instead,
+                // clear the latched fault at the top of each frame so the guest
+                // retries. A bad indirect vcall (e.g. the first-frame root-view
+                // dispatch on an uninitialised FWShell+0x88 member) now unwinds
+                // cleanly back to the host via the emulator's .dynstr bad-vcall
+                // recovery (Step B) rather than aborting the whole session.
+                //
+                // Guard against a tight deterministic re-crash loop: count
+                // consecutive frames in which the guest faulted and, past a
+                // small threshold, skip the guest update for THAT frame only
+                // (still retrying on later frames, e.g. once a scene finishes
+                // loading and the root view becomes valid).
+                static int   s_consecutive_frame_faults = 0;
+                static bool  s_logged_fault = false;
+                const int    kMaxConsecutiveFrameFaults = 8;
+                bool         skip_guest_update_this_frame = false;
+                if (g_emulator_64->has_faulted()) {
+                    s_consecutive_frame_faults++;
+                    if (!s_logged_fault) {
+                        std::cerr << "[SRE/Fault] Guest faulted — clearing fault and retrying next frame "
+                                     "(non-permanent isolation)." << std::endl;
+                        s_logged_fault = true;
+                    }
+                    // Clear the latched fault so the guest can run again.
+                    g_emulator_64->clear_faulted();
+                    // Signal the SRE Lua layer to perform an emergency Lua VM reset
+                    // before the next coroutine resume. The guest fault likely left
+                    // a corrupted lua_State::ci call stack (bad lua_CFunction pointer
+                    // was branched to, executing random bytes until Dynarmic halted).
+                    // Without this reset, the next lua_resume through the bridge
+                    // causes a SIGSEGV inside JniBridge64::call_handler.
+                    {
+                        static uint64_t s_lua_vm_faulted_addr = 0;
+                        if (!s_lua_vm_faulted_addr && g_loader_64 && g_sre_mod.base_addr) {
+                            s_lua_vm_faulted_addr = g_loader_64->get_symbol_vaddr(
+                                &g_sre_mod, "g_sre_lua_vm_faulted");
+                        }
+                        if (s_lua_vm_faulted_addr) {
+                            *(volatile int*)(g_guest_memory + s_lua_vm_faulted_addr) = 1;
+                        }
+                    }
+                    if (s_consecutive_frame_faults > kMaxConsecutiveFrameFaults) {
+                        // Deterministic re-crash: skip the guest update this frame
+                        // to avoid burning CPU on a call that always faults, but
+                        // DO keep trying on subsequent frames.
+                        skip_guest_update_this_frame = true;
+                        static int s_skip_log = 0;
+                        if (s_skip_log++ < 5) {
+                            std::cerr << "[SRE/Fault] " << s_consecutive_frame_faults
+                                      << " consecutive faults — skipping guest update this frame only."
+                                      << std::endl;
+                        }
+                    }
+                } else {
+                    // A clean frame resets the counter so transient faults don't
+                    // accumulate toward the skip threshold.
+                    s_consecutive_frame_faults = 0;
+                }
+                if (skip_guest_update_this_frame) {
+                    // fall through to the render/blit path without running updateApp
+                } else {
+                    // Run any threads left over from the previous frame BEFORE updating.
+                    // Scene transitions queue a background load thread; running it here
+                    // ensures the "scene loaded" flag is set before updateApplication
+                    // tries to poll it.
+                    if (g_emulator_64->has_pending_threads()) {
+                        g_emulator_64->run_pending_threads();
+                    }
+
+                    g_emulator_64->set_sreg(0, game_dt);
+                    uint64_t update_ticks_before = 0;
+                    uint64_t update_ticks_after = 0;
+
+                    // ── Frame Watchdog ──────────────────────────────────────────────────
+                    // If sre_Scene_FinishLoad left the Lua mutex locked (longjmp escape),
+                    // the scene-loading flag stays set. We detect and force-clear it here.
+                    {
+                        // g_sre_scene_loading lives in libsre.so (g_sre_mod), not the game binary.
+                        // Resolve once on first frame, cache for all subsequent frames.
+                        static uint64_t s_scene_loading_addr = 0;
+                        static uint64_t s_suppress_hud_addr  = 0;
+                        static bool     s_scene_loading_resolved = false;
+                        if (!s_scene_loading_resolved) {
+                            s_scene_loading_addr = g_loader_64->get_symbol_vaddr(
+                                &g_sre_mod, "g_sre_scene_loading");
+                            s_suppress_hud_addr  = g_loader_64->get_symbol_vaddr(
+                                &g_sre_mod, "g_sre_suppress_hud_frames");
+                            s_scene_loading_resolved = true;
+                            if (s_scene_loading_addr)
+                                std::cout << "[Watchdog] Scene loading flag @ 0x"
+                                          << std::hex << s_scene_loading_addr << std::dec << std::endl;
+                            else
+                                std::cout << "[Watchdog] WARNING: g_sre_scene_loading not found in libsre.so" << std::endl;
+                        }
+
+                        bool was_scene_loading = s_scene_loading_addr &&
+                            (*(volatile int*)(g_guest_memory + s_scene_loading_addr) != 0);
+
+                        update_ticks_before = sre_update_ticks_addr
+                            ? *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr) : 0;
+
+                        // ── Step C: FWShell root-view sanity guard ──────────────────────────
+                        // Root cause of draws=0: on the first Update tick the guest dispatches
+                        // a virtual call through FWShell+0x88 (CaverShell::Update:
+                        // ldr x0,[x19,#136]; x8=[x0]; blr [x8,#72]). Early in boot that member
+                        // holds a garbage/not-yet-ready view pointer (observed 0xcea33c90,
+                        // vptr=0), so the vcall faults every frame and rendering never starts.
+                        // If the member currently points at a garbage view (bad range or bad
+                        // vtable), zero it so the guest's own null-checks skip the dispatch this
+                        // frame. Self-heals: once CaverShell::InitView installs a valid view
+                        // (sane vtable in code range), the guard stops firing and draws proceed.
+                        if (g_guest_memory && swordi_abi == 12) {
+                            static const uint64_t kShellAddr   = 0x16e9c20ULL; // DAT_007e9c20 + 0x1000000 (1.4.12 only)
+                            static const uint64_t kArenaEnd    = 0xE0000000ULL;
+                            static const uint32_t kRootOff     = 0x88;
+                            const uint64_t code_lo = 0x1000000ULL;
+                            const uint64_t code_hi = 0x1000000ULL + g_main_mod_64.mem_size;
+
+                            // (1) Read FWShell singleton. Inspect both widths once for diagnosis.
+                            static bool s_shell_diag = false;
+                            uint64_t shell64 = 0; uint32_t shell32 = 0;
+                            if (kShellAddr + 8 < kArenaEnd) {
+                                std::memcpy(&shell64, g_guest_memory + kShellAddr, 8);
+                                std::memcpy(&shell32, g_guest_memory + kShellAddr, 4);
+                            }
+                            if (!s_shell_diag) {
+                                std::cerr << "[RenderGuard] FWShell@0x" << std::hex << kShellAddr
+                                          << " raw64=0x" << shell64 << " raw32=0x" << shell32
+                                          << std::dec << std::endl;
+                                s_shell_diag = true;
+                            }
+                            // Prefer whichever width yields a sane guest heap pointer.
+                            auto in_heap = [](uint64_t p){ return p >= 0x20000000ULL && p < 0x47000000ULL; };
+                            uint64_t shell = 0;
+                            if (in_heap(shell32)) shell = shell32;
+                            else if (in_heap(shell64)) shell = shell64;
+
+                            if (shell) {
+                                uint32_t root_addr32 = (uint32_t)(shell & 0xffffffffULL) + kRootOff;
+                                if ((uint64_t)root_addr32 + 4 < kArenaEnd) {
+                                    uint32_t rootview = 0;
+                                    std::memcpy(&rootview, g_guest_memory + root_addr32, 4);
+                                    if (rootview != 0) {
+                                        // (3) Decide if the root view is garbage / not ready.
+                                        bool bad = (rootview < 0x10000 || rootview >= 0xE0000000ULL);
+                                        uint64_t vptr = 0;
+                                        if (!bad && (uint64_t)rootview + 8 < kArenaEnd) {
+                                            std::memcpy(&vptr, g_guest_memory + rootview, 8);
+                                            if (vptr == 0 || vptr < code_lo || vptr >= code_hi)
+                                                bad = true;
+                                        } else if (!bad) {
+                                            bad = true; // can't safely read vtable → treat as bad
+                                        }
+                                        if (bad) {
+                                            uint32_t zero = 0;
+                                            std::memcpy(g_guest_memory + root_addr32, &zero, 4);
+                                            static int s_guard_log = 0;
+                                            if (s_guard_log++ < 5) {
+                                                std::cerr << "[RenderGuard] Zeroed garbage FWShell root-view 0x"
+                                                          << std::hex << rootview << " (vptr=0x" << vptr
+                                                          << std::dec << ") — skipping dispatch until valid view installed"
+                                                          << std::endl;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        g_emulator_64->call(updateApp, {env_ptr, 0});
+                        update_ticks_after = sre_update_ticks_addr
+                            ? *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr) : 0;
+
+                        /* Keep this independent of the guest hook.  A single
+                         * first-frame sample was insufficient: zero-valued or
+                         * unresolved symbols silently suppressed the diagnosis. */
+                        static uint64_t s_diag_frame = 0;
+                        if ((completed_frames == 0 || completed_frames - s_diag_frame >= 60) &&
+                            sre_update_ticks_addr && sre_frame_ticks_addr &&
+                            sre_shell_ticks_addr && sre_scene_poll_ticks_addr) {
+                            uint64_t update_ticks = *(volatile uint64_t*)(g_guest_memory + sre_update_ticks_addr);
+                            uint64_t frame_ticks = *(volatile uint64_t*)(g_guest_memory + sre_frame_ticks_addr);
+                            uint64_t shell_ticks = *(volatile uint64_t*)(g_guest_memory + sre_shell_ticks_addr);
+                            uint64_t poll_ticks = *(volatile uint64_t*)(g_guest_memory + sre_scene_poll_ticks_addr);
+                            uint64_t world_drive = 0;
+                            uint64_t ps_ticks = 0, ps_susp = 0, ps_fires = 0, ps_errs = 0;
+                            uint64_t obj_count = 0, obj_removals = 0;
+                            {
+                                static uint64_t s_wd_addr = 0;
+                                static uint64_t s_ps_addr[4] = {0,0,0,0};
+                                static uint64_t s_obj_addr[2] = {0,0};
+                                static bool s_wd_resolved = false;
+                                if (!s_wd_resolved && g_loader_64) {
+                                    s_wd_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_world_drive_count");
+                                    s_ps_addr[0] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_ticks");
+                                    s_ps_addr[1] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_suspended_seen");
+                                    s_ps_addr[2] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_timer_fires");
+                                    s_ps_addr[3] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_ps_resume_errors");
+                                    s_obj_addr[0] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_object_count");
+                                    s_obj_addr[1] = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_object_removals");
+                                    s_wd_resolved = true;
+                                }
+                                if (s_wd_addr) world_drive = *(volatile uint64_t*)(g_guest_memory + s_wd_addr);
+                                if (s_ps_addr[0]) ps_ticks = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[0]);
+                                if (s_ps_addr[1]) ps_susp  = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[1]);
+                                if (s_ps_addr[2]) ps_fires = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[2]);
+                                if (s_ps_addr[3]) ps_errs  = *(volatile uint64_t*)(g_guest_memory + s_ps_addr[3]);
+                                if (s_obj_addr[0]) obj_count = *(volatile uint64_t*)(g_guest_memory + s_obj_addr[0]);
+                                if (s_obj_addr[1]) obj_removals = *(volatile uint64_t*)(g_guest_memory + s_obj_addr[1]);
+                            }
+                            uint64_t guest_poll_ticks = poll_ticks >= host_scene_poll_calls
+                                ? poll_ticks - host_scene_poll_calls : 0;
+                            std::cout << "[SRE/FrameDiag] host_frame=" << completed_frames
+                                      << " JNI=" << update_ticks
+                                      << " frame=" << frame_ticks
+                                      << " shell=" << shell_ticks
+                                      << " scene_poll_total=" << poll_ticks
+                                      << " scene_poll_guest=" << guest_poll_ticks
+                                      << " scene_poll_fallback=" << host_scene_poll_calls
+                                      << " world_drive=" << world_drive
+                                      << " ps_ticks=" << ps_ticks
+                                      << " ps_susp=" << ps_susp
+                                      << " ps_fires=" << ps_fires
+                                      << " ps_errs=" << ps_errs
+                                      << " obj=" << obj_count
+                                      << " rm=" << obj_removals
+                                      << " gsv=";
+                            {
+                                static uint64_t s_gsv_addr = 0;
+                                static uint64_t s_gsv_view_addr = 0;
+                                static uint64_t s_gsv_relay_addr = 0;
+                                static bool s_gsv_resolved = false;
+                                if (!s_gsv_resolved && g_loader_64) {
+                                    s_gsv_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gui_scene_active");
+                                    s_gsv_view_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_gui_scene_view_ptr");
+                                    s_gsv_relay_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_guiview_relay_calls");
+                                    s_gsv_resolved = true;
+                                }
+                                if (s_gsv_addr) std::cout << *(volatile int*)(g_guest_memory + s_gsv_addr);
+                                else std::cout << "?";
+                                if (s_gsv_view_addr)
+                                    std::cout << "/0x" << std::hex
+                                              << *(volatile uint64_t*)(g_guest_memory + s_gsv_view_addr)
+                                              << std::dec;
+                                if (s_gsv_relay_addr)
+                                    std::cout << " relay=" << *(volatile uint64_t*)(g_guest_memory + s_gsv_relay_addr);
+                            }
+                            std::cout << " scene=";
+                            {
+                                static uint64_t s_scn_addr = 0;
+                                static bool s_scn_resolved = false;
+                                if (!s_scn_resolved && g_loader_64) {
+                                    s_scn_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_current_scene_name");
+                                    s_scn_resolved = true;
+                                }
+                                if (s_scn_addr && *(volatile char*)(g_guest_memory + s_scn_addr)) {
+                                    // Clamp to the 128-byte guest buffer (g_sre_current_scene_name[128])
+                                    size_t scn_len = strnlen((const char*)(g_guest_memory + s_scn_addr), 127);
+                                    std::cout.write((const char*)(g_guest_memory + s_scn_addr), scn_len);
+                                } else {
+                                    std::cout << "(none)";
+                                }
+                            }
+                            std::cout << std::endl;
+                            s_diag_frame = completed_frames;
+                        } else if (completed_frames == 0 &&
+                                   (!sre_update_ticks_addr || !sre_frame_ticks_addr ||
+                                    !sre_shell_ticks_addr || !sre_scene_poll_ticks_addr)) {
+                            std::cerr << "[SRE/FrameDiag] WARNING: unresolved counter(s): JNI=0x"
+                                      << std::hex << sre_update_ticks_addr << " frame=0x"
+                                      << sre_frame_ticks_addr << " shell=0x" << sre_shell_ticks_addr
+                                      << " scene_poll=0x" << sre_scene_poll_ticks_addr << std::dec
+                                      << std::endl;
+                        }
+
+                        // After call: if flag is STILL set, FinishLoad's cleanup was
+                        // skipped (exception path). Force-clear so next frame runs clean.
+                        // Also suppress HUD data reads for 2 frames so we don't spam
+                        // stale game-state pointers while the new scene is activating.
+                        // Only force-clear after the flag has stayed stuck for a
+                        // grace period of consecutive frames. A legitimately
+                        // in-progress background scene load must not be clobbered
+                        // mid-init, otherwise the next updateApplication runs against
+                        // a half-initialized scene (corrupted branch-target crash).
+                        static int s_scene_stuck_frames = 0;
+                        if (was_scene_loading && s_scene_loading_addr) {
+                            int still_loading = *(volatile int*)(g_guest_memory + s_scene_loading_addr);
+                            if (still_loading) {
+                                s_scene_stuck_frames++;
+                                if (s_scene_stuck_frames >= 60) {
+                                    std::cout << "[Watchdog] Scene load flag stuck for "
+                                              << s_scene_stuck_frames
+                                              << " consecutive frames — force-clearing (safety net)." << std::endl;
+                                    *(volatile int*)(g_guest_memory + s_scene_loading_addr) = 0;
+                                    // Suppress stale pointer reads for 30 frames
+                                    if (s_suppress_hud_addr)
+                                        *(volatile int*)(g_guest_memory + s_suppress_hud_addr) = 30;
+                                    s_scene_stuck_frames = 0;
+                                }
+                                // Below threshold: do NOT clear — let the load finish.
+                            } else {
+                                s_scene_stuck_frames = 0;
+                            }
+                        } else {
+                            s_scene_stuck_frames = 0;
+                        }
+                    }
+
+                    /* Recover only a missed JNI hook.  The guest frame is the
+                     * primary poll owner; an unconditional host call doubled
+                     * the poll count on every frame. */
+                    if (sre_scene_shifter_tick_addr && sre_update_ticks_addr &&
+                        update_ticks_after == update_ticks_before) {
+                        g_emulator_64->call(sre_scene_shifter_tick_addr, {});
+                        host_scene_poll_calls++;
+                        std::cerr << "[SRE/FrameDiag] JNI hook missed; host poll fallback used at host_frame="
+                                  << completed_frames << std::endl;
+                    }
+
+                    /* ShowAdMaybe runs inside GameOverVC::Update. Starting a
+                     * scene load from that nested callback re-enters Lua/GC and
+                     * can spin at 0x14edd04. Drain the request only after the
+                     * complete updateApplication invocation has returned. */
+                    if (sre_gameover_respawn_tick_addr &&
+                        sre_gameover_respawn_controller_addr &&
+                        *(volatile uint64_t*)(g_guest_memory +
+                            sre_gameover_respawn_controller_addr) != 0) {
+                        g_emulator_64->call(sre_gameover_respawn_tick_addr, {});
+                        g_death_detected_countdown = 0;
+                    }
+
+                    // ── Auto Level Loader (debug) ────────────────────────────────
+                    // SWORDIGO_AUTO_LEVEL=<scene> [SWORDIGO_AUTO_SPAWN=<spawn>]
+                    // After boot stabilizes (~frame 200), requests a scene shift via
+                    // the guest scene-shifter vars so we can test in-game behavior
+                    // (e.g. timed object destruction) headlessly.
+                    // The guest scene shifter validates that the current controller
+                    // is a GameViewController, so menu-state requests fail safely.
+                    {
+                        static int      s_auto_state = 0;  /* 0=unresolved,1=armed,2=fired */
+                        static uint64_t s_ss_pending_va = 0, s_ss_target_va = 0, s_ss_spawn_va = 0;
+                        const char* auto_level = getenv("SWORDIGO_AUTO_LEVEL");
+                        if (auto_level && g_use_sre && g_loader_64 && g_guest_memory && s_auto_state != 2) {
+                            if (s_auto_state == 0) {
+                                s_ss_pending_va = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_pending");
+                                s_ss_target_va  = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_target");
+                                s_ss_spawn_va   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_scene_shift_spawn");
+                                std::cout << "[AutoLevel] resolved pending=0x" << std::hex << s_ss_pending_va
+                                          << " target=0x" << s_ss_target_va
+                                          << " spawn=0x" << s_ss_spawn_va << std::dec << std::endl;
+                                s_auto_state = 1;
+                            }
+                            if (s_auto_state == 1 && completed_frames > 200 &&
+                                s_ss_pending_va && s_ss_target_va) {
+                                int pending = *(volatile int*)(g_guest_memory + s_ss_pending_va);
+                                if (!pending) {
+                                    strncpy((char*)(g_guest_memory + s_ss_target_va), auto_level, 127);
+                                    const char* spawn = getenv("SWORDIGO_AUTO_SPAWN");
+                                    if (spawn && s_ss_spawn_va)
+                                        strncpy((char*)(g_guest_memory + s_ss_spawn_va), spawn, 63);
+                                    *(volatile int*)(g_guest_memory + s_ss_pending_va) = 1;
+                                    std::cout << "[AutoLevel] Scene shift request -> '" << auto_level
+                                              << "' spawn='" << (spawn ? spawn : "start") << "'" << std::endl;
+                                    s_auto_state = 2;
+                                }
+                            }
+                        }
+                    }
+
+
+
+
+                    // Run any threads spawned during this frame's updateApplication
+                    // (handles the edge case where spin count < 4 and the deadlock
+                    // unblock in run() did not trigger).
+                    if (g_emulator_64->has_pending_threads()) {
+                        g_emulator_64->run_pending_threads();
+                    }
+                }
+
+                if (g_step_one_frame) {
+                    g_step_one_frame = false;
+                    mod_toast("Stepped 1 frame", 0.8f);
+                }
+            }
+            g_swordfare_gui.update_console_backend();
+            // Update Memory Research live root pointers every frame
+            if (g_swordfare_gui.is_research_ready()) {
+                swordfare::research::InstanceRegistry::instance().tick();
+                swordfare::research::LiveRoots rr;
+                rr.gsc_va       = g_game_scene_controller;
+                rr.hero_va      = g_hero_obj;
+                rr.health_va    = g_hero_health_comp;
+                rr.mana_va      = g_hero_mana_comp;
+                rr.char_ctrl_va = g_hero_char_ctrl_comp;
+                g_swordfare_gui.update_research_roots(rr);
+            }
+
+            update_arm64_research_roots();
+
+            // ── Live memory engine tick ────────────────────────────────────
+            // Runs on the EMULATED frame, not on the render frame, so frozen
+            // values are re-applied and tracked objects re-resolved on the
+            // guest's own tick.  A wall-clock thread doing this would race the
+            // game's own writes to the same addresses.
+            if (g_swordfare_gui.is_research_ready() && g_guest_memory) {
+                static uint64_t s_research_frame = 0;
+                g_swordfare_gui.tick_research(++s_research_frame,
+                                              g_guest_memory, GUEST_MEM_SIZE);
+            }
+            // ── Auto Console Test (debug) ──────────────────────────────────
+            // SWORDIGO_AUTO_CONSOLE=1  submits two console commands headlessly
+            // and reports status/result after each (reproduces the
+            // "only the first console command works" bug). Waits for the game
+            // to actually be in-game (g_sre_last_lua_state set) before
+            // submitting, and polls for the status change between commands.
+            if (getenv("SWORDIGO_AUTO_CONSOLE") && g_use_sre && g_loader_64 && g_guest_memory &&
+                g_lua_console_ready) {
+                static int      s_console_test_state = 0;
+                static uint64_t s_cbuf = 0, s_cresult = 0, s_cpending = 0, s_cstatus = 0, s_lstate = 0;
+                static uint64_t s_centries = 0, s_cseen = 0, s_cruns = 0;
+                static uint64_t s_exec_entries = 0, s_exec_seen = 0, s_console_entry = 0, s_console_ok = 0;
+                static uint64_t s_prev_ok = 0;
+                static int      s_wait_frames = 0, s_cmd_idx = 1, s_uv_corrupt_seen = 0;
+                if (s_console_test_state == 0) {
+                    s_cbuf     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_buf");
+                    s_cresult  = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_result");
+                    s_cpending = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_pending");
+                    s_cstatus  = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_lua_console_status");
+                    s_lstate   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_last_lua_state");
+                    s_centries = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_console_service_entries");
+                    s_cseen    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_console_pending_seen");
+                    s_cruns    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_console_runs");
+                    s_exec_entries = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_exec_entries");
+                    s_exec_seen    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_exec_console_seen");
+                    s_console_entry= g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_console_entry");
+                    s_console_ok   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_console_exit_ok");
+                    std::cout << "[AutoConsole] resolved buf=0x" << std::hex << s_cbuf
+                              << " result=0x" << s_cresult << " pending=0x" << s_cpending
+                              << " status=0x" << s_cstatus
+                              << " last_lua_state=0x" << s_lstate
+                              << " entries=0x" << s_centries << " seen=0x" << s_cseen
+                              << " runs=0x" << s_cruns << std::dec << std::endl;
+                    s_console_test_state = 1;
+                }
+                auto dump_diag = [&](const std::string& tag) {
+                    uint64_t lstate = s_lstate ? *(uint64_t*)(g_guest_memory + s_lstate) : 0;
+                    // Vendored Lua GC state probe: lua_State +32 = global_State*
+                    uint64_t g_ = 0;
+                    unsigned gcstate = 0xFF;
+                    uint64_t totalbytes = 0, gcdept = 0, gray = 0, tmudata = 0, rootgc = 0;
+                    int gcstepmul = 0, gcpause = 0, sweepstrgc = 0;
+                    int uv_nodes = -1, uv_cycle = 0;
+                    if (lstate) {
+                        g_ = *(uint64_t*)(g_guest_memory + lstate + 32);
+                        if (g_ && g_ < 0x30000000ULL) {
+                            gcstate    = *(uint8_t*)(g_guest_memory + g_ + 33);
+                            sweepstrgc = *(int*)(g_guest_memory + g_ + 36);
+                            rootgc     = *(uint64_t*)(g_guest_memory + g_ + 40);
+                            gray       = *(uint64_t*)(g_guest_memory + g_ + 56);
+                            tmudata    = *(uint64_t*)(g_guest_memory + g_ + 80);
+                            totalbytes = *(uint64_t*)(g_guest_memory + g_ + 120);
+                            gcdept     = *(uint64_t*)(g_guest_memory + g_ + 136);
+                            gcpause    = *(int*)(g_guest_memory + g_ + 144);
+                            gcstepmul  = *(int*)(g_guest_memory + g_ + 148);
+                            /* Walk open-upvalue list (uvhead @ g+184, sentinel;
+                             * nodes linked via u.l.next @ +32) to detect cycles. */
+                            uint64_t head = g_ + 184;
+                            uint64_t uv = *(uint64_t*)(g_guest_memory + g_ + 216);
+                            int n = 0;
+                            while (uv && uv != head && n < 200000 &&
+                                   uv >= 0x1000000ULL && uv < 0x30000000ULL) {
+                                n++;
+                                uint64_t nx = *(uint64_t*)(g_guest_memory + uv + 32);
+                                if (nx == uv) { uv_cycle = 2; break; }  /* self-loop */
+                                uv = nx;
+                            }
+                            if (uv == head) uv_nodes = n;
+                            else if (n >= 200000) { uv_nodes = n; uv_cycle = 1; }
+                            else if (!(uv >= 0x1000000ULL && uv < 0x30000000ULL)) uv_cycle = 3;
+                        }
+                    }
+                    std::cout << "[AutoConsole] " << tag.c_str()
+                              << " entries=" << (s_centries ? *(volatile uint64_t*)(g_guest_memory + s_centries) : 0)
+                              << " seen="    << (s_cseen    ? *(volatile uint64_t*)(g_guest_memory + s_cseen)    : 0)
+                              << " runs="    << (s_cruns    ? *(volatile uint64_t*)(g_guest_memory + s_cruns)    : 0)
+                              << " exec="    << (s_exec_entries ? *(volatile uint64_t*)(g_guest_memory + s_exec_entries) : 0)
+                              << " exec_seen=" << (s_exec_seen ? *(volatile uint64_t*)(g_guest_memory + s_exec_seen) : 0)
+                              << " c_entry=" << (s_console_entry ? *(volatile uint64_t*)(g_guest_memory + s_console_entry) : 0)
+                              << " c_ok="   << (s_console_ok   ? *(volatile uint64_t*)(g_guest_memory + s_console_ok)   : 0)
+                              << " pending=" << *(volatile int*)(g_guest_memory + s_cpending)
+                              << " status="  << *(volatile int*)(g_guest_memory + s_cstatus)
+                              << " lstate="  << std::hex << lstate
+                              << " gc=" << (unsigned)gcstate
+                              << " tot=" << std::dec << totalbytes
+                              << " stepmul=" << gcstepmul << " pause=" << gcpause
+                              << " dept=" << gcdept
+                              << " gray=0x" << std::hex << gray << " tm=0x" << tmudata
+                              << " root=0x" << rootgc << std::dec
+                              << " sweepstrgc=" << sweepstrgc
+                              << " uv=" << uv_nodes << " uvcycle=" << uv_cycle << std::endl;
+                };
+                if (s_console_test_state == 1 && s_cbuf) {
+                    /* Wait until the game is in a level (last_lua_state set) */
+                    void* ls = s_lstate ? *(void**)(g_guest_memory + s_lstate) : 0;
+                    if (completed_frames > 300 && ls) {
+                        /* Reproduce the user's flow: run raijin_script.lua, then
+                         * Camera.ResetFocus(); then a trivial print — waiting for
+                         * the guest's completion counter between each. */
+                        std::cout << "[AutoConsole] starting 3-command test at frame "
+                                  << completed_frames << std::endl;
+                        s_cmd_idx = 1;
+                        static char s_raijin[4096] = {0};
+                        if (!s_raijin[0]) {
+                            const char* home = getenv("HOME");
+                            char p[512];
+                            snprintf(p, sizeof(p), "%s/.local/share/swordigo-desktop/lua_scripts/raijin_script.lua",
+                                     home ? home : ".");
+                            FILE* f = fopen(p, "rb");
+                            if (!f) f = fopen("raijin_script.lua", "rb");
+                            if (f) {
+                                size_t rd = fread(s_raijin, 1, sizeof(s_raijin) - 1, f);
+                                fclose(f);
+                                s_raijin[rd] = 0;
+                            } else {
+                                strcpy(s_raijin, "print('NO_RAIJIN_FILE')");
+                            }
+                        }
+                        strncpy((char*)(g_guest_memory + s_cbuf), s_raijin, 4094);
+                        *(volatile int*)(g_guest_memory + s_cstatus)  = 0;
+                        *(volatile int*)(g_guest_memory + s_cpending) = 1;
+                        std::cout << "[AutoConsole] submitted raijin_script at frame "
+                                  << completed_frames << std::endl;
+                        s_console_test_state = 2;
+                        s_wait_frames = 0;
+                    }
+                }
+                if (s_console_test_state == 2) {
+                    uint64_t ok = s_console_ok ? *(volatile uint64_t*)(g_guest_memory + s_console_ok) : 0;
+                    uint64_t ent = s_console_entry ? *(volatile uint64_t*)(g_guest_memory + s_console_entry) : 0;
+                    if (ok > s_prev_ok) {
+                        std::cout << "[AutoConsole] cmd" << s_cmd_idx << " COMPLETED (entry=" << ent
+                                  << " ok=" << ok << ") after " << s_wait_frames << " polls" << std::endl;
+                        dump_diag("after cmd" + std::to_string(s_cmd_idx) + ":");
+                        s_prev_ok = ok;
+                        if (s_cmd_idx == 1) {
+                            /* raijin_script is NOT a single-tick command: it
+                             * registers ~40 Program.Wait timers that keep
+                             * firing for ~14s afterwards, and the game swaps
+                             * its lua_State during that window (the original
+                             * bug: a command fired AFTER the raijin tail ran
+                             * on a stale state). Wait out the tail before
+                             * firing the next command. */
+                            std::cout << "[AutoConsole] cmd1 done — waiting out raijin tail "
+                                      << "(1400 frames) before cmd2" << std::endl;
+                            s_console_test_state = 3;  /* raijin tail cooldown */
+                            s_wait_frames = 0;
+                        } else if (s_cmd_idx < 3) {
+                            s_cmd_idx++;
+                            const char* c = (s_cmd_idx == 2) ? "Camera.ResetFocus();" : "print('AUTO_CMD3_OK')";
+                            strncpy((char*)(g_guest_memory + s_cbuf), c, 4094);
+                            *(volatile int*)(g_guest_memory + s_cstatus)  = 0;
+                            *(volatile int*)(g_guest_memory + s_cpending) = 1;
+                            std::cout << "[AutoConsole] submitted cmd" << s_cmd_idx
+                                      << " ('" << c << "') at frame " << completed_frames << std::endl;
+                            s_wait_frames = 0;
+                        } else {
+                            std::cout << "[AutoConsole] TEST_COMPLETE" << std::endl;
+                            s_console_test_state = 5;
+                            s_wait_frames = 0;
+                        }
+                    } else if (++s_wait_frames % 120 == 0) {
+                        dump_diag("waiting cmd" + std::to_string(s_cmd_idx) + ":");
+                    } else if (s_wait_frames > 1500) {
+                        std::cout << "[AutoConsole] TIMEOUT waiting for cmd" << s_cmd_idx
+                                  << " (entry=" << ent << " ok=" << ok << ")" << std::endl;
+                        std::cout << "[AutoConsole] TEST_COMPLETE" << std::endl;
+                        s_console_test_state = 5;
+                        s_wait_frames = 0;
+                    }
+                }
+                if (s_console_test_state == 3) {
+                    /* Raijin tail cooldown: watch the lua_State pointer for the
+                     * swap while the script's Program.Wait timers finish. */
+                    static uint64_t s_tail_lstate = 0;
+                    uint64_t lstate = s_lstate ? *(uint64_t*)(g_guest_memory + s_lstate) : 0;
+                    if (!s_tail_lstate) s_tail_lstate = lstate;
+                    if (++s_wait_frames % 120 == 0) {
+                        std::cout << "[AutoConsole] tail " << s_wait_frames << " lstate=0x"
+                                  << std::hex << lstate << std::dec << std::endl;
+                        if (lstate && lstate != s_tail_lstate) {
+                            std::cout << "[AutoConsole] *** lua_State SWAPPED 0x" << std::hex
+                                      << s_tail_lstate << " -> 0x" << lstate << std::dec
+                                      << " at frame " << completed_frames << std::endl;
+                            s_tail_lstate = lstate;
+                        }
+                        dump_diag("tail:");
+                    }
+                    if (s_wait_frames >= 1400) {
+                        std::cout << "[AutoConsole] raijin tail elapsed — firing cmd2 at frame "
+                                  << completed_frames << std::endl;
+                        s_cmd_idx = 2;
+                        strncpy((char*)(g_guest_memory + s_cbuf), "Camera.ResetFocus();", 4094);
+                        *(volatile int*)(g_guest_memory + s_cstatus)  = 0;
+                        *(volatile int*)(g_guest_memory + s_cpending) = 1;
+                        std::cout << "[AutoConsole] submitted cmd2 ('Camera.ResetFocus();')"
+                                  << std::endl;
+                        s_console_test_state = 2;
+                        s_wait_frames = 0;
+                    }
+                }
+                if (s_console_test_state == 5) {
+                    /* Watch the open-upvalue list for corruption (post-raijin). */
+                    if (++s_wait_frames % 120 == 0) {
+                        uint64_t lstate = s_lstate ? *(uint64_t*)(g_guest_memory + s_lstate) : 0;
+                        uint64_t g_ = lstate ? *(uint64_t*)(g_guest_memory + lstate + 32) : 0;
+                        int n = -1, cyc = 0;
+                        if (g_ && g_ < 0x30000000ULL) {
+                            uint64_t head = g_ + 184;
+                            uint64_t uv = *(uint64_t*)(g_guest_memory + g_ + 216);
+                            int cnt = 0;
+                            uint64_t first_bad = 0;
+                            while (uv && uv != head && cnt < 500000 &&
+                                   uv >= 0x1000000ULL && uv < 0x30000000ULL) {
+                                cnt++;
+                                uint64_t nx = *(uint64_t*)(g_guest_memory + uv + 32);
+                                if (nx == uv) { cyc = 2; first_bad = uv; break; }
+                                if (!(nx >= 0x1000000ULL && nx < 0x30000000ULL)) { cyc = 3; first_bad = uv; break; }
+                                uv = nx;
+                            }
+                            if (uv == head) n = cnt;
+                            else if (cnt >= 500000) { n = cnt; cyc = 1; }
+                            if (cyc && !s_uv_corrupt_seen) {
+                                s_uv_corrupt_seen = 1;
+                                std::cout << "[AutoConsole] *** UV LIST CORRUPTED at frame "
+                                          << completed_frames << " nodes=" << n
+                                          << " cycle=" << cyc << " first_bad=0x" << std::hex
+                                          << first_bad << " head=0x" << head << std::dec
+                                          << " gcstate=" << (unsigned)*(uint8_t*)(g_guest_memory + g_ + 33)
+                                          << std::endl;
+                            }
+                        }
+                        if (s_wait_frames % 600 == 0)
+                            dump_diag("watch:");
+                    }
+                }
+            }
+
+            // Render custom sky (after game frame, using depth buffer trick)
+            if (g_sky.enabled && g_display_active) {
+                g_sky.update(dt_seconds);
+                g_sky.render(g_win_w, g_win_h);
+            }
+            // --- Death recovery: handled by SRE ShowAdMaybe hook ---
+            // The old system used execv() to restart the entire process after 3s.
+            // Now, SRE hooks GameOverViewController::ShowAdMaybe() and directly
+            // calls GameOverViewDidContinue() — proper in-game respawn from checkpoint.
+            // This countdown is kept only for logging/diagnostics.
+            if (g_death_detected_countdown > 0) {
+                g_death_detected_countdown--;
+                if (g_death_detected_countdown == 0) {
+                    std::cout << "\n[SRE] Death timeout reached — respawn should have been handled by ShowAdMaybe hook" << std::endl;
+                    std::cout << "[SRE] If you're stuck, tap the game over screen to trigger respawn" << std::endl;
+                }
+            }
+            
+            io_thread_poll();
+
+            // Handle async snapshot callbacks
+            extern int g_snapshot_load_pending_count; // counter, not boolean
+            extern bool g_snapshot_has_data;
+            extern std::vector<uint8_t> g_snapshot_data;
+            while (g_snapshot_load_pending_count > 0 && snapshotLoaded) {
+                g_snapshot_load_pending_count--;
+                if (g_snapshot_has_data && !g_snapshot_data.empty()) {
+                    static uint32_t save_buf_addr = 0x40000000;
+                    uint32_t array_len = g_snapshot_data.size();
+                    if (save_buf_addr + 4 + array_len > 0xE0000000ULL) {
+                        std::cerr << "[SAVE] Save data too large (" << array_len << " bytes), skipping" << std::endl;
+                        continue;
+                    }
+                    *(uint32_t*)(g_guest_memory + save_buf_addr) = array_len;
+                    memcpy(g_guest_memory + save_buf_addr + 4, g_snapshot_data.data(), array_len);
+                    std::cout << "[Callback64] snapshotLoaded with " << array_len << " bytes of save data" << std::endl;
+                    g_emulator_64->call(snapshotLoaded, {env_ptr, 0, 0, (uint64_t)save_buf_addr});
+                    g_snapshot_has_data = false;
+                } else {
+                    std::cout << "[Callback64] snapshotLoaded(null, null) — no saved game" << std::endl;
+                    g_emulator_64->call(snapshotLoaded, {env_ptr, 0, 0, 0});
+                }
+            }
+            
+            if (g_display_active) {
+#ifdef VULKAN_BACKEND
+                if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    g_vk_backend.begin_frame();
+                } else
+#endif
+                {
+                    fbo_begin_game();
+                }
+            }
+            
+            // --- Run deferred threads (from pthread_create) ---
+            // Scene transitions spawn loading threads. Running them inline
+            // (nested uc_emu_start) corrupts state. Run them here between frames.
+            if (g_emulator_64->has_pending_threads()) {
+                std::cout << "[Diag64] Frame " << completed_frames 
+                          << " running deferred threads" << std::endl;
+                g_emulator_64->run_pending_threads();
+            }
+            
+            if (sre_menu_active_addr) {
+                *(int32_t*)(g_guest_memory + sre_menu_active_addr) = 0;
+            }
+
+            // ── SRE Lua write-back ─────────────────────────────────────────────
+            // Character.SetLevel / SetExp / SetHealth / SetMana / SetCoins all
+            // store a pending request in three guest-side volatile variables.
+            // The host must poll them here and write the value into the GameState
+            // structure so the change actually takes effect in emulated memory.
+            if (sre_char_set_pending_addr && sre_char_set_field_addr && sre_char_set_value_addr &&
+                g_guest_memory)
+            {
+                int pending = *(volatile int*)(g_guest_memory + sre_char_set_pending_addr);
+                if (pending) {
+                    int field = *(volatile int*)(g_guest_memory + sre_char_set_field_addr);
+                    int value = *(volatile int*)(g_guest_memory + sre_char_set_value_addr);
+
+                    // Clear the flag immediately so we don't double-apply
+                    *(volatile int*)(g_guest_memory + sre_char_set_pending_addr) = 0;
+
+                    if (sre_gamestate_ptr_addr) {
+                        uint64_t gs = *(uint64_t*)(g_guest_memory + sre_gamestate_ptr_addr);
+                        if (gs != 0) {
+                            char* gs_host = (char*)g_guest_memory + gs;
+                            uint64_t hero_obj = 0;
+                            uint64_t hero_health_comp = 0;
+                            uint64_t hero_mana_comp = 0;
+                            bool is_64bit = false;
+
+                            if (sre_hero_obj_addr) {
+                                is_64bit = true;
+                                hero_obj = *(uint64_t*)(g_guest_memory + sre_hero_obj_addr);
+                            }
+                            if (sre_hero_health_comp_addr) {
+                                hero_health_comp = *(uint64_t*)(g_guest_memory + sre_hero_health_comp_addr);
+                            }
+                            if (sre_hero_mana_comp_addr) {
+                                hero_mana_comp = *(uint64_t*)(g_guest_memory + sre_hero_mana_comp_addr);
+                            }
+
+                            extern uint32_t g_hero_obj;
+                            extern uint32_t g_hero_health_comp;
+                            extern uint32_t g_hero_mana_comp;
+
+                            uint64_t target_hero_obj = is_64bit ? hero_obj : g_hero_obj;
+                            uint64_t target_health_comp = is_64bit ? hero_health_comp : g_hero_health_comp;
+                            uint64_t target_mana_comp = is_64bit ? hero_mana_comp : g_hero_mana_comp;
+
+                            switch (field) {
+                                case 1: // level
+                                    *(int*)(gs_host + 0xB8) = value;
+                                    if (target_hero_obj) {
+                                        if (is_64bit) {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x64) = value;
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x94) = value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x64) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetLevel -> %d\n", value);
+                                    break;
+                                case 2: // exp / XP
+                                    *(int*)(gs_host + 0xB4) = value;
+                                    if (target_hero_obj) {
+                                        if (is_64bit) {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x60) = value;
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x90) = value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_hero_obj + 0x60) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetExp -> %d\n", value);
+                                    break;
+                                case 3: // current HP
+                                    *(int*)(gs_host + 0xA8) = value;
+                                    if (target_health_comp) {
+                                        if (is_64bit) {
+                                            *(float*)(g_guest_memory + target_health_comp + 0x1c) = (float)value;
+                                            *(float*)(g_guest_memory + target_health_comp + 0x20) = (float)value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_health_comp + 0x7c) = value;
+                                            *(int*)(g_guest_memory + target_health_comp + 0x80) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetHealth -> %d\n", value);
+                                    break;
+                                case 4: // current mana
+                                    *(int*)(gs_host + 0xAC) = value;
+                                    if (target_mana_comp) {
+                                        if (is_64bit) {
+                                            *(float*)(g_guest_memory + target_mana_comp + 0x1c) = (float)value;
+                                            *(float*)(g_guest_memory + target_mana_comp + 0x20) = (float)value;
+                                        } else {
+                                            *(int*)(g_guest_memory + target_mana_comp + 0x40) = value;
+                                        }
+                                    }
+                                    printf("[SRE-WB] SetMana -> %d\n", value);
+                                    break;
+                                case 5: // coins
+                                    *(int*)(gs_host + 0xB0) = value;
+                                    printf("[SRE-WB] SetCoins -> %d\n", value);
+                                    break;
+                                default:
+                                    printf("[SRE-WB] Unknown field %d (value=%d) — ignored\n", field, value);
+                                    break;
+                            }
+                        }
+                    }
+                }
+            }
+            // ── end SRE Lua write-back ─────────────────────────────────────────
+
+            g_emulator_64->call(drawApp, {env_ptr, 0});
+
+            if (g_display_active) {
+#ifdef VULKAN_BACKEND
+                if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    // Vulkan frame end + present is done after overlays
+                } else
+#endif
+                {
+                    draw_batcher_flush(); // Flush any pending batched draws
+                    
+                    // Read background data from SRE → feed FBO shaders
+                    {
+                        extern float g_bg_depth, g_bg_scale;
+                        extern float g_bg_ambient_r, g_bg_ambient_g, g_bg_ambient_b;
+                        extern float g_portal_active, g_portal_world_x, g_portal_world_y, g_portal_world_z;
+                        extern float g_portal_color_r, g_portal_color_g, g_portal_color_b;
+                        extern float g_portal_intensity, g_portal_speed;
+                        
+                        if (bg_depth_addr)
+                            g_bg_depth = *(float*)(g_guest_memory + bg_depth_addr);
+                        if (bg_scale_addr)
+                            g_bg_scale = *(float*)(g_guest_memory + bg_scale_addr);
+                        
+                        // Read portal effect state
+                        if (portal_active_addr) {
+                            int active = *(int*)(g_guest_memory + portal_active_addr);
+                            g_portal_active = active ? 1.0f : 0.0f;
+                            if (active && portal_x_addr) {
+                                g_portal_world_x = *(float*)(g_guest_memory + portal_x_addr);
+                                g_portal_world_y = *(float*)(g_guest_memory + portal_y_addr);
+                                g_portal_world_z = *(float*)(g_guest_memory + portal_z_addr);
+                                // Read actual portal color from game data
+                                if (portal_color_r_addr) {
+                                    g_portal_color_r = *(float*)(g_guest_memory + portal_color_r_addr);
+                                    g_portal_color_g = *(float*)(g_guest_memory + portal_color_g_addr);
+                                    g_portal_color_b = *(float*)(g_guest_memory + portal_color_b_addr);
+                                }
+                                // Read full VP matrix (16 floats) for portal positioning
+                                if (portal_vp_matrix_addr) {
+                                    extern float g_portal_vp_matrix[16];
+                                    float* src = (float*)(g_guest_memory + portal_vp_matrix_addr);
+                                    for (int i = 0; i < 16; i++) g_portal_vp_matrix[i] = src[i];
+                                }
+                            }
+                        }
+                    }
+                    
+                    /* === PostFX Auto-Disable in Menus ===
+                     * DISABLED — Unreliable due to incomplete GUI hook coverage.
+                     * We only control ~8 DrawRect hooks but the engine has many
+                     * more GUI views (map, pause, equipment, shops, etc.) that
+                     * we can't detect yet. Re-enable once we hook a reliable
+                     * frame-level signal (e.g. ProgramState screen type, or a
+                     * top-level "is gameplay active" flag from the engine).
+                     *
+                     * Infrastructure in place:
+                     *   SRE:  g_sre_menu_active (volatile int, exported)
+                     *         Set by NewMenuView/GUIAlertView/GUISlider DrawRect hooks
+                     *   Host: sre_menu_active_addr, postfx_user_preset, etc.
+                     *         Reads flag, suppresses PostFX, restores on menu close
+                     */
+
+                    // Handshake: copy guest hero position to host global for shader lighting
+                    g_host_hero_pos[0] = g_sre_hero_pos_x_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_x_addr) : 0.0f;
+                    g_host_hero_pos[1] = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
+                    g_host_hero_pos[2] = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
+
+                    fbo_end_game_and_blit(g_draw_w, g_draw_h, g_fbo_mode, &g_postfx);
+                    
+                    // Render portal in vanilla mode — DISABLED pending RE of vertex data
+                    // if (!fbo_is_active()) {
+                    //     fbo_draw_portal_vanilla(g_draw_w, g_draw_h);
+                    // }
+                    
+                    // Reset per-frame effect counters for next frame
+                    if (effect_frame_reset_addr) {
+                        g_emulator_64->call(effect_frame_reset_addr, {});
+                    }
+                    
+                    // === SRE Music Command Processing ===
+                    // Read guest globals and dispatch to host OpenAL
+                    if (sre_music_load_pending_addr) {
+                        int load_pending = *(int*)(g_guest_memory + sre_music_load_pending_addr);
+                        if (load_pending) {
+                            // Read music name from guest memory
+                            char name_buf[256] = {0};
+                            memcpy(name_buf, g_guest_memory + sre_music_load_name_addr, 255);
+                            name_buf[255] = 0;
+                            
+                            // Clear pending flag in guest
+                            int zero = 0;
+                            memcpy(g_guest_memory + sre_music_load_pending_addr, &zero, 4);
+                            
+                            // Load and play via host API
+                            sre_music_host_load(std::string(name_buf));
+                        }
+                        
+                        int play_pending = *(int*)(g_guest_memory + sre_music_play_pending_addr);
+                        if (play_pending) {
+                            sre_music_host_play();
+                            int zero = 0;
+                            memcpy(g_guest_memory + sre_music_play_pending_addr, &zero, 4);
+                        }
+                        
+                        int pause_pending = *(int*)(g_guest_memory + sre_music_pause_pending_addr);
+                        if (pause_pending) {
+                            sre_music_host_pause();
+                            int zero = 0;
+                            memcpy(g_guest_memory + sre_music_pause_pending_addr, &zero, 4);
+                        }
+                        
+                        int stop_pending = *(int*)(g_guest_memory + sre_music_stop_pending_addr);
+                        if (stop_pending) {
+                            sre_music_host_stop();
+                            int zero = 0;
+                            memcpy(g_guest_memory + sre_music_stop_pending_addr, &zero, 4);
+                        }
+                        
+                        int vol_dirty = *(int*)(g_guest_memory + sre_music_volume_dirty_addr);
+                        if (vol_dirty) {
+                            float vol = *(float*)(g_guest_memory + sre_music_volume_addr);
+                            // Apply duck multiplier on top of guest volume
+                            vol *= s_duck_volume;
+                            sre_music_host_set_volume(vol);
+                            int zero = 0;
+                            memcpy(g_guest_memory + sre_music_volume_dirty_addr, &zero, 4);
+                        }
+                        
+                        int loop_dirty = *(int*)(g_guest_memory + sre_music_looping_dirty_addr);
+                        if (loop_dirty) {
+                            int looping = *(int*)(g_guest_memory + sre_music_looping_addr);
+                            sre_music_host_set_looping(looping != 0);
+                            int zero = 0;
+                            memcpy(g_guest_memory + sre_music_looping_dirty_addr, &zero, 4);
+                        }
+                        
+                        // === Host-side music ducking ===
+                        // Triggered by 0item.wav asset loading (boss kill / XP sack SFX).
+                        // 3-phase: fade down → hold low → fade back up.
+                        if (g_music_duck_trigger) {
+                            g_music_duck_trigger = 0;
+                            s_duck_phase = 1;
+                            s_duck_timer = DUCK_FADE_DOWN_TIME;
+                            std::cout << "[SRE-Music] Duck triggered (0item.wav detected)" << std::endl;
+                        }
+                        
+                        if (s_duck_phase > 0) {
+                            s_duck_timer -= dt_seconds;
+                            float prev_duck = s_duck_volume;
+                            
+                            if (s_duck_phase == 1) {
+                                // Phase 1: fading down
+                                float progress = 1.0f - (s_duck_timer / DUCK_FADE_DOWN_TIME);
+                                if (progress < 0.0f) progress = 0.0f;
+                                if (progress > 1.0f) progress = 1.0f;
+                                s_duck_volume = 1.0f - progress * (1.0f - DUCK_LOW_VOLUME);
+                                if (s_duck_timer <= 0.0f) {
+                                    s_duck_phase = 2;
+                                    s_duck_timer = DUCK_HOLD_TIME;
+                                    s_duck_volume = DUCK_LOW_VOLUME;
+                                }
+                            } else if (s_duck_phase == 2) {
+                                // Phase 2: holding low
+                                s_duck_volume = DUCK_LOW_VOLUME;
+                                if (s_duck_timer <= 0.0f) {
+                                    s_duck_phase = 3;
+                                    s_duck_timer = DUCK_FADE_UP_TIME;
+                                }
+                            } else if (s_duck_phase == 3) {
+                                // Phase 3: fading back up
+                                float progress = 1.0f - (s_duck_timer / DUCK_FADE_UP_TIME);
+                                if (progress < 0.0f) progress = 0.0f;
+                                if (progress > 1.0f) progress = 1.0f;
+                                s_duck_volume = DUCK_LOW_VOLUME + progress * (1.0f - DUCK_LOW_VOLUME);
+                                if (s_duck_timer <= 0.0f) {
+                                    s_duck_phase = 0;
+                                    s_duck_volume = 1.0f;
+                                    std::cout << "[SRE-Music] Duck complete — volume restored" << std::endl;
+                                }
+                            }
+                            
+                            // Apply ducked volume to OpenAL
+                            if (s_duck_volume != prev_duck && sre_music_volume_addr) {
+                                float guest_vol = *(float*)(g_guest_memory + sre_music_volume_addr);
+                                sre_music_host_set_volume(guest_vol * s_duck_volume);
+                            }
+                        }
+                        
+                        // Music loop watchdog: if looping is enabled but source
+                        // has stopped (e.g. OGG stream ended), restart it.
+                        // AL_LOOPING doesn't always work with streamed audio.
+                        if (sre_music_looping_addr) {
+                            int looping = *(int*)(g_guest_memory + sre_music_looping_addr);
+                            if (looping && !sre_music_host_is_playing()) {
+                                // Source stopped but should loop — restart
+                                sre_music_host_play();
+                            }
+                        }
+                    }
+
+                    // === SRE LNI Command Processing ===
+                    if (sre_lni_pending_addr) {
+                        int lni_pending = *(int*)(g_guest_memory + sre_lni_pending_addr);
+                        if (lni_pending) {
+                            char cmd_buf[64] = {0};
+                            memcpy(cmd_buf, g_guest_memory + sre_lni_command_addr, 63);
+                            cmd_buf[63] = 0;
+                            
+                            std::string cmd(cmd_buf);
+                            std::cout << "[SRE-LNI] Processing command: '" << cmd << "'" << std::endl;
+                            
+                            if (cmd == "quit") {
+                                std::cout << "[SRE-LNI] Exiting requested by game mod." << std::endl;
+                                exit(0);
+                            } else if (cmd == "copyToClipboard") {
+                                char arg1_buf[512] = {0};
+                                memcpy(arg1_buf, g_guest_memory + sre_lni_arg1_addr, 511);
+                                ImGui::SetClipboardText(arg1_buf);
+                                std::cout << "[SRE-LNI] Copied to clipboard: '" << arg1_buf << "'" << std::endl;
+                            } else if (cmd == "openUrl" || cmd == "openURL") {
+                                char arg1_buf[512] = {0};
+                                memcpy(arg1_buf, g_guest_memory + sre_lni_arg1_addr, 511);
+                                if (strcmp(arg1_buf, "overlay:") == 0 || strcmp(arg1_buf, "overlay") == 0) {
+                                    g_swordfare_gui.set_mod_overlay_visible(true);
+                                    std::cout << "[SRE-LNI] Mod requested opening overlay menu." << std::endl;
+                                }
+                            }
+                            
+                            // Clear pending flag in guest
+                            int zero = 0;
+                            memcpy(g_guest_memory + sre_lni_pending_addr, &zero, 4);
+                        }
+                    }
+
+                    // Sync overlay state with guest controls_hidden
+                    if (sre_controls_hidden_addr && g_guest_memory) {
+                        int state = g_swordfare_gui.is_mod_overlay_visible() ? 1 : 0;
+                        memcpy(g_guest_memory + sre_controls_hidden_addr, &state, 4);
+                    }
+                }
+            }
+
+            // Camera override not yet ported to ARM64 (cam_apply uses Emulator* / ARM32 registers)
+            // cam_apply(g_emulator_64, g_guest_memory);
+
+            // Render GUI overlay (F1 toggle)
+            if (g_display_active && gui_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+                g_gui.render(mouse_x, mouse_y, mouse_pressed, g_win_w, g_win_h);
+            }
+            
+            // Render controls editor overlay (F2 toggle)
+            if (g_display_active && g_input_config.is_editing()) {
+                g_input_config.render_editor(g_win_w, g_win_h, mouse_x, mouse_y, mouse_pressed);
+                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+                glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                // Controls editor header text
+                {
+                    std::string mode_str = "POSITION";
+                    if (g_input_config.get_editor_mode() == EDITOR_REBIND) mode_str = "REBIND (click button, press key)";
+                    g_gui.draw_string("CONTROLS EDITOR [" + mode_str + "]  |  F2=Save & Close  R=Toggle Rebind", 10, g_win_h - 20, 1.3f, 100, 200, 255, 255);
+                    g_gui.draw_string("Blue=Move  Green=Action  Orange=Menu  Purple=Magic Macro  Yellow=Custom", 10, g_win_h - 38, 1.1f, 180, 180, 200, 200);
+                }
+                // Draw readable button labels on each circle
+                {
+                    float sx = (float)g_win_w / 960.0f;
+                    float sy = (float)g_win_h / 544.0f;
+                    for (int i = 0; i < g_input_config.button_count(); i++) {
+                        TouchButton* btn = g_input_config.get_button(i);
+                        if (!btn) continue;
+                        float wx = btn->game_x * sx;
+                        float wy = btn->game_y * sy;
+                        float wr = btn->radius * std::min(sx, sy) * 0.7f;
+                        // Display name
+                        std::string dname = btn->display_name.empty() ? btn->name : btn->display_name;
+                        // Key binding text
+                        std::string key1 = InputConfig::scancode_name(btn->sdl_scancode);
+                        std::string key2 = InputConfig::scancode_name(btn->sdl_scancode_alt);
+                        std::string keytxt = "[" + key1;
+                        if (btn->sdl_scancode_alt > 0) keytxt += "/" + key2;
+                        keytxt += "]";
+                        // Color
+                        uint8_t cr = 255, cg = 255, cb = 255;
+                        if (btn->is_macro) { cr = 200; cg = 140; cb = 255; }
+                        else if (btn->is_custom) { cr = 255; cg = 255; cb = 100; }
+                        // Draw name above center
+                        g_gui.draw_string(dname, (int)(wx - dname.size() * 4), (int)(wy + 6), 1.0f, cr, cg, cb, 255);
+                        // Draw key binding below center
+                        g_gui.draw_string(keytxt, (int)(wx - keytxt.size() * 3.5f), (int)(wy - 10), 0.9f, 180, 180, 180, 200);
+                        if (btn->is_macro) {
+                            g_gui.draw_string("MACRO", (int)(wx - 16), (int)(wy - wr - 14), 0.8f, 180, 80, 220, 200);
+                        }
+                    }
+                }
+                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+                glPopAttrib();
+            }
+            
+            // Render F3 debug overlay
+            if (g_display_active && debug_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+                glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+                // ── Panel background ──
+                int panel_h = 380;
+                glColor4ub(10, 10, 18, 210);
+                glBegin(GL_QUADS);
+                glVertex2f(8, g_win_h - 8); glVertex2f(440, g_win_h - 8);
+                glVertex2f(440, g_win_h - panel_h); glVertex2f(8, g_win_h - panel_h);
+                glEnd();
+                // Accent bar (top)
+                glColor4ub(80, 200, 120, 255);
+                glBegin(GL_QUADS);
+                glVertex2f(8, g_win_h - 8); glVertex2f(440, g_win_h - 8);
+                glVertex2f(440, g_win_h - 11); glVertex2f(8, g_win_h - 11);
+                glEnd();
+
+                char dbg[256];
+                float y = g_win_h - 30;
+                float x = 20;
+                float lh = 17;  // line height
+
+                // ── Section: Performance ──
+                snprintf(dbg, sizeof(dbg), "FPS: %.1f", fps);
+                g_gui.draw_string(dbg, x, y, 2.0f, 80, 255, 120, 255); y -= 28;
+
+                snprintf(dbg, sizeof(dbg), "Frame: %d", completed_frames);
+                g_gui.draw_string(dbg, x, y, 1.3f, 200, 200, 210, 255); y -= lh;
+
+                // ── Section: Render Stats ──
+                snprintf(dbg, sizeof(dbg), "Draws: %d   Verts: %d   TexBinds: %d",
+                         g_frame_stats.draw_calls, g_frame_stats.vertices_submitted, g_frame_stats.texture_binds);
+                g_gui.draw_string(dbg, x, y, 1.1f, 160, 160, 175, 255); y -= lh;
+                snprintf(dbg, sizeof(dbg), "State: %d   MatOps: %d   TexUps: %d",
+                         g_frame_stats.state_changes, g_frame_stats.matrix_ops, g_frame_stats.tex_uploads);
+                g_gui.draw_string(dbg, x, y, 1.1f, 160, 160, 175, 255); y -= lh + 4;
+
+                // ── Section: Display ──
+                snprintf(dbg, sizeof(dbg), "Render: %dx%d  Window: %dx%d  Draw: %dx%d",
+                         GAME_W, GAME_H, g_win_w, g_win_h, g_draw_w, g_draw_h);
+                g_gui.draw_string(dbg, x, y, 1.1f, 130, 130, 155, 255); y -= lh;
+
+                snprintf(dbg, sizeof(dbg), "Mouse: %d,%d   DT: %.4fs", mouse_x, mouse_y, dt_seconds);
+                g_gui.draw_string(dbg, x, y, 1.1f, 130, 130, 155, 255); y -= lh + 4;
+
+                // ── Section: Engine & Backend ──
+                // Separator line
+                glColor4ub(60, 60, 80, 200);
+                glBegin(GL_QUADS);
+                glVertex2f(x, y + 6); glVertex2f(420, y + 6);
+                glVertex2f(420, y + 5); glVertex2f(x, y + 5);
+                glEnd();
+                y -= 4;
+
+                // CPU Engine
+                const char* engine_str = g_emulator_64 ? g_emulator_64->engine_name() : "None";
+                bool is_dynarmic = g_emulator_64 && strcmp(g_emulator_64->engine_name(), "Dynarmic") == 0;
+                snprintf(dbg, sizeof(dbg), "CPU Engine: %s", engine_str);
+                g_gui.draw_string(dbg, x, y, 1.3f,
+                    is_dynarmic ? 255 : 200,   // Dynarmic = gold, Unicorn = cyan
+                    is_dynarmic ? 200 : 220,
+                    is_dynarmic ? 60  : 255, 255);
+                y -= lh;
+
+                // Graphics API
+                const char* api_str = (g_graphics_api == GraphicsAPI::VULKAN) ? "Vulkan" : "OpenGL";
+                snprintf(dbg, sizeof(dbg), "Graphics: %s", api_str);
+                g_gui.draw_string(dbg, x, y, 1.3f, 100, 200, 255, 255); y -= lh;
+
+                // Scale mode
+                const char* fbo_mode_str = "Unknown";
+                if (g_fbo_mode == FBOScale::SHARP_BILINEAR) fbo_mode_str = "Sharp-Bilinear";
+                else if (g_fbo_mode == FBOScale::NEAREST) fbo_mode_str = "Nearest";
+                else if (g_fbo_mode == FBOScale::CRT_SCANLINE) fbo_mode_str = "CRT Scanline";
+                else if (g_fbo_mode == FBOScale::FSR) fbo_mode_str = "FSR 1.0";
+                snprintf(dbg, sizeof(dbg), "Scaler: %s", fbo_mode_str);
+                g_gui.draw_string(dbg, x, y, 1.2f, 255, 200, 100, 255); y -= lh;
+
+                // PostFX
+                if (g_postfx.enabled) {
+                    snprintf(dbg, sizeof(dbg), "PostFX: %s", g_postfx.preset_name);
+                    g_gui.draw_string(dbg, x, y, 1.2f, 255, 160, 80, 255);
+                } else {
+                    g_gui.draw_string("PostFX: Off", x, y, 1.2f, 100, 100, 110, 200);
+                }
+                y -= lh;
+
+                // Binary info
+                const BinaryInfo* binfo = g_binary_selector.get_loaded_info();
+                if (binfo) {
+                    snprintf(dbg, sizeof(dbg), "Binary: %s (%s)", binfo->filename.c_str(), binfo->label.c_str());
+                } else {
+                    snprintf(dbg, sizeof(dbg), "Binary: %s", g_lib_name.c_str());
+                }
+                g_gui.draw_string(dbg, x, y, 1.1f, 120, 180, 255, 255); y -= lh;
+
+                // Speed
+                snprintf(dbg, sizeof(dbg), "Speed: %s  %s", mod_speed_label(), g_game_paused ? "|| PAUSED" : "");
+                g_gui.draw_string(dbg, x, y, 1.2f, 255, 180, 50, 255); y -= lh + 4;
+
+                // ── Section: Player Stats ──
+                if (sre_gui_scene_active_addr && g_guest_memory) {
+                    int scene_active = *(int*)(g_guest_memory + sre_gui_scene_active_addr);
+                    if (scene_active && sre_player_hp_addr) {
+                        int hp     = *(int*)(g_guest_memory + sre_player_hp_addr);
+                        int max_hp = *(int*)(g_guest_memory + sre_player_max_hp_addr);
+                        int mana   = *(int*)(g_guest_memory + sre_player_mana_addr);
+                        int max_mn = *(int*)(g_guest_memory + sre_player_max_mana_addr);
+                        int coins  = *(int*)(g_guest_memory + sre_player_coins_addr);
+                        int xp     = sre_player_xp_addr ? *(int*)(g_guest_memory + sre_player_xp_addr) : 0;
+                        int level  = sre_player_level_addr ? *(int*)(g_guest_memory + sre_player_level_addr) : 0;
+                        int atk    = sre_player_atk_level_addr ? *(int*)(g_guest_memory + sre_player_atk_level_addr) : 0;
+
+                        // Separator
+                        glColor4ub(60, 60, 80, 200);
+                        glBegin(GL_QUADS);
+                        glVertex2f(x, y + 6); glVertex2f(420, y + 6);
+                        glVertex2f(420, y + 5); glVertex2f(x, y + 5);
+                        glEnd();
+                        y -= 4;
+
+                        snprintf(dbg, sizeof(dbg), "HP: %d/%d  Mana: %d/%d  Coins: %d",
+                                 hp, max_hp, mana, max_mn, coins);
+                        int hp_pct = max_hp > 0 ? (hp * 100 / max_hp) : 0;
+                        uint8_t hr = hp_pct > 50 ? 80 : 255;
+                        uint8_t hg = hp_pct > 25 ? 255 : 80;
+                        g_gui.draw_string(dbg, x, y, 1.3f, hr, hg, 80, 255); y -= lh;
+
+                        snprintf(dbg, sizeof(dbg), "Lv.%d  XP: %d  ATK: %d", level, xp, atk);
+                        g_gui.draw_string(dbg, x, y, 1.3f, 180, 140, 255, 255); y -= lh;
+                    }
+                }
+
+                // ── Hotkey legend ──
+                y -= 2;
+                g_gui.draw_string("F1:GUI F2:Ctrl F3:Debug F4:Scale F5:Cam F6:Graphics", x, y, 1.0f, 80, 80, 100, 180); y -= 14;
+                g_gui.draw_string("F7:Video \\\\:Type F8:Pause F10:HUD F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
+
+                if (g_typing_mode) {
+                    g_gui.draw_string("TYPING MODE", 350, g_win_h - 30, 1.2f, 255, 80, 80, 255);
+                }
+                if (g_cam_active) {
+                    char cam_dbg[128];
+                    cam_debug_string(cam_dbg, sizeof(cam_dbg));
+                    g_gui.draw_string(cam_dbg, x, y - 14, 1.0f, 80, 200, 120, 255);
+                }
+
+                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+                glPopAttrib();
+            }
+            
+            // Render mod tools overlay
+            if (g_display_active && !g_pod_enabled) {
+                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+                glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                mod_render_overlay(g_gui, g_win_w, g_win_h, dt_seconds);
+                mod_achievement_poll(g_guest_memory, 1);  // offsets are absolute guest VA
+                mod_achievement_render(g_gui, g_win_w, g_win_h, dt_seconds);
+
+                // Poll game notifications
+                if (g_sre_game_notification_pending_addr && g_sre_game_notification_addr) {
+                    int* pending = (int*)(g_guest_memory + g_sre_game_notification_pending_addr);
+                    if (*pending) {
+                        char* msg = (char*)(g_guest_memory + g_sre_game_notification_addr);
+                        mod_toast(msg, 2.5f);
+                        *pending = 0;
+                    }
+                }
+                
+                
+                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+                glPopAttrib();
+            }
+
+            extern int g_gl_diag_frame;
+            g_gl_diag_frame++;
+
+            // Render SRT overlay (inventory editor, etc.) — F11 toggle
+            if (g_display_active && !g_pod_enabled && g_srt_overlay.is_visible()) {
+                // Convert sustained mouse_pressed to single-frame click
+                static bool overlay_prev_pressed = false;
+                bool overlay_click = mouse_pressed && !overlay_prev_pressed;
+                overlay_prev_pressed = mouse_pressed;
+                
+                glPushAttrib(GL_ALL_ATTRIB_BITS);
+                glViewport(0, 0, g_draw_w, g_draw_h);
+                glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+                glOrtho(0, g_win_w, 0, g_win_h, -1, 1);
+                glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+                glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                g_srt_overlay.render(g_gui, g_win_w, g_win_h,
+                                      mouse_x, mouse_y,
+                                      overlay_click, dt_seconds);
+                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix();
+                glPopAttrib();
+            }
+            
+            // Draw Swordfare GUI F3 Overlay if visible
+            if (g_display_active && !g_pod_enabled) {
+                g_swordfare_gui.begin_frame();
+                if (g_swordfare_gui.is_visible()) {
+                    SwordfareDebugStats st;
+                    st.fps           = fps;
+                    st.dt_seconds    = dt_seconds;
+                    st.frame_count   = completed_frames;
+                    st.draw_calls    = g_frame_stats.draw_calls;
+                    st.tex_binds     = g_frame_stats.texture_binds;
+                    st.vertices      = g_frame_stats.vertices_submitted;
+                    st.matrix_ops    = g_frame_stats.matrix_ops;
+                    st.state_changes = g_frame_stats.state_changes;
+                    st.tex_uploads   = g_frame_stats.tex_uploads;
+                    st.win_w         = g_win_w;
+                    st.win_h         = g_win_h;
+                    st.draw_w        = g_draw_w;
+                    st.draw_h        = g_draw_h;
+                    st.mouse_x       = mouse_x;
+                    st.mouse_y       = mouse_y;
+                    st.cam_x         = g_sre_cam_x_addr ? *(float*)(g_guest_memory + g_sre_cam_x_addr) : g_cam_off_x;
+                    st.cam_y         = g_sre_cam_y_addr ? *(float*)(g_guest_memory + g_sre_cam_y_addr) : g_cam_off_y;
+                    st.cam_z         = g_sre_cam_z_addr ? *(float*)(g_guest_memory + g_sre_cam_z_addr) : g_cam_off_z;
+                    st.cam_zoom      = 1.0f;
+                    st.hero_x        = g_sre_hero_pos_x_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_x_addr) : 0.0f;
+                    st.hero_y        = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
+                    st.hero_z        = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
+                    st.cam_active    = g_cam_active;
+                    st.typing_mode   = g_typing_mode;
+                    st.game_paused   = g_game_paused;
+                    st.postfx_on     = g_postfx.enabled;
+                    st.postfx_preset = g_postfx.preset_name;
+                    if (g_fbo_mode == FBOScale::SHARP_BILINEAR) st.scale_mode = "Sharp-Bilinear";
+                    else if (g_fbo_mode == FBOScale::NEAREST) st.scale_mode = "Nearest";
+                    else if (g_fbo_mode == FBOScale::CRT_SCANLINE) st.scale_mode = "CRT Scanline";
+                    else if (g_fbo_mode == FBOScale::FSR) st.scale_mode = "FSR 1.0";
+                    st.binary_name    = g_lib_name.c_str();
+                    st.speed_label    = mod_speed_label();
+                    st.graphics_api   = (g_graphics_api == GraphicsAPI::VULKAN) ? "Vulkan" : "OpenGL";
+                    g_swordfare_gui.draw_debug(st);
+                }
+                
+                // Draw SRE LUA buttons and overlays if present
+                if (sre_btn_array_addr && g_guest_memory) {
+                    void* overlays_ptr = sre_overlay_array_addr ? (g_guest_memory + sre_overlay_array_addr) : nullptr;
+                    bool globally_hidden = false;
+                    if (sre_btn_globally_hidden_addr) {
+                        globally_hidden = (*(int*)(g_guest_memory + sre_btn_globally_hidden_addr) != 0);
+                    }
+                    g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr, overlays_ptr, globally_hidden);
+                }
+                if (gui_visible) {
+                    GuiAction act = g_swordfare_gui.draw_control_panel(&gui_visible);
+                    if (act != GUI_NONE) {
+                        process_gui_action(act, running);
+                    }
+                }
+                g_swordfare_gui.draw_lua_console();
+                g_swordfare_gui.draw_lua_script_editor();
+                g_swordfare_gui.draw_lua_script_manager();
+                g_swordfare_gui.draw_mod_overlay(g_save_dir);
+                g_swordfare_gui.draw_research_overlay();
+                g_swordfare_gui.draw_research_hud();
+                g_swordfare_gui.draw_graphics_options_modal(g_postfx);
+                g_swordfare_gui.end_frame();
+            }
+            
+            // Present the frame
+            if (g_display_active && g_display_ptr) {
+#ifdef VULKAN_BACKEND
+                if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    g_vk_backend.end_frame_and_present(&g_postfx, (int)g_fbo_mode);
+                } else
+#endif
+                {
+                    RedstellGC::instance().process_main_thread_deletions();
+                    g_emu_frame_now = completed_frames;
+                    if (g_pod_enabled) pod_publish_frame();
+                    maybe_capture_frame();
+                    g_display_ptr->swap();
+                }
+                // Reclaim stale deferred guest frees every frame, on BOTH render paths
+                // (RL mod leak guard — the deferred-free list only drains on guest
+                // malloc, so free-heavy workloads need a frame-driven drain).
+                sre_guest_heap_drain_deferred();
+
+                // ========= Frame rate limiter =========
+                // The original game ran at 30fps with VSync. Without a frame cap,
+                // the loop runs at 500+ FPS and the dt floor clamp inflates tiny
+                // deltas to 16.6ms, making everything move ~8x faster.
+                // Target 60fps for smooth gameplay at correct speed.
+                // In HARD MODE this is bypassed — entities run at full uncapped speed.
+                {
+                    bool hardmode = false;
+                    if (sre_hardmode_addr) {
+                        hardmode = *(volatile int*)(g_emulator_64->get_memory_base() + sre_hardmode_addr) != 0;
+                    }
+                    if (!hardmode) {
+                        Uint64 frequency = SDL_GetPerformanceFrequency();
+                        double target_seconds = 1.0 / 60.0;
+                        Uint64 target_ticks = (Uint64)(target_seconds * frequency);
+                        Uint64 current_ticks = SDL_GetPerformanceCounter() - start_counter;
+                        
+                        if (current_ticks < target_ticks) {
+                            Uint64 wait_ticks = target_ticks - current_ticks;
+                            double wait_ms = (double)wait_ticks * 1000.0 / frequency;
+                            
+                            // Sleep for the bulk of the duration (leaving 1.5ms for spin lock)
+                            if (wait_ms > 1.5) {
+                                SDL_Delay((Uint32)(wait_ms - 1.5));
+                            }
+                            
+                            // High-precision spin lock for the remaining time
+                            while (SDL_GetPerformanceCounter() - start_counter < target_ticks) {
+                                #if defined(__x86_64__) || defined(_M_X64)
+                                    __builtin_ia32_pause();
+                                #endif
+                            }
+                        }
+                    }
+                }
+                // Sync text input state from SRE (replaces JNI bridge path)
+                // SRE's StartTextInputWithDelegate hook sets g_sre_text_input_active = 1,
+                // StopTextInputWithDelegate / textInputDidFinish set it to 0.
+                if (sre_text_input_active_addr) {
+                    uint8_t* mem = g_emulator_64->get_memory_base();
+                    int sre_ti = *(volatile int*)(mem + sre_text_input_active_addr);
+                    if (sre_ti && !g_text_input_active) {
+                        g_text_input_active = true;
+                        if (g_vaddr_sre_text_input_init_val && g_guest_memory) {
+                            g_text_input_buffer = (const char*)(g_guest_memory + g_vaddr_sre_text_input_init_val);
+                        } else {
+                            g_text_input_buffer.clear();
+                        }
+                        std::cout << "[TextInput] SRE: text input activated, initial value: \"" << g_text_input_buffer << "\"" << std::endl;
+                    } else if (!sre_ti && g_text_input_active) {
+                        g_text_input_active = false;
+                        g_text_input_buffer.clear();
+                        std::cout << "[TextInput] SRE: text input deactivated" << std::endl;
+                    }
+                }
+
+                // Auto-toggle SDL text input when game requests it
+                if (g_text_input_active && !g_text_input_was_active) {
+                    SDL_StartTextInput(g_display_ptr->get_window());
+                    std::cout << "[TextInput] SDL text input enabled" << std::endl;
+                } else if (!g_text_input_active && g_text_input_was_active) {
+                    SDL_StopTextInput(g_display_ptr->get_window());
+                    std::cout << "[TextInput] SDL text input disabled" << std::endl;
+                }
+                g_text_input_was_active = g_text_input_active;
+
+                // ARM64 text input callback helpers
+                // Hooked by SRE — our reimplementation in sre_gui_native.c
+                // bypasses the corrupt ITextInputDelegate vtable entirely.
+                auto call_text_change_64 = [&](const std::string& text) {
+                    if (!g_fw_textInputDidChange) return;
+                    uint8_t* memory = g_emulator_64->get_memory_base();
+                    uint32_t str_addr = write_guest_jstring(memory, text);
+                    g_emulator_64->call(g_fw_textInputDidChange, {env_ptr, 0, (uint64_t)str_addr});
+                };
+                auto call_text_finish_64 = [&]() {
+                    if (!g_fw_textInputDidFinish) return;
+                    g_emulator_64->call(g_fw_textInputDidFinish, {env_ptr, 0});
+                };
+
+                SDL_Event event;
+                while (SDL_PollEvent(&event)) {
+                    if (g_swordfare_gui.process_event(event)) {
+                        // ImGui consumed the event
+                        continue;
+                    }
+                    switch (event.type) {
+                        case SDL_EVENT_QUIT:
+                            // A hidden pod window can receive a stray close/quit
+                            // event from the compositor (libdecor/Wayland); the
+                            // pod must only exit on an explicit kMsgQuit.
+                            if (!g_pod_enabled) running = false;
+                            break;
+                        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                            if (!g_pod_enabled) running = false;
+                            break;
+                        case SDL_EVENT_WINDOW_RESIZED:
+                            g_win_w = event.window.data1;
+                            g_win_h = event.window.data2;
+                            SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
+                            std::cout << "[Display] Window resized to " << g_win_w << "x" << g_win_h
+                                      << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                            break;
+                        case SDL_EVENT_KEY_DOWN:
+                            if (g_text_input_active) {
+                                if (event.key.key == SDLK_RETURN) {
+                                    std::cout << "[TextInput] Enter — confirming \"" << g_text_input_buffer << "\"" << std::endl;
+                                    call_text_change_64(g_text_input_buffer);
+                                    call_text_finish_64();
+                                    g_text_input_active = false;
+                                    g_text_input_buffer.clear();
+                                    if (g_fw_handleMenuBtn) {
+                                        g_emulator_64->call(g_fw_handleMenuBtn, {env_ptr, 0});
+                                    }
+                                } else if (event.key.key == SDLK_ESCAPE) {
+                                    std::cout << "[TextInput] Escape — cancelling" << std::endl;
+                                    g_text_input_buffer.clear();
+                                    call_text_change_64("");
+                                    call_text_finish_64();
+                                    g_text_input_active = false;
+                                    if (g_fw_handleMenuBtn) {
+                                        g_emulator_64->call(g_fw_handleMenuBtn, {env_ptr, 0});
+                                    }
+                                } else if (event.key.key == SDLK_BACKSPACE) {
+                                    if (!g_text_input_buffer.empty()) {
+                                        g_text_input_buffer.pop_back();
+                                        call_text_change_64(g_text_input_buffer);
+                                        if (g_vaddr_sre_text_input_init_val && g_guest_memory) {
+                                            g_text_input_buffer = (const char*)(g_guest_memory + g_vaddr_sre_text_input_init_val);
+                                        }
+                                        std::cout << "[TextInput] Backspace → \"" << g_text_input_buffer << "\"" << std::endl;
+                                    }
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_A || event.key.key == SDLK_D) {
+                                if (g_cam_active && g_cam_pov_mode) {
+                                    g_cam_pov_facing = (event.key.key == SDLK_A) ? -1.0f : 1.0f;
+                                    cam_write_to_guest();
+                                }
+                            }
+                            if (should_block_keyboard()) {
+                                bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
+                                if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
+                            }
+                            if (event.key.key == SDLK_F1 && !event.key.repeat) { gui_visible = !gui_visible; break; }
+                            if (event.key.key == SDLK_F4 && !event.key.repeat) {
+                                g_swordfare_gui.toggle_mod_overlay();
+                                std::cout << "[ModOverlay] " << (g_swordfare_gui.is_mod_overlay_visible() ? "ON" : "OFF") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F2 && !event.key.repeat) {
+                                g_input_config.toggle_editor();
+                                if (!g_input_config.is_editing()) g_input_config.save(g_save_dir + "/controls_arm64.ini");
+                                break;
+                            }
+                            // Controls editor: R toggles rebind mode, Delete removes custom button
+                            if (g_input_config.is_editing() && !event.key.repeat) {
+                                if (event.key.key == SDLK_R) {
+                                    auto mode = g_input_config.get_editor_mode();
+                                    g_input_config.set_editor_mode(mode == EDITOR_REBIND ? EDITOR_POSITION : EDITOR_REBIND);
+                                    std::cout << "[Controls] Editor mode: " 
+                                              << (g_input_config.get_editor_mode() == EDITOR_REBIND ? "REBIND" : "POSITION") << std::endl;
+                                    break;
+                                }
+                                // Capture key for rebinding
+                                if (g_input_config.editor_handle_key(event.key.scancode)) break;
+                            }
+                            if (event.key.key == SDLK_F3 && !event.key.repeat) {
+                                if (event.key.mod & SDL_KMOD_CTRL) {
+                                    trigger_toggle_debug_info();
+                                    break;
+                                }
+                                debug_visible = !debug_visible;
+                                g_swordfare_gui.toggle_visible();
+                                break;
+                            }
+                            if (event.key.key == SDLK_D && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
+                                trigger_toggle_collision_shapes();
+                                break;
+                            }
+                            if (event.key.key == SDLK_W && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
+                                trigger_toggle_combat_wireframe();
+                                break;
+                            }
+                            if (event.key.key == SDLK_F5 && !event.key.repeat) { cam_toggle(); break; }
+                            if (event.key.key == SDLK_M && !event.key.repeat) {
+                                if (g_cam_active) {
+                                    g_cam_pov_mode = !g_cam_pov_mode;
+                                    if (!g_cam_pov_mode) {
+                                        // Leaving POV: clear free-look so the next
+                                        // entry returns to legacy ±45° facing.
+                                        g_cam_yaw = 0.0f;
+                                        g_cam_pitch = 0.0f;
+                                        g_cam_roll = 0.0f;
+                                    }
+                                    char msg[64];
+                                    snprintf(msg, sizeof(msg), "Camera POV: %s", g_cam_pov_mode ? "ON (drag to look)" : "OFF");
+                                    mod_toast(msg, 1.5f);
+                                    cam_write_to_guest();
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                                extern void cam_set_fov(float fov_rad);
+                                float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
+                                cam_set_fov(std::max(0.35f, cur - 0.05f));
+                                break;
+                            }
+                            if (event.key.key == SDLK_F8 && !event.key.repeat) {
+                                extern void cam_set_fov(float fov_rad);
+                                float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
+                                cam_set_fov(std::min(1.4f, cur + 0.05f));
+                                break;
+                            }
+                            if (event.key.key == SDLK_F6 && !event.key.repeat) {
+                                g_swordfare_gui.toggle_graphics_options();
+                                break;
+                            }
+                            if (event.key.key == SDLK_R && !event.key.repeat) {
+                                std::cout << "[PostFX] Reloading custom postfx config..." << std::endl;
+                                if (postfx_load_custom_json(g_postfx)) {
+                                    std::cout << "[PostFX] Successfully loaded custom config!" << std::endl;
+                                } else {
+                                    std::cout << "[PostFX] Failed to load custom config, generating default template." << std::endl;
+                                    postfx_save_default_json();
+                                    postfx_load_custom_json(g_postfx);
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
+                                g_typing_mode = !g_typing_mode;
+                                if (g_typing_mode) {
+                                    SDL_StartTextInput(g_display_ptr->get_window());
+                                    std::cout << "[Keyboard] Typing mode ON" << std::endl;
+                                } else {
+                                    SDL_StopTextInput(g_display_ptr->get_window());
+                                    std::cout << "[Keyboard] Typing mode OFF" << std::endl;
+                                }
+                                break;
+                            }
+                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                                g_video_background_enabled = !g_video_background_enabled;
+                                std::cout << "[VideoBackground] Video playback: " << (g_video_background_enabled ? "ENABLED" : "DISABLED") << std::endl;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F8 && !event.key.repeat) { mod_toggle_pause(); break; }
+                            if (event.key.key == SDLK_F9 && !event.key.repeat) { mod_step_frame(); break; }
+                            if (event.key.key == SDLK_F10 && !event.key.repeat) {
+                                g_hide_touch_hud = !g_hide_touch_hud;
+                                g_gl_hide_hud = g_hide_touch_hud;
+                                break;
+                            }
+                            if (event.key.key == SDLK_F12 && !event.key.repeat) {
+                                SDL_WindowFlags flags = SDL_GetWindowFlags(g_display_ptr->get_window());
+                                if (flags & SDL_WINDOW_FULLSCREEN) {
+                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), false);
+                                    // Query actual window size — preserves native aspect ratio (16:10, etc.)
+                                    int ww, wh;
+                                    SDL_GetWindowSize(g_display_ptr->get_window(), &ww, &wh);
+                                    g_win_w = ww; g_win_h = wh;
+                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
+                                    std::cout << "[Display] Windowed " << ww << "x" << wh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                                } else {
+                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), true);
+                                    int fw, fh;
+                                    SDL_GetWindowSize(g_display_ptr->get_window(), &fw, &fh);
+                                    g_win_w = fw; g_win_h = fh;
+                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
+                                    std::cout << "[Display] Fullscreen " << fw << "x" << fh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                                }
+                                break;
+                            }
+                            // N — Time of Day cycle: Day → Afternoon → Night → Day
+                            if (event.key.key == SDLK_N && !event.key.repeat && !g_typing_mode && !g_swordfare_gui.is_lua_console_open()) {
+                                // 0=Day, 1=Afternoon, 2=Night
+                                static int time_of_day = 0;
+                                time_of_day = (time_of_day + 1) % 3;
+                                
+                                // Start from current PostFX preset
+                                postfx_apply_preset(g_postfx, g_postfx_preset);
+                                
+                                if (time_of_day == 0) {
+                                    // === DAY (default) ===
+                                    // Restore background brightness
+                                    if (bg_brightness_addr) {
+                                        *(float*)(g_guest_memory + bg_brightness_addr) = 1.0f;
+                                    }
+                                    mod_toast("Day", 1.5f);
+                                    std::cout << "[TimeOfDay] Day — default" << std::endl;
+                                    
+                                } else if (time_of_day == 1) {
+                                    // === AFTERNOON (1PM warm light) ===
+                                    // No background filter — keep BG bright and warm
+                                    if (bg_brightness_addr) {
+                                        *(float*)(g_guest_memory + bg_brightness_addr) = 1.1f;
+                                    }
+                                    g_postfx.enabled = true;
+                                    // Warm vibrant color grading
+                                    g_postfx.color_adjust = true;
+                                    g_postfx.warmth = 0.35f;        // warm golden tone
+                                    g_postfx.brightness = 0.05f;    // slightly brighter
+                                    g_postfx.contrast = 1.1f;       // punchy contrast
+                                    g_postfx.saturation = 1.2f;     // vivid colors
+                                    // Strong god rays — intense afternoon sun
+                                    g_postfx.god_rays = true;
+                                    g_postfx.god_rays_intensity = 0.8f;
+                                    g_postfx.god_rays_decay = 0.97f;
+                                    g_postfx.sun_x = 0.75f;         // sun to the right
+                                    g_postfx.sun_y = 0.7f;          // lower in sky
+                                    // Strong SSAO — harsh afternoon shadows
+                                    g_postfx.ssao = true;
+                                    g_postfx.ssao_radius = 0.03f;
+                                    g_postfx.ssao_intensity = 1.5f;
+                                    // Bloom — bright sun reflections
+                                    g_postfx.bloom = true;
+                                    g_postfx.bloom_threshold = 0.55f;
+                                    g_postfx.bloom_intensity = 0.35f;
+                                    // Shadows — strong directional
+                                    g_postfx.shadows = true;
+                                    g_postfx.shadow_intensity = 0.55f;
+                                    g_postfx.shadow_light_x = 0.5f;
+                                    g_postfx.shadow_light_y = -0.6f;
+                                    // Subtle vignette
+                                    g_postfx.vignette = true;
+                                    g_postfx.vignette_intensity = 0.15f;
+                                    mod_toast("Afternoon", 1.5f);
+                                    std::cout << "[TimeOfDay] Afternoon — warm, bright, strong shadows" << std::endl;
+                                    
+                                } else {
+                                    // === NIGHT ===
+                                    // Dim the SRE background renderer
+                                    if (bg_brightness_addr) {
+                                        *(float*)(g_guest_memory + bg_brightness_addr) = 0.3f;
+                                    }
+                                    g_postfx.enabled = true;
+                                    // Cool blue desaturated tint
+                                    g_postfx.color_adjust = true;
+                                    g_postfx.brightness = -0.12f;    // dim overall
+                                    g_postfx.contrast = 0.9f;        // softer contrast
+                                    g_postfx.saturation = 0.6f;      // desaturate
+                                    g_postfx.warmth = -0.25f;        // cool blue shift
+                                    // Heavy vignette — darkness at edges
+                                    g_postfx.vignette = true;
+                                    g_postfx.vignette_intensity = 0.55f;
+                                    // SSAO for dark corners
+                                    g_postfx.ssao = true;
+                                    g_postfx.ssao_radius = 0.03f;
+                                    g_postfx.ssao_intensity = 1.6f;
+                                    // No god rays at night — moonlight bloom instead
+                                    g_postfx.god_rays = false;
+                                    g_postfx.bloom = true;
+                                    g_postfx.bloom_threshold = 0.5f;
+                                    g_postfx.bloom_intensity = 0.4f;
+                                    // Film grain for atmosphere
+                                    g_postfx.film_grain = true;
+                                    g_postfx.grain_intensity = 0.03f;
+                                    mod_toast("Night", 1.5f);
+                                    std::cout << "[TimeOfDay] Night — dim, cool, atmospheric" << std::endl;
+                                }
+                                break;
+                            }
+                            // ---- Lua Console: backtick toggles, feed keys when open ----
+                            if (event.key.key == SDLK_GRAVE && !event.key.repeat && g_lua_console_ready) {
+                                g_swordfare_gui.toggle_lua_console();
+                                break;
+                            }
+                            if (event.key.key == SDLK_EQUALS && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT)) { mod_speed_up(); break; }
+                            if (event.key.key == SDLK_MINUS && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT)) { mod_speed_down(); break; }
+                            if (event.key.key == SDLK_0 && !event.key.repeat) { mod_speed_reset(); break; }
+                            // fall through
+                        case SDL_EVENT_KEY_UP: {
+                            if (g_text_input_active) {
+                                break;
+                            }
+                            if (should_block_keyboard()) {
+                                bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
+                                if (!is_toggle) break;
+                            }
+                            bool is_down = (event.type == SDL_EVENT_KEY_DOWN);
+                            int scancode = event.key.scancode;
+
+                            // Use the original modal confirmation handler. Enter
+                            // maps to its Control action; jump/attack bindings remain valid.
+                            if (is_down && !event.key.repeat) {
+                                int confirm_key = 0;
+                                if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER ||
+                                    event.key.key == SDLK_LCTRL || event.key.key == SDLK_RCTRL) confirm_key = 0x11;
+                                else if (event.key.key == SDLK_SPACE || event.key.key == SDLK_UP) confirm_key = 0x26;
+                                else if (event.key.key == SDLK_ESCAPE) confirm_key = 0x1b;
+                                if (confirm_key && dispatch_gameover_key(confirm_key)) break;
+                            }
+
+                            // ---- Virtual Key translation for Android mods ----
+                            bool handled_virtual = false;
+                            extern bool g_sre_overlay_blocking;
+                            bool block_virtual = g_sre_overlay_blocking && (event.key.key != SDLK_ESCAPE && event.key.key != SDLK_X);
+                            if (!block_virtual) {
+                                if (event.key.key == SDLK_TAB) {
+                                    handled_virtual = simulate_virtual_key("Open", is_down);
+                                } else if (event.key.key == SDLK_E) {
+                                    handled_virtual = simulate_virtual_key("Use", is_down);
+                                } else if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_X) {
+                                    handled_virtual = simulate_virtual_key("X", is_down);
+                                } else if (event.key.key == SDLK_V) {
+                                    handled_virtual = simulate_virtual_key("Armory", is_down);
+                                // NOTE: K is the attack/swing key — do NOT intercept it for SRE overlays.
+                                // SRE overlay "Keybinds" button must be clicked with mouse instead.
+                                } else if (event.key.key == SDLK_P) {
+                                    handled_virtual = simulate_virtual_key("+ Keybind", is_down);
+                                }
+                            }
+                            if (handled_virtual) {
+                                break;
+                            }
+
+                            // ---- NATIVE KEYBOARD DISPATCH (portals/dialogues via Enter key) ----
+                            if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+                                uint64_t gamesceneview = 0;
+                                if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
+                                    gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
+                                }
+                                if (is_valid_guest_ptr(gamesceneview)) {
+                                    uint64_t overlay = *(uint64_t*)(g_guest_memory + gamesceneview + 0x100);
+                                    if (is_valid_guest_ptr(overlay)) {
+                                        uint64_t listener = *(uint64_t*)(g_guest_memory + overlay + 0xf0);
+                                        if (is_valid_guest_ptr(listener)) {
+                                            // Write a GUIKeyboardEvent in guest scratch memory (e.g. 0x3F800)
+                                            uint32_t guest_event_addr = 0x3F800;
+                                            std::memset(g_guest_memory + guest_event_addr, 0, 128);
+                                            *(int*)(g_guest_memory + guest_event_addr + 0xc) = is_down ? 1 : 2;  // Action (1=down, 2=up)
+                                            *(int*)(g_guest_memory + guest_event_addr + 0x10) = 0xd;              // VK_RETURN (13)
+                                            
+                                            // Resolve GameOverlayView::HandleKeyboardEvent dynamically from the object's vtable (offset 0x28)
+                                            uint64_t vtable = *(uint64_t*)(g_guest_memory + overlay);
+                                            uint64_t handle_keyboard_event = *(uint64_t*)(g_guest_memory + vtable + 0x28);
+                                            g_emulator_64->call(handle_keyboard_event, {overlay, (uint64_t)guest_event_addr});
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+
+                            // ---- TYPING MODE: route through FWKeyboard + text buffer ----
+                            if (g_typing_mode && is_down) {
+                                break;
+                            }
+                            if (g_typing_mode && !is_down) {
+                                break;
+                            }
+
+                            // Camera + arrow keys (camera-only when active, not game movement)
+                            switch (event.key.key) {
+                                case SDLK_LEFT:
+                                    if (g_cam_active) arrow_left = is_down;
+                                    break;
+                                case SDLK_RIGHT:
+                                    if (g_cam_active) arrow_right = is_down;
+                                    break;
+                                case SDLK_UP:
+                                    if (g_cam_active) arrow_up = is_down;
+                                    break;
+                                case SDLK_DOWN:
+                                    if (g_cam_active) arrow_down = is_down;
+                                    break;
+                                case SDLK_PAGEUP:
+                                    if (g_cam_active) cam_key_pgup = is_down;
+                                    break;
+                                case SDLK_PAGEDOWN:
+                                    if (g_cam_active) cam_key_pgdn = is_down;
+                                    break;
+                                case SDLK_EQUALS:
+                                case SDLK_KP_PLUS:
+                                    if (g_cam_active) cam_key_pgup = is_down;
+                                    break;
+                                case SDLK_MINUS:
+                                case SDLK_KP_MINUS:
+                                    if (g_cam_active) cam_key_pgdn = is_down;
+                                    break;
+                                case SDLK_HOME:
+                                    if (is_down && g_cam_active) cam_reset();
+                                    break;
+                            }
+                            break;
+                        }
+                        // --- Text input events ---
+                        case SDL_EVENT_TEXT_INPUT: {
+                            const char* text = event.text.text;
+                            if (g_swordfare_gui.is_lua_console_open()) {
+                                // ImGui handles text input now, do nothing here.
+                            } else if (g_text_input_active) {
+                                g_text_input_buffer += text;
+                                call_text_change_64(g_text_input_buffer);
+                                if (g_vaddr_sre_text_input_init_val && g_guest_memory) {
+                                    g_text_input_buffer = (const char*)(g_guest_memory + g_vaddr_sre_text_input_init_val);
+                                }
+                                std::cout << "[TextInput] \"" << g_text_input_buffer << "\"" << std::endl;
+                            }
+                            break;
+                        }
+                        case SDL_EVENT_MOUSE_WHEEL:
+                            if (g_cam_active) cam_scroll_zoom((float)event.wheel.y);
+                            break;
+                        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                            if (event.button.button == SDL_BUTTON_LEFT) {
+                                mouse_pressed = true;
+                                mouse_x = event.button.x;
+                                mouse_y = g_win_h - event.button.y;
+                                // Controls editor intercepts all mouse events
+                                if (g_input_config.is_editing()) {
+                                    float gx = event.button.x * 960.0f / (float)g_win_w;
+                                    float gy = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
+                                    g_input_config.editor_mouse_down(gx, gy);
+                                    click_swallowed_by_gui = true;
+                                    break;
+                                }
+                                GuiAction gui_action = GUI_NONE;
+                                bool gui_consumed = false;
+                                if (gui_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+                                    gui_action = g_gui.handle_click(mouse_x, mouse_y, g_win_w, g_win_h);
+                                    gui_consumed = (gui_action != GUI_NONE)
+                                                 || (mouse_y >= g_win_h - (int)(32 * g_gui.get_scale()))
+                                                 || g_gui.has_modal_open();
+                                }
+                                if (gui_consumed) {
+                                    click_swallowed_by_gui = true;
+                                    process_gui_action(gui_action, running);
+                                } else if (g_srt_overlay.is_visible()) {
+                                    // Overlay is open — swallow click, don't send to game
+                                    click_swallowed_by_gui = true;
+                                } else {
+                                    bool btn_hit = false;
+                                    if (g_graphics_api == GraphicsAPI::OPENGL) {
+                                        ImGuiIO& io = ImGui::GetIO();
+                                        if (io.WantCaptureMouse || g_swordfare_gui.is_input_blocked((float)event.button.x, (float)event.button.y)) {
+                                            btn_hit = true;
+                                        }
+                                    }
+                                    if (btn_hit) {
+                                        click_swallowed_by_gui = true;
+                                    } else {
+                                        click_swallowed_by_gui = false;
+                                        float x = event.button.x * 960.0f / (float)g_win_w;
+                                        float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
+                                        last_mouse_x = x; last_mouse_y = y;
+                                        call_touch_64(1, 1, accumulated_time, x, y, x, y, 1);
+                                    }
+                                }
+                            }
+                            break;
+                        case SDL_EVENT_MOUSE_MOTION:
+                            mouse_x = event.motion.x;
+                            mouse_y = g_win_h - event.motion.y;
+                            if (g_input_config.is_editing() && mouse_pressed) {
+                                float gx = event.motion.x * 960.0f / (float)g_win_w;
+                                float gy = 544.0f - (event.motion.y * 544.0f / (float)g_win_h);
+                                g_input_config.editor_mouse_move(gx, gy);
+                            } else if (g_cam_active && g_cam_pov_mode && mouse_pressed
+                                       && !click_swallowed_by_gui && !g_srt_overlay.is_visible()) {
+                                // POV free-look: dragging rotates yaw/pitch instead
+                                // of sending a swipe to the game.
+                                extern void cam_look(float dyaw, float dpitch);
+                                cam_look((float)event.motion.xrel, (float)event.motion.yrel);
+                            } else if (mouse_pressed && !click_swallowed_by_gui && !g_srt_overlay.is_visible()) {
+                                float x = event.motion.x * 960.0f / (float)g_win_w;
+                                float y = 544.0f - (event.motion.y * 544.0f / (float)g_win_h);
+                                call_touch_64(4, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 0);
+                                last_mouse_x = x; last_mouse_y = y;
+                            }
+                            break;
+                        case SDL_EVENT_MOUSE_BUTTON_UP:
+                            if (event.button.button == SDL_BUTTON_LEFT) {
+                                mouse_pressed = false;
+                                mouse_x = event.button.x;
+                                mouse_y = g_win_h - event.button.y;
+                                if (g_input_config.is_editing()) {
+                                    g_input_config.editor_mouse_up();
+                                } else if (!click_swallowed_by_gui && !g_srt_overlay.is_visible()) {
+                                    float x = event.button.x * 960.0f / (float)g_win_w;
+                                    float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
+                                    call_touch_64(2, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 1);
+                                    last_mouse_x = -1.0f; last_mouse_y = -1.0f;
+                                }
+                                click_swallowed_by_gui = false;
+                            }
+                            break;
+                        // --- Multi-touch / finger events (touchscreen support) ---
+                        case SDL_EVENT_FINGER_DOWN: {
+                            float x = event.tfinger.x * 960.0f;
+                            float y = (1.0f - event.tfinger.y) * 544.0f;
+                            int finger_id = (int)(event.tfinger.fingerID % 10) + 20;
+                            call_touch_64(1, finger_id, accumulated_time, x, y, x, y, 1);
+                            break;
+                        }
+                        case SDL_EVENT_FINGER_UP: {
+                            float x = event.tfinger.x * 960.0f;
+                            float y = (1.0f - event.tfinger.y) * 544.0f;
+                            int finger_id = (int)(event.tfinger.fingerID % 10) + 20;
+                            call_touch_64(2, finger_id, accumulated_time, x, y, x, y, 1);
+                            break;
+                        }
+                        case SDL_EVENT_FINGER_MOTION: {
+                            float x = event.tfinger.x * 960.0f;
+                            float y = (1.0f - event.tfinger.y) * 544.0f;
+                            float old_x = (event.tfinger.x - event.tfinger.dx) * 960.0f;
+                            float old_y = (1.0f - (event.tfinger.y - event.tfinger.dy)) * 544.0f;
+                            int finger_id = (int)(event.tfinger.fingerID % 10) + 20;
+                            call_touch_64(4, finger_id, accumulated_time, x, y, old_x, old_y, 0);
+                            break;
+                        }
+                        case SDL_EVENT_GAMEPAD_ADDED:
+                            if (!g_gamepad) {
+                                g_gamepad = SDL_OpenGamepad(event.gdevice.which);
+                                if (g_gamepad)
+                                    std::cout << "[Input] Gamepad connected: " << SDL_GetGamepadName(g_gamepad) << std::endl;
+                            }
+                            break;
+                        case SDL_EVENT_GAMEPAD_REMOVED:
+                            if (g_gamepad && event.gdevice.which == SDL_GetJoystickID(SDL_GetGamepadJoystick(g_gamepad))) {
+                                SDL_CloseGamepad(g_gamepad);
+                                g_gamepad = nullptr;
+                                std::cout << "[Input] Gamepad disconnected" << std::endl;
+                            }
+                            break;
+                    }
+                }
+                
+                // Keyboard→touch button dispatch (game buttons like WASD, space, etc.)
+                {
+                    extern bool g_sre_overlay_blocking;
+                    bool input_blocked = g_sre_overlay_blocking || g_typing_mode || g_swordfare_gui.is_lua_console_open() || g_text_input_active;
+                    // Merge real SDL keyboard state with pod-injected keys. A
+                    // hidden-window pod never feeds real keys into SDL, so the
+                    // loop must consult g_pod_key_state for control buttons.
+                    static bool merged_keys[512];
+                    const bool* keys = nullptr;
+                    if (!input_blocked) {
+                        const bool* sdl_keys = SDL_GetKeyboardState(nullptr);
+                        if (g_pod_enabled) {
+                            for (int kk = 0; kk < 512; ++kk)
+                                merged_keys[kk] = g_pod_key_state[kk] ||
+                                                  (sdl_keys && sdl_keys[kk]);
+                            keys = merged_keys;
+                        } else {
+                            keys = sdl_keys;
+                        }
+                    }
+                    for (int bi = 0; bi < g_input_config.button_count(); bi++) {
+                        TouchButton* btn = g_input_config.get_button(bi);
+                        if (!btn) continue;
+                        
+                        // Skip buttons during controls editor
+                        if (g_input_config.is_editing()) continue;
+                        
+                        // Check both primary and alt key bindings
+                        bool is_down = false;
+                        if (keys) {
+                            if (btn->sdl_scancode > 0 && btn->sdl_scancode < 512) {
+                                bool block_primary = g_cam_active && 
+                                    (btn->sdl_scancode == SDL_SCANCODE_LEFT || btn->sdl_scancode == SDL_SCANCODE_RIGHT ||
+                                     btn->sdl_scancode == SDL_SCANCODE_UP || btn->sdl_scancode == SDL_SCANCODE_DOWN);
+                                if (!block_primary) {
+                                    is_down = keys[btn->sdl_scancode];
+                                }
+                            }
+                            if (!is_down && btn->sdl_scancode_alt > 0 && btn->sdl_scancode_alt < 512) {
+                                bool block_alt = g_cam_active && 
+                                    (btn->sdl_scancode_alt == SDL_SCANCODE_LEFT || btn->sdl_scancode_alt == SDL_SCANCODE_RIGHT ||
+                                     btn->sdl_scancode_alt == SDL_SCANCODE_UP || btn->sdl_scancode_alt == SDL_SCANCODE_DOWN);
+                                if (!block_alt) {
+                                    is_down = keys[btn->sdl_scancode_alt];
+                                }
+                            }
+                        }
+                        
+
+                        // Resolve player's GameSceneController / listener safely
+                        uint64_t gamesceneview = 0;
+                        if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
+                            gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
+                        }
+                        
+                        uint64_t overlay = 0;
+                        uint64_t listener = 0;
+                        if (is_valid_guest_ptr(gamesceneview)) {
+                            overlay = *(uint64_t*)(g_guest_memory + gamesceneview + 0x100);
+                            if (is_valid_guest_ptr(overlay)) {
+                                listener = *(uint64_t*)(g_guest_memory + overlay + 0xf0);
+                                if (!is_valid_guest_ptr(listener)) {
+                                    listener = 0;
+                                }
+                            }
+                        }
+
+                        // Intercept gameplay buttons if active play is detected
+                        bool is_gameplay_btn = (btn->name == "left" || btn->name == "right" || btn->name == "jump" || btn->name == "attack" || btn->name == "magic" || btn->name == "use_item");
+                        bool use_native = (listener != 0) && is_gameplay_btn;
+
+                        // Android's real Back event opens/closes the game menu.
+                        // A touch at the legacy "menu" button coordinates lands
+                        // in empty HUD space in 1.4.13 and made Escape ineffective.
+                        if (btn->name == "menu" && handleBackButtonPress) {
+                            if (is_down && !btn->is_pressed && !dispatch_gameover_key(0x1b))
+                                g_emulator_64->call(handleBackButtonPress, {env_ptr, 0});
+                            btn->is_pressed = is_down;
+                            continue;
+                        }
+
+                        if (is_down && !btn->is_pressed) {
+                            btn->is_pressed = true;
+                            
+                            if ((btn->name == "jump" || btn->name == "attack") &&
+                                dispatch_gameover_key(btn->name == "jump" ? 0x26 : 0x11)) continue;
+                            if (use_native) {
+                                dispatch_gameplay_button(btn->name, true);
+                            } else if (btn->is_macro && btn->macro_open_touch_id >= 0) {
+                                // Macro step 1: press the magic menu button to open spell selection
+                                TouchButton* opener = nullptr;
+                                for (int j = 0; j < g_input_config.button_count(); j++) {
+                                    TouchButton* t = g_input_config.get_button(j);
+                                    if (t && t->touch_id == btn->macro_open_touch_id) { opener = t; break; }
+                                }
+                                if (opener) {
+                                    std::cout << "[Macro] Step 1: press " << opener->name 
+                                              << " at (" << opener->game_x << ", " << opener->game_y 
+                                              << ") touch_id=" << opener->touch_id << std::endl;
+                                    // Press opener — process_macros releases at 50ms (stage 1→2)
+                                    int macro_tid = 100 + btn->touch_id;
+                                    call_touch_64(1, macro_tid, accumulated_time,
+                                        opener->game_x, opener->game_y, opener->game_x, opener->game_y, 1);
+                                }
+                                // Start macro sequence
+                                btn->macro_pending = true;
+                                btn->macro_stage = 1;  // opener pressed, waiting for release
+                                btn->macro_fire_time = (uint64_t)(accumulated_time * 1000.0);
+                                std::cout << "[Macro] Started: " << btn->name 
+                                          << " delay=" << btn->macro_delay_ms << "ms" << std::endl;
+                            } else {
+                                // Normal button press
+                                call_touch_64(1, btn->touch_id, accumulated_time,
+                                    btn->game_x, btn->game_y, btn->game_x, btn->game_y, 1);
+                            }
+                        } else if (!is_down && btn->is_pressed) {
+                            btn->is_pressed = false;
+                            
+                            if (use_native) {
+                                dispatch_gameplay_button(btn->name, false);
+                            } else if (!btn->is_macro) {
+                                call_touch_64(2, btn->touch_id, accumulated_time,
+                                    btn->game_x, btn->game_y, btn->game_x, btn->game_y, 0);
+                            }
+                        }
+                    }
+                    
+                    // Process pending macro step 2 (delayed spell slot tap)
+                    g_input_config.process_macros(accumulated_time,
+                        [&](int action, int id, double time, float x, float y, float ox, float oy, int tap) {
+                            call_touch_64(action, id, time, x, y, ox, oy, tap);
+                        });
+                }
+            }
+            
+            // FPS counter
+            fps_frame_count++;
+            Uint64 fps_now = SDL_GetTicks();
+            if (fps_now - fps_last_time >= 1000) {
+                fps = fps_frame_count * 1000.0f / (fps_now - fps_last_time);
+                fps_frame_count = 0;
+                fps_last_time = fps_now;
+            }
+            
+            completed_frames++;
+            total_draw_calls += g_frame_stats.draw_calls;
+            total_tex_binds += g_frame_stats.texture_binds;
+            total_tex_uploads += g_frame_stats.tex_uploads;
+            total_matrix_ops += g_frame_stats.matrix_ops;
+            total_state_changes += g_frame_stats.state_changes;
+            total_asset_opens += g_frame_stats.asset_opens;
+            
+            if (completed_frames == 1 || completed_frames == 10 || 
+                completed_frames <= 20 ||
+                completed_frames % 100 == 0) {
+                std::cout << "[Frame64 " << completed_frames << "] "
+                          << "draws=" << g_frame_stats.draw_calls
+                          << " tex_binds=" << g_frame_stats.texture_binds
+                          << " tex_ups=" << g_frame_stats.tex_uploads
+                          << " verts=" << g_frame_stats.vertices_submitted
+                          << " vtx_calls=" << g_frame_stats.vertex_pointer_calls
+                          << " texc_calls=" << g_frame_stats.texcoord_pointer_calls
+                          << " matrix=" << g_frame_stats.matrix_ops
+                          << " state=" << g_frame_stats.state_changes
+                          << " assets=" << g_frame_stats.asset_opens
+                          << " clears=" << g_frame_stats.clear_calls
+                          << std::endl;
+                draw_batcher_print_stats();
+            }
+
+            // Poll lua_resume error counter from SRE
+            if (g_sre_resume_err_count_addr) {
+                int count = *(int32_t*)(g_guest_memory + g_sre_resume_err_count_addr);
+                if (count > g_sre_resume_err_last_seen) {
+                    std::string err_msg = "(unknown)";
+                    if (g_sre_resume_last_err_addr) {
+                        const char* msg = (const char*)(g_guest_memory + g_sre_resume_last_err_addr);
+                        if (msg[0]) err_msg = msg;
+                    }
+                    std::cerr << "[SRE] lua_resume error #" << count
+                              << " (frame " << completed_frames << "): "
+                              << err_msg << std::endl;
+                    g_sre_resume_err_last_seen = count;
+                }
+            }
+
+            // Poll __cxa_throw unrecovered caller from SRE
+            if (g_sre_cxa_unrecovered_addr) {
+                int count = *(int32_t*)(g_guest_memory + g_sre_cxa_unrecovered_addr);
+                if (count > g_sre_cxa_last_seen) {
+                    uint64_t caller = *(uint64_t*)(g_guest_memory + g_sre_cxa_caller_addr);
+                    uint64_t nm_offset = caller > 0x1000000 ? caller - 0x1000000 : caller;
+                    std::cerr << "[SRE] !! __cxa_throw UNRECOVERED #" << count
+                              << " (frame " << completed_frames << ")"
+                              << " caller=0x" << std::hex << caller
+                              << " (nm offset 0x" << nm_offset << ")"
+                              << std::dec << std::endl;
+                    g_sre_cxa_last_seen = count;
+                }
+            }
+
+            // Poll lua_call_safe errors from SRE
+            if (g_sre_lua_error_count_addr) {
+                int err_count = *(int32_t*)(g_guest_memory + g_sre_lua_error_count_addr);
+                if (err_count > g_sre_lua_error_last_seen && g_sre_lua_error_buf_addr) {
+                    const char* err_msg = (const char*)(g_guest_memory + g_sre_lua_error_buf_addr);
+                    std::cerr << "[SRE-LUA] Error #" << err_count
+                              << " (frame " << completed_frames << "): "
+                              << std::string(err_msg, strnlen(err_msg, 200)) << std::endl;
+                    g_sre_lua_error_last_seen = err_count;
+                }
+            }
+            
+            if (TARGET_FRAMES > 0 && completed_frames >= TARGET_FRAMES) running = false;
+        }
+
+        g_input_config.save(g_save_dir + "/controls_arm64.ini");
+        if (g_gamepad) {
+            SDL_CloseGamepad(g_gamepad);
+            g_gamepad = nullptr;
+        }
+
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "[RESULT64] Completed " << completed_frames << " frames (ARM64)" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "  Total draw calls:      " << total_draw_calls << std::endl;
+        std::cout << "  Total tex binds:       " << total_tex_binds << std::endl;
+        std::cout << "  Avg draw/frame:        " << (completed_frames ? total_draw_calls / completed_frames : 0) << std::endl;
+        std::cout << "========================================" << std::endl;
+        // The forward pass reports what it claimed and why it refused the rest.
+        // atexit() from the dlopened swgfx library cannot be relied on, so the
+        // census is printed here, on the way out of the real program.
+        ffp::print_stats();
+    }
+}
+
+
+
+Display* g_display_ptr = nullptr;
+char** g_saved_argv = nullptr;
+int g_saved_argc = 0;
+
+int main(int argc, char* argv[]) {
+    g_saved_argc = argc;
+    g_saved_argv = argv;
+    // Engine-pod preview (Ruby GG dock) must never pop its own crash UI —
+    // ruby owns the session lifecycle and shows the state itself.
+    bool pod_requested = false;
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--pod-preview", 13) == 0) pod_requested = true;
+    }
+    // Install the sleek fatal-crash reporting window early: a SIGSEGV/SIGABRT
+    // in the emulator or host bridges now surfaces a GUI crash box with a
+    // backtrace instead of the process vanishing silently.
+    if (!pod_requested) crashui::install_crash_handler();
+    os_external::set_dev_working_dir(); // Windows: chdir to repo root so src/assets resolves
+    // Check for --headless flag
+    bool headless = false;
+    bool check_data_only = false;
+    bool use_openswordigo = false;
+    std::string openswordigo_scene = "town_part1.scene";
+    std::string openswordigo_library;
+    std::string cli_mod;
+#ifdef HEADLESS_DEFAULT
+    headless = true;
+#endif
+    for (int i = 1; i < argc; i++) {
+        // ---- Engine-pod preview (Ruby GG dock) ----------------------------
+        // --pod-preview <shm_name>:<W>x<H> — boot a hidden low-res session and
+        // publish frames over shared memory (see platform/pod_ipc.h).
+        const char* pod_arg = nullptr;
+        if (strncmp(argv[i], "--pod-preview=", 14) == 0) pod_arg = argv[i] + 14;
+        else if (strcmp(argv[i], "--pod-preview") == 0 && i + 1 < argc) pod_arg = argv[++i];
+        if (pod_arg) {
+            g_pod_enabled = true;
+            std::string s = pod_arg;
+            size_t colon = s.rfind(':');
+            if (colon != std::string::npos) {
+                g_pod_shm_name = s.substr(0, colon);
+                int w = 0, h = 0;
+                if (sscanf(s.c_str() + colon + 1, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                    g_pod_w = w; g_pod_h = h;
+                }
+            } else {
+                g_pod_shm_name = s;
+            }
+            std::cout << "[Pod] Preview mode: shm='" << g_pod_shm_name
+                      << "' res=" << g_pod_w << "x" << g_pod_h << std::endl;
+        }
+        if (strcmp(argv[i], "--headless") == 0) headless = true;
+        if (strcmp(argv[i], "--check-data") == 0) check_data_only = true;
+        if (strcmp(argv[i], "--host-smoke") == 0) return client_host_smoke();
+        if (strcmp(argv[i], "--guest-smoke") == 0) return client_guest_smoke();
+        if (strcmp(argv[i], "--help") == 0) {
+            std::cout << "SwordigoDesktop ELF/JIT client\n"
+                "  --no-launcher --dynarmic --lib <ARM64 libswordigo.so> --assets <directory>\n"
+                "  --check-data    Validate game/asset/SRE files and exit (0=present, 2=invalid).\n"
+                "  --host-smoke    Test host graphics, audio, events and synthetic save IO.\n"
+                "  --guest-smoke   Test 4 GiB mapping and load/relocate both guest SREs.\n"
+                "See WINDOWS_CLIENT.md for setup, controls, saves and logs.\n";
+            return 0;
+        }
+        if (strcmp(argv[i], "--openswordigo") == 0) use_openswordigo = true;
+        if (strcmp(argv[i], "--openswordigo-scene") == 0 && i + 1 < argc) {
+            openswordigo_scene = argv[++i];
+        }
+        if (strcmp(argv[i], "--openswordigo-lib") == 0 && i + 1 < argc) {
+            openswordigo_library = argv[++i];
+        }
+#ifdef VULKAN_BACKEND
+        if (strcmp(argv[i], "--vulkan") == 0) g_graphics_api = GraphicsAPI::VULKAN;
+#endif
+        if (strcmp(argv[i], "--engine=dynarmic") == 0 || strcmp(argv[i], "--dynarmic") == 0) {
+            g_use_dynarmic = true;
+            std::cout << "[Main] Engine: Dynarmic JIT" << std::endl;
+        }
+        if (strcmp(argv[i], "--engine=unicorn") == 0 || strcmp(argv[i], "--unicorn") == 0) {
+            g_use_dynarmic = false;
+            std::cout << "[Main] Engine: Unicorn (TCG)" << std::endl;
+        }
+        if (strcmp(argv[i], "--sre") == 0) {
+            g_use_sre = true;
+            std::cout << "[Main] SRE: Enabled" << std::endl;
+        }
+        if (strcmp(argv[i], "--no-sre") == 0) {
+            g_use_sre = false;
+            std::cout << "[Main] SRE: Disabled" << std::endl;
+        }
+        if (strcmp(argv[i], "--test-lib") == 0) {
+            g_lib_name = "engine/v1.4.12/armeabi-v7a/libswordigo.so";
+            std::cout << "[Main] Using v1.4.12 ARM32" << std::endl;
+        }
+        if (strcmp(argv[i], "--scene") == 0 && i + 1 < argc) {
+            g_boot_scene = argv[++i];
+            std::cout << "[Main] Direct boot scene: " << g_boot_scene << std::endl;
+        }
+        if (strncmp(argv[i], "--scene=", 8) == 0) {
+            g_boot_scene = argv[i] + 8;
+            std::cout << "[Main] Direct boot scene: " << g_boot_scene << std::endl;
+        }
+        if (strcmp(argv[i], "--lib") == 0 && i + 1 < argc) {
+            g_lib_name = argv[++i];
+            std::cout << "[Main] Custom lib: " << g_lib_name << std::endl;
+        }
+        if ((strcmp(argv[i], "--mod") == 0 || strcmp(argv[i], "-mod") == 0) && i + 1 < argc) {
+            cli_mod = argv[++i];
+            g_launcher_selected_mod = cli_mod;
+            set_active_mod_name(cli_mod);
+            std::cout << "[Main] Mod specified via CLI: " << cli_mod << std::endl;
+        }
+        if (strncmp(argv[i], "--mod=", 6) == 0) {
+            cli_mod = argv[i] + 6;
+            g_launcher_selected_mod = cli_mod;
+            set_active_mod_name(cli_mod);
+            std::cout << "[Main] Mod specified via CLI: " << cli_mod << std::endl;
+        }
+        if (strcmp(argv[i], "--assets") == 0 && i + 1 < argc) {
+            g_instance_assets_dir = argv[++i];
+            g_assets_dir = "assets";
+            std::cout << "[Main] Custom assets: " << g_instance_assets_dir << std::endl;
+            // Match the launcher: re-point the asset manager at the instance
+            // dir so the engine loads the instance's resources/scene/scl files.
+            asset_manager_init(get_data_path(g_instance_assets_dir).c_str());
+            asset_manager_init_arm32(get_data_path(g_instance_assets_dir).c_str());
+        }
+        // Generate manifest.json from engine/ dir and exit
+        // Usage: swordigo-desktop --generate-manifest [engine_dir] [output_path]
+        if (strcmp(argv[i], "--generate-manifest") == 0) {
+            std::string eng_path = (i + 1 < argc) ? argv[i + 1] : "engine";
+            std::string out_path = (i + 2 < argc) ? argv[i + 2] : eng_path + "/manifest.json";
+            BinarySelector gen;
+            gen.generate_manifest(eng_path, out_path);
+            // Clean exit — stop the background IO thread, then skip static
+            // destruction (see the game-path exit note below).
+            io_thread_stop();
+            std::cout.flush();
+            std::cerr.flush();
+            std::quick_exit(0);
+        }
+    }
+
+    if (check_data_only) {
+        const auto sre = get_data_path(g_lib_name.find("v1.4.13") != std::string::npos
+            ? "libs/libsre13.so" : "libs/libsre12.so");
+        const auto errors = client::check_data(get_data_path(g_lib_name),
+            get_data_path(g_instance_assets_dir), g_use_sre ? sre : "");
+        for (const auto& error : errors) std::cerr << "[Setup] " << error << '\n';
+        if (errors.empty()) std::cout << "[Setup] Required containers present; gameplay compatibility untested.\n";
+        return errors.empty() ? 0 : 2;
+    }
+
+    // Pod mode always runs the ARM64 Dynarmic + SRE13 pipeline at low res.
+    if (g_pod_enabled) {
+        g_use_sre = true;
+        g_use_dynarmic = true;
+        g_graphics_api = GraphicsAPI::OPENGL;
+        headless = false;
+        std::cout << "[Pod] Forcing Dynarmic + SRE + OpenGL for preview session" << std::endl;
+    }
+    
+    // Set up user-writable directory paths
+#ifdef _WIN32
+    // Use the same app-data root as the launcher (get_user_data_dir / APPDATA),
+    // so instance.ini files and setup placed in ..\Roaming\swordigo-desktop are
+    // found by both the boot scan and the launcher.
+    std::string base_dir = get_user_data_dir();
+    while (!base_dir.empty() && (base_dir.back() == '/' || base_dir.back() == '\\'))
+        base_dir.pop_back();
+#else
+    std::string home_dir = getenv("HOME") ? getenv("HOME") : ".";
+    std::string xdg_data = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home_dir + "/.local/share");
+    std::string base_dir = xdg_data + "/swordigo-desktop";
+#endif
+
+    fs::create_directories(base_dir + "/save");
+    fs::create_directories(base_dir + "/cache");
+    g_save_dir = base_dir + "/save";
+    g_cache_dir = base_dir + "/cache";
+    std::cout << "[Main] Save directory: " << g_save_dir << std::endl;
+    std::cout << "[Main] Cache directory: " << g_cache_dir << std::endl;
+    
+    Display display;
+    
+    // ========================================================================
+    // First-run setup: copy data from system install to user dir
+    // (like Minecraft: /usr/share/swordigo → ~/.local/share/swordigo-desktop/)
+    // ========================================================================
+    ensure_user_data();
+    
+    // ========================================================================
+    // Binary discovery (manifest-first, scan-fallback)
+    // ========================================================================
+    // Priority: user data dir > CWD > env override > system install
+    std::string data_dir = base_dir;  // ~/.local/share/swordigo-desktop/
+    const char* env_dir = getenv("SWORDIGO_DATA_DIR");
+    if (env_dir) data_dir = env_dir;
+    
+    // If user data dir has no engine/, fall back to CWD (dev mode)
+    if (!fs::exists(data_dir + "/engine")) {
+        if (fs::exists("./engine")) {
+            data_dir = ".";
+            std::cout << "[Boot] Using CWD for game data (dev mode)" << std::endl;
+        }
+    }
+    
+    // Paths for manifest-based loading
+    std::string engine_dir = data_dir + "/engine";
+    std::string system_manifest = engine_dir + "/manifest.json";
+    std::string user_config_dir;
+    const char* xdg_config = getenv("XDG_CONFIG_HOME");
+    if (xdg_config) {
+        user_config_dir = std::string(xdg_config) + "/swordigo-desktop";
+    } else {
+        const char* home = getenv("HOME");
+        user_config_dir = std::string(home ? home : ".") + "/.config/swordigo-desktop";
+    }
+    std::string user_instances_path = user_config_dir + "/instances.json";
+    std::string registry_path = base_dir + "/swordigo_binaries.json";
+    
+    // Set data_dir on BinarySelector so save_instance_ini() can use it
+    g_binary_selector.set_data_dir(data_dir);
+    
+    // Strategy: always use INI-based scan on engine/ dir if exists
+    if (fs::exists(engine_dir) && fs::is_directory(engine_dir)) {
+        std::cout << "[Boot] Scanning engine directory for instance.ini files..." << std::endl;
+        g_binary_selector.load_manifest(system_manifest);
+    } else {
+        // Legacy: flat directory scan
+        std::cout << "[Boot] No engine/ dir, flat scan: " << data_dir << std::endl;
+        g_binary_selector.scan_directory(data_dir);
+        if (data_dir != "." && data_dir != base_dir) {
+            g_binary_selector.scan_directory(base_dir);
+        }
+    }
+    
+    // Always load user-added custom instances
+    g_binary_selector.load_user_instances(user_instances_path);
+    
+    // Load old-format registry for backward compat
+    g_binary_selector.load_registry(registry_path);
+
+    // ========================================================================
+    // Show unified launcher GUI (graphics API + binary selection)
+    // ========================================================================
+    if (!headless && !use_openswordigo) {
+        bool skip_launcher = false;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--vulkan") == 0 || strcmp(argv[i], "--no-launcher") == 0 ||
+                strcmp(argv[i], "--lib") == 0 || strcmp(argv[i], "--scene") == 0 ||
+                strncmp(argv[i], "--scene=", 8) == 0) {
+                skip_launcher = true;
+                break;
+            }
+        }
+        if (!skip_launcher) {
+            LaunchConfig lconf = show_launcher(g_binary_selector);
+            if (!lconf.should_launch) {
+                std::cout << "[Main] Launch cancelled by user" << std::endl;
+                // Save any instances created during this session
+                g_binary_selector.save_user_instances(user_instances_path);
+                // Clean shutdown — same policy as the game-path exit below:
+                // stop the background IO thread first, then quick_exit so we
+                // never run unsafe static destructors. A plain return 0 here
+                // ran __cxa_finalize while the IO thread was still alive,
+                // causing a 'double free or corruption' in libswcore's global
+                // destructors on every launcher window close.
+                io_thread_stop();
+                std::cout.flush();
+                std::cerr.flush();
+                std::quick_exit(0);
+            }
+             g_graphics_api = lconf.graphics_api;
+             g_lib_name = lconf.selected_binary;
+             g_instance_assets_dir = lconf.assets_dir;
+             g_assets_dir = "assets";
+             g_use_dynarmic = lconf.use_dynarmic;
+             g_use_sre = lconf.use_sre;
+             g_advanced_redstell_opts = lconf.advanced_redstell_opts;
+             g_launcher_selected_mod = lconf.selected_mod;
+             if (!cli_mod.empty()) {
+                 g_launcher_selected_mod = cli_mod;
+                 set_active_mod_name(cli_mod);
+             }
+             // Re-initialize the asset manager with the correct assets directory
+             // (asset_manager_init was called at startup with the default "assets" path)
+             asset_manager_init(get_data_path(g_instance_assets_dir).c_str());
+             asset_manager_init_arm32(get_data_path(g_instance_assets_dir).c_str());
+             g_binary_selector.set_loaded(g_lib_name);
+             
+             // Persist any user instances created during this session
+             g_binary_selector.save_user_instances(user_instances_path);
+             std::cout << "[Main] Launcher: " 
+                       << (g_graphics_api == GraphicsAPI::VULKAN ? "Vulkan" : "OpenGL")
+                       << " | Engine: " << (g_use_dynarmic ? "Dynarmic" : "Unicorn")
+                       << " | Binary: " << g_lib_name
+                       << " | Assets: " << g_assets_dir << " (Instance: " << g_instance_assets_dir << ")" << std::endl;
+        }
+    }
+
+    if (!headless) {
+        int native_w = 1920, native_h = 1080;
+        int pod_win_logical_w = 0, pod_win_logical_h = 0;  // pod: logical window px
+        if (g_pod_enabled) {
+            // Ask for a logical window size that lands near the requested
+            // preview resolution after HiDPI content scaling, so the drawable
+            // (and hence the shm frames) stay close to e.g. 1280x720 instead
+            // of ballooning to 2x on retina-class displays.
+            float density = 1.0f;
+            SDL_DisplayID pid = SDL_GetPrimaryDisplay();
+            if (pid) {
+                float cs = SDL_GetDisplayContentScale(pid);
+                if (cs >= 1.0f) density = cs;
+            }
+            native_w = (int)(g_pod_w / density + 0.5f);
+            native_h = (int)(g_pod_h / density + 0.5f);
+            if (native_w < 320) native_w = 320;
+            if (native_h < 180) native_h = 180;
+            pod_win_logical_w = native_w;
+            pod_win_logical_h = native_h;
+            std::cout << "[Pod] Window logical " << native_w << "x" << native_h
+                      << " (display scale " << density << ") to hit ~"
+                      << g_pod_w << "x" << g_pod_h << std::endl;
+        }
+        {
+            SDL_DisplayID display_id = SDL_GetPrimaryDisplay();
+            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display_id);
+            if (mode && !g_pod_enabled) {
+                native_w = mode->w;
+                native_h = mode->h;
+                std::cout << "[Main] Native display: " << native_w << "x" << native_h 
+                          << " @ " << mode->refresh_rate << "Hz" << std::endl;
+            }
+        }
+
+        bool display_initialized = false;
+
+#ifdef VULKAN_BACKEND
+        if (g_graphics_api == GraphicsAPI::VULKAN) {
+            if (display.init_vulkan(native_w, native_h, "Swordigo")) {
+                g_display_active = true;
+                g_display_ptr = &display;
+                if (!g_vk_backend.init(display.get_window(), GAME_W, GAME_H)) {
+                    std::cerr << "[Main] Vulkan backend init failed, falling back to OpenGL" << std::endl;
+                    g_graphics_api = GraphicsAPI::OPENGL;
+                    // Will fall back to OpenGL display creation below
+                } else {
+                    std::cout << "[Main] Vulkan backend initialized" << std::endl;
+                    display_initialized = true;
+                }
+            }
+        }
+#endif
+
+        if (g_graphics_api == GraphicsAPI::OPENGL) {
+            if (display.init(native_w, native_h, "Swordigo", g_pod_enabled)) {
+                g_display_active = true;
+                g_display_ptr = &display;
+                display_initialized = true;
+                // The boot loading screen is created AFTER g_swordfare_gui.init()
+                // below, because it reuses that GUI's ImGui context + shared
+                // SDL3/GL3 backend (creating a second backend and later shutting
+                // it down crashed the game GUI's first frame).
+            }
+        }
+
+        if (display_initialized) {
+            // Get physical drawable dimensions (HiDPI)
+            SDL_GetWindowSizeInPixels(display.get_window(), &g_draw_w, &g_draw_h);
+
+            // Pod mode: SDL reports drawable = logical × pixel density, so
+            // resize the (hidden) window so the DRAWABLE size lands near the
+            // requested preview resolution. g_win_w/g_win_h then mirror the
+            // LOGICAL size, which is what ruby's normalized coordinates and
+            // SDL mouse events both operate in.
+            if (g_pod_enabled) {
+                float pd = SDL_GetWindowPixelDensity(display.get_window());
+                if (pd < 1.0f) pd = 1.0f;
+                int log_w = (int)(g_pod_w / pd + 0.5f);
+                int log_h = (int)(g_pod_h / pd + 0.5f);
+                if (log_w < 160) log_w = 160;
+                if (log_h < 90) log_h = 90;
+                SDL_SetWindowSize(display.get_window(), log_w, log_h);
+                SDL_GetWindowSizeInPixels(display.get_window(), &g_draw_w, &g_draw_h);
+                g_win_w = log_w;
+                g_win_h = log_h;
+                std::cout << "[Pod] pixel density " << pd << " -> logical "
+                          << log_w << "x" << log_h << ", drawable "
+                          << g_draw_w << "x" << g_draw_h << std::endl;
+            }
+
+            // --- Dynamic render resolution: match drawable pixels & aspect ratio ---
+            // Use the physical drawable size directly as the game render resolution.
+            // This gives 1:1 pixel mapping — no upscaling, maximum sharpness.
+            // The aspect ratio naturally matches the display (16:10, 16:9, etc.)
+            GAME_W = g_draw_w;
+            GAME_H = g_draw_h;
+            // Clamp to reasonable range: at least 1920 wide, at most 4096 wide
+            if (GAME_W < 1920) { GAME_W = 1920; GAME_H = (int)(1920.0f * g_draw_h / g_draw_w); }
+            if (GAME_W > 4096) { float s = 4096.0f / GAME_W; GAME_W = 4096; GAME_H = (int)(GAME_H * s); }
+            // Ensure even dimensions (GPU-friendly)
+            GAME_W &= ~1;
+            GAME_H &= ~1;
+            // Recompute touch coordinate scaling
+            TOUCH_SCALE_X = (float)GAME_W / 960.0f;
+            TOUCH_SCALE_Y = (float)GAME_H / 544.0f;
+
+            // Pod mode: open the shared-memory frame ring now that the real
+            // back-buffer dimensions are known, and arm the stdin control
+            // reader so ruby can pause/mute/quit/type from boot onwards.
+            if (g_pod_enabled) {
+                pod_start_reader();
+                g_pod_ring = pod::FrameRing::create(g_pod_shm_name,
+                                                    (uint32_t)g_draw_w,
+                                                    (uint32_t)g_draw_h);
+                if (g_pod_ring) {
+                    g_pod_ring->set_state(pod::kStateBooting);
+                    std::cout << "[Pod] Frame ring ready (" << g_draw_w << "x"
+                              << g_draw_h << ", 3 slots) for shm '"
+                              << g_pod_shm_name << "'" << std::endl;
+                } else {
+                    std::cerr << "[Pod] WARNING: cannot create frame shm '"
+                              << g_pod_shm_name << "' — preview disabled" << std::endl;
+                }
+            }
+
+            std::cout << "[Main] Display initialized - native " << native_w << "x" << native_h
+                      << " | drawable: " << g_draw_w << "x" << g_draw_h
+                      << " | render: " << GAME_W << "x" << GAME_H
+                      << " | aspect: " << std::fixed << std::setprecision(3)
+                      << ((float)GAME_W / GAME_H) << std::endl;
+            // OpenSwordigo owns its own ImGui context for the in-engine menu
+            // (see openswordigo_plugin.cpp) — don't double-init the host GUI.
+            if (!use_openswordigo) {
+                if (g_graphics_api == GraphicsAPI::OPENGL) {
+                    g_swordfare_gui.init(display.get_window(), SDL_GL_GetCurrentContext());
+#ifdef VULKAN_BACKEND
+                } else if (g_graphics_api == GraphicsAPI::VULKAN) {
+                    g_swordfare_gui.init_vulkan(display.get_window(), &g_vk_backend);
+#endif
+                }
+
+                // Bring up the boot loading screen now that the game GUI owns a
+                // live ImGui context + SDL3/GL3 backend. The loading screen
+                // REUSES that context/backend (OpenGL path only) so it shows the
+                // logo + hiro animation + progress during the boot gap instead
+                // of a blank window — and tears down only its own resources.
+                if (!headless && !g_pod_enabled && g_graphics_api == GraphicsAPI::OPENGL &&
+                    g_swordfare_gui.is_initialized() && g_swordfare_gui.imgui_context()) {
+                    g_loading_screen = new LoadingScreen();
+                    if (!g_loading_screen->init(display.get_window(),
+                                                g_swordfare_gui.imgui_context())) {
+                        delete g_loading_screen;
+                        g_loading_screen = nullptr;
+                    } else {
+                        g_loading_screen->set_stage("Preparing runtime");
+                        g_loading_screen->frame();
+                    }
+                }
+            }
+        } else {
+            std::cerr << "[Main] Display init failed, falling back to headless" << std::endl;
+        }
+    } else {
+        if (headless) std::cout << "[Main] Running in headless mode" << std::endl;
+    }
+
+    if (use_openswordigo) {
+        if (headless) {
+            std::cerr << "[OpenSwordigo/Host] --headless is not supported yet" << std::endl;
+            return 2;
+        }
+        if (!g_display_active) {
+            std::cerr << "[OpenSwordigo/Host] Display initialization failed" << std::endl;
+            return 1;
+        }
+
+        if (openswordigo_library.empty()) {
+            const std::string installed = get_data_path("OpenSwordigo/libopenswordigo.so");
+            if (fs::exists(installed)) {
+                openswordigo_library = installed;
+            } else if (fs::exists("./OpenSwordigo/build/bin/libopenswordigo.so")) {
+                openswordigo_library = "./OpenSwordigo/build/bin/libopenswordigo.so";
+            } else {
+                openswordigo_library = "./bin/libs/libopenswordigo.so";
+            }
+        }
+
+        OpenSwordigoLaunchOptions options;
+        options.library_path = openswordigo_library;
+        options.assets_root = get_data_path(g_instance_assets_dir + "/resources");
+        options.scene = openswordigo_scene;
+        const int result = run_openswordigo(display, options);
+        std::cout.flush();
+        std::cerr.flush();
+        std::quick_exit(result);
+    }
+
+    // ========================================================================
+    // Binary fallback (only if launcher was skipped via CLI flags)
+    // ========================================================================
+    {
+        const auto& bins = g_binary_selector.get_binaries();
+        if (g_lib_name.find("engine/") != std::string::npos || g_lib_name.find("/") != std::string::npos) {
+            // Full path specified (engine/ structure or CLI --lib path)
+            std::cout << "[BinSel] Using: " << g_lib_name << std::endl;
+            g_binary_selector.set_loaded(g_lib_name);
+        } else if (!bins.empty()) {
+            g_lib_name = g_binary_selector.get_default();
+            g_binary_selector.set_loaded(g_lib_name);
+            std::cout << "[BinSel] Using default: " << g_lib_name << std::endl;
+        }
+        g_binary_selector.save_registry(registry_path);
+        g_binary_selector.save_user_instances(user_instances_path);
+    }
+
+    init_all();
+
+    // ── Memory Research Catalog — init embedded SQLite3 DB ─────────────────
+    // Called immediately after init_all() (which allocates g_guest_memory).
+    // get_data_path("") gives the writable user data root for user_research.db.
+    {
+        std::string user_data_root = get_data_path("");
+        // Trim trailing separator
+        while (!user_data_root.empty() &&
+               (user_data_root.back() == '/' || user_data_root.back() == '\\'))
+            user_data_root.pop_back();
+        swordfare::research::RecoveryCatalog::instance().init(user_data_root);
+    }
+
+    // Detect architecture from binary ELF header
+    {
+        std::string so_path = get_data_path(g_lib_name);
+        g_is_arm64 = is_arm64_binary(so_path);
+        std::cout << "[Boot] Architecture: " << (g_is_arm64 ? "ARM64" : "ARM32") << std::endl;
+    }
+    
+    if (g_is_arm64) {
+        load_and_boot_arm64();
+    } else {
+        load_and_boot();
+    }
+
+    // Cleanup FBO/Vulkan and background IO thread
+    if (g_display_active) {
+#ifdef VULKAN_BACKEND
+        if (g_graphics_api == GraphicsAPI::VULKAN) {
+            g_vk_backend.destroy();
+        } else
+#endif
+        {
+            g_swordfare_gui.shutdown();
+            fbo_destroy();
+        }
+    }
+    VideoBackground::cleanup();
+    io_thread_stop();
+    RedstellGC::instance().shutdown();
+
+    // Pod mode: mark the session done and release the shared frame ring.
+    // (Process exits right after via quick_exit, so the stdin reader thread
+    // does not need explicit joining.)
+    if (g_pod_ring) {
+        g_pod_ring->set_state(pod::kStateExiting);
+        delete g_pod_ring;
+        g_pod_ring = nullptr;
+    }
+    
+    std::cout << "[Main] Swordigo — session complete." << std::endl;
+
+    /*
+     * The guest loader owns a large amount of state whose lifetime extends
+     * beyond the host frame loop.  Running C++ static destructors here is not
+     * safe: the selector teardown currently walks BinaryInfo strings after
+     * the guest/loader teardown has invalidated process-wide state.  All
+     * owned runtime resources have been explicitly stopped above; terminate
+     * without re-entering unordered static destruction.
+     */
+    std::cout.flush();
+    std::cerr.flush();
+    std::quick_exit(0);
+}
+
+extern "C" const char* sre_resolve_symbol(uint64_t addr) {
+    // Search in g_main_mod_64
+    for (int i = 0; i < g_main_mod_64.num_dynsym; i++) {
+        if (g_main_mod_64.dynsym[i].st_name == 0) continue;
+        uint64_t val = g_main_mod_64.base_addr + g_main_mod_64.dynsym[i].st_value;
+        uint64_t size = g_main_mod_64.dynsym[i].st_size;
+        if (size == 0) size = 8; // fallback size
+        if (addr >= val && addr < val + size) {
+            return g_main_mod_64.dynstr + g_main_mod_64.dynsym[i].st_name;
+        }
+    }
+    // Search in g_sre_mod
+    for (int i = 0; i < g_sre_mod.num_dynsym; i++) {
+        if (g_sre_mod.dynsym[i].st_name == 0) continue;
+        uint64_t val = g_sre_mod.base_addr + g_sre_mod.dynsym[i].st_value;
+        uint64_t size = g_sre_mod.dynsym[i].st_size;
+        if (size == 0) size = 8; // fallback size
+        if (addr >= val && addr < val + size) {
+            return g_sre_mod.dynstr + g_sre_mod.dynsym[i].st_name;
+        }
+    }
+    // Search in g_sre_extras_mod (optional addon)
+    if (g_sre_extras_mod.dynstr && g_sre_extras_mod.dynsym && g_sre_extras_mod.num_dynsym > 0) {
+        for (int i = 0; i < g_sre_extras_mod.num_dynsym; i++) {
+            if (g_sre_extras_mod.dynsym[i].st_name == 0) continue;
+            uint64_t val = g_sre_extras_mod.base_addr + g_sre_extras_mod.dynsym[i].st_value;
+            uint64_t size = g_sre_extras_mod.dynsym[i].st_size;
+            if (size == 0) size = 8; // fallback size
+            if (addr >= val && addr < val + size) {
+                return g_sre_extras_mod.dynstr + g_sre_extras_mod.dynsym[i].st_name;
+            }
+        }
+    }
+    return nullptr;
+}
+
+extern "C" uint64_t sre_resolve_address(const char* symbol) {
+    if (!symbol) return 0;
+    
+    // Search in g_main_mod_64
+    for (int i = 0; i < g_main_mod_64.num_dynsym; i++) {
+        if (g_main_mod_64.dynsym[i].st_name == 0) continue;
+        const char* name = g_main_mod_64.dynstr + g_main_mod_64.dynsym[i].st_name;
+        if (strcmp(name, symbol) == 0) {
+            return g_main_mod_64.base_addr + g_main_mod_64.dynsym[i].st_value;
+        }
+    }
+    
+    // Search in g_sre_mod
+    for (int i = 0; i < g_sre_mod.num_dynsym; i++) {
+        if (g_sre_mod.dynsym[i].st_name == 0) continue;
+        const char* name = g_sre_mod.dynstr + g_sre_mod.dynsym[i].st_name;
+        if (strcmp(name, symbol) == 0) {
+            return g_sre_mod.base_addr + g_sre_mod.dynsym[i].st_value;
+        }
+    }
+
+    // Search in g_sre_extras_mod (optional addon)
+    if (g_sre_extras_mod.dynstr && g_sre_extras_mod.dynsym && g_sre_extras_mod.num_dynsym > 0) {
+        for (int i = 0; i < g_sre_extras_mod.num_dynsym; i++) {
+            if (g_sre_extras_mod.dynsym[i].st_name == 0) continue;
+            const char* name = g_sre_extras_mod.dynstr + g_sre_extras_mod.dynsym[i].st_name;
+            if (strcmp(name, symbol) == 0) {
+                return g_sre_extras_mod.base_addr + g_sre_extras_mod.dynsym[i].st_value;
+            }
+        }
+    }
+
+    return 0;
+}

@@ -1,0 +1,217 @@
+/*
+ * sre.h — Swordigo Runtime Engine
+ * 
+ * Public header for libsre12.so — an ARM64 shared library that replaces
+ * problematic functions in libswordigo.so with clean, non-atomic,
+ * single-threaded implementations.
+ *
+ * Compiled with: aarch64-linux-gnu-gcc -shared -fPIC -O2
+ * Loaded by: SwordigoDesktop ELF loader as a guest dependency
+ */
+
+#ifndef SRE_H
+#define SRE_H
+
+/* Freestanding type definitions — no libc headers needed */
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+typedef unsigned long      uint64_t;
+typedef signed int         int32_t;
+typedef signed long        int64_t;
+typedef unsigned long      size_t;
+typedef long               ptrdiff_t;
+
+/* Aliases used by other SRE headers */
+typedef uint64_t           sre_u64;
+typedef uint32_t           sre_u32;
+typedef unsigned long      sre_size_t;
+
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
+
+/* =========================================================================
+ * CppString — GNU libstdc++ COW std::string internals
+ * =========================================================================
+ * The Caver engine uses GNU libstdc++ std::string with Copy-On-Write (COW).
+ * The string data is prefixed by a _Rep header:
+ *
+ *   [_Rep header (24 bytes)][string data (capacity+1 bytes)]
+ *                            ^
+ *                            std::string::_M_p points here
+ *
+ * The _Rep::_M_refcount uses atomic LDAXR/STLXR on ARM64, causing spin
+ * loops in Unicorn. Our replacement uses simple non-atomic operations.
+ *
+ * Refcount convention (GNU libstdc++):
+ *   -1 = leaked/static (never delete — used by empty string sentinel)
+ *    0 = one reference (not shared)
+ *   >0 = N+1 references (shared)
+ */
+
+/* Matches GNU libstdc++ _Rep layout on AArch64 */
+typedef struct {
+    uint64_t length;       /* offset 0:  current string length */
+    uint64_t capacity;     /* offset 8:  allocated capacity (excl. NUL) */
+    int32_t  refcount;     /* offset 16: reference count (see convention above) */
+    int32_t  _pad;         /* offset 20: padding for 8-byte alignment */
+    /* char data[] follows at offset 24 */
+} SreStringRep;
+
+/* Get the _Rep header from a string data pointer */
+#define SRE_REP(data_ptr) (((SreStringRep*)(data_ptr)) - 1)
+
+/* Get the string data from a _Rep pointer */
+#define SRE_DATA(rep_ptr) ((char*)((rep_ptr) + 1))
+
+/* std::string object is just a pointer to the data */
+typedef struct {
+    char* data;  /* points to character data after _Rep header */
+} SreString;
+
+/* =========================================================================
+ * Hook Table — defines which functions to redirect
+ * =========================================================================
+ * The host reads this table after loading libsre12.so and writes trampolines
+ * at each target address in libswordigo.so.
+ */
+
+typedef struct {
+    uint64_t    target_offset;  /* file offset in libswordigo.so */
+    const char* symbol_name;    /* symbol name in libsre12.so */
+    uint64_t    orig_func;      /* relay stub address (set by host after trampoline install) */
+} SreHookEntry;
+
+/* =========================================================================
+ * Exported functions — called from the host or via trampoline
+ * =========================================================================
+ */
+
+/* Initialization — called by host after loading */
+void sre_init(uint64_t swordigo_base, uint64_t empty_sentinel_bss_offset);
+
+/* Vtable Validator — verifies if vtable is 8-byte aligned and inside valid module range */
+int sre_is_valid_vtable_ptr(uint64_t vtable);
+
+/* Code-pointer validator (FIX6) — verifies addr is a 4-byte-aligned executable
+ * function pointer inside the UNION superset of all known .text/code ranges:
+ * guest .text [0x1203e90, 0x1583478) OR libsre [0x2000000, 0x2300000). */
+int sre_is_valid_code_ptr(uint64_t addr);
+
+/* CppString replacements — hooked via trampoline */
+SreString* sre_CppString_from_char_p(SreString* self, const char* src);
+SreString* sre_CppString_assign(SreString* self, const char* src, uint64_t len);
+SreString* sre_CppString_append(SreString* self, const char* src, uint64_t len);
+void sre_CppString_release(SreString* self);
+void sre_CppString_rep_release(SreStringRep* rep);
+
+/* C++ exception frame initializer — prevents EHABI abort (sre_effects.c) */
+void sre_ExceptionFrameInit(uint64_t* a1, uint64_t a2, uint64_t a3);
+
+/* C++ unwind dispatcher — returns immediately, drops the broken exception (sre_effects.c) */
+void* sre_UnwindRaiseException(void* a1);
+
+/* AudioSystem::EndAudioInterruptionIfNecessary — no-op on desktop (sre_caver.c) */
+void* sre_AudioSystem_EndAudioInterruptionIfNecessary(void* self);
+
+/* __stack_chk_fail replacement — pure return-to-LR, no longjmp (sre_caver.c) */
+void sre_stack_chk_fail(void);
+
+/* =========================================================================
+ * Math types (matching Caver engine)
+ * =========================================================================
+ */
+
+typedef struct { float x, y; }       SreVec2;
+typedef struct { float x, y, z; }    SreVec3;
+typedef struct { float r, g, b, a; } SreColor;
+
+/* =========================================================================
+ * Frame Loop — sre_frame_loop.c
+ * =========================================================================
+ * Per-frame update pipeline with time-sliced coroutine scheduling.
+ */
+
+/* Per-frame coroutine time-budget state (volatile, polled by ProgramState_Update) */
+extern volatile int   g_sre_frame_budget_expired;
+extern volatile float g_sre_frame_budget_ms_remaining;
+extern volatile uint64_t g_sre_update_application_ticks;
+extern volatile uint64_t g_sre_frame_update_ticks;
+extern volatile uint64_t g_sre_frame_shell_ticks;
+
+/* Called at the start of each host frame to reset the time budget */
+void sre_frame_budget_start(void);
+
+/* Returns 1 if this frame's coroutine time budget is exhausted */
+int sre_frame_budget_check(void);
+
+/* Main frame tick: called from sre_updateApplication instead of original relay */
+void sre_frame_update(void* env, void* obj, float dt);
+
+/* PC-safe CaverShell::Update replacement (trampoline target) */
+void sre_CaverShell_Update_trampoline(void* self, float dt);
+
+/* Scene::Update hook (call-through, allows ProgramState budget to work) */
+void sre_Scene_Update(void* self, float dt);
+
+/* GameSceneController::Update hook (call-through) */
+void sre_GameSceneController_Update(void* self, float dt);
+
+/* GUIApplication::DispatchEvents PC no-op */
+void sre_GUIApplication_DispatchEvents(void* self);
+
+/* Relay pointers set by trampoline installer */
+typedef void (*pfn_CaverShell_Update)(void* self, float dt);
+extern pfn_CaverShell_Update g_orig_CaverShell_Update;
+
+typedef void (*pfn_orig_GSC_Update)(void* self, float dt);
+extern pfn_orig_GSC_Update g_orig_GameSceneController_Update;
+
+typedef void (*pfn_orig_Scene_Update)(void* self, float dt);
+extern pfn_orig_Scene_Update g_orig_Scene_Update_fn;
+
+/* GameSceneView::Update relay — set by TrampolineMgr in main.cpp.
+ * Points to the relay cave that executes the original GameSceneView::Update
+ * first instruction and jumps back to the rest of the original function. */
+typedef void (*pfn_orig_GSV_Update)(void* self, float dt);
+extern pfn_orig_GSV_Update g_orig_GameSceneView_Update_fn;
+
+/* GameData::Clear crash guard (sre_scene_update.c) */
+void sre_GameData_Clear(void* this_);
+extern uint64_t g_orig_GameData_Clear;
+
+/* ComponentOutletBase::Connect vtable safety guard (sre_scene_update.c) */
+uint64_t sre_ComponentOutletBase_Connect(void* this_, void* a2);
+extern uint64_t g_orig_ComponentOutletBase_Connect;
+
+/* Proto::SceneObject destructor guard used during scene teardown. */
+void sre_Proto_SceneObject_Destroy(void* this_);
+extern uint64_t g_orig_Proto_SceneObject_Destroy;
+
+/* =========================================================================
+ * Button lifecycle hooks — auto-hide/show buttons during game state changes.
+ * Implemented in sre_mini_api.c.
+ * ========================================================================= */
+void sre_button_set_all_hidden(int hidden);
+void sre_button_remove_all(void);
+void sre_button_lifecycle_set_enabled(int enabled);
+void sre_button_lifecycle_on_cinematic_mode(int enabled);
+void sre_button_lifecycle_on_menu_load(void);
+void sre_button_lifecycle_on_menu_disappear(void);
+void sre_button_lifecycle_on_pause(void);
+void sre_button_lifecycle_on_unpause(void);
+void sre_button_lifecycle_on_portal_in(void);
+void sre_button_lifecycle_on_portal_out(void);
+void sre_button_lifecycle_on_skill_picker_load(void);
+void sre_button_lifecycle_on_skill_picker_destroy(void);
+void sre_button_lifecycle_on_game_over(void);
+void sre_button_lifecycle_on_scene_destruct(void);
+
+/* Host-triggered developer overlays & debug toggles (sre_scene_update.c) */
+extern volatile int g_sre_request_toggle_debug_info;
+extern volatile int g_sre_request_toggle_collision_shapes;
+extern volatile int g_sre_request_toggle_combat_wireframe;
+
+#endif /* SRE_H */
+

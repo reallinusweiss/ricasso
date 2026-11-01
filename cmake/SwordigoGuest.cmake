@@ -1,0 +1,17 @@
+include_guard(GLOBAL)
+set(SWORDIGO_GUEST_CC "" CACHE FILEPATH "ARM64 ELF compiler (cross GCC or Clang, never host MinGW GCC)")
+if (SWORDIGO_GUEST_CC)
+    set(AARCH64_CC "${SWORDIGO_GUEST_CC}")
+    get_filename_component(_guest_name "${AARCH64_CC}" NAME)
+    if (_guest_name MATCHES "clang")
+        # The SRE uses the repository's freestanding guest libc declarations.
+        # Android imports are resolved by the ELF loader; no host CRT is linked.
+        set(SWORDIGO_GUEST_FLAGS --target=aarch64-linux-android21 -ffreestanding)
+        set(SWORDIGO_GUEST_LINK_FLAGS -fuse-ld=lld -Wl,--hash-style=both)
+    endif()
+else()
+    find_program(AARCH64_CC aarch64-linux-gnu-gcc)
+endif()
+if (NOT AARCH64_CC)
+    message(FATAL_ERROR "SRE requires an ARM64 ELF compiler. Set SWORDIGO_GUEST_CC to clang or aarch64-linux-gnu-gcc, or disable SWORDIGO_BUILD_SRE and supply matching guest libraries.")
+endif()
