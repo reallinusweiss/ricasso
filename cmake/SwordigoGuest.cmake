@@ -15,3 +15,5 @@ endif()
 if (NOT AARCH64_CC)
     message(FATAL_ERROR "SRE requires an ARM64 ELF compiler. Set SWORDIGO_GUEST_CC to clang or aarch64-linux-gnu-gcc, or disable SWORDIGO_BUILD_SRE and supply matching guest libraries.")
 endif()
+# __FILE__ (used by toml-c) must not carry the builder's local path into the guest libraries.
+list(APPEND SWORDIGO_GUEST_FLAGS "-ffile-prefix-map=${CMAKE_SOURCE_DIR}/=")
