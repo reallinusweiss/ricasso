@@ -31,14 +31,14 @@ ProfileManager::ProfileManager() {
 
 QString ProfileManager::profile_file_path() const {
     QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (base.isEmpty()) base = QDir::homePath() + "/.local/share/swordigo-desktop";
+    if (base.isEmpty()) base = QDir::homePath() + "/.local/share/ricasso";
     QDir().mkpath(base);
     return base + "/launcher_profile.json";
 }
 
 QString ProfileManager::avatars_dir_path() const {
     QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (base.isEmpty()) base = QDir::homePath() + "/.local/share/swordigo-desktop";
+    if (base.isEmpty()) base = QDir::homePath() + "/.local/share/ricasso";
     QString av_dir = base + "/avatars";
     QDir().mkpath(av_dir);
     return av_dir;

@@ -43,7 +43,7 @@ static int resolve_mod_resource(const char *filename, char *out_buf, size_t out_
     const char *mod = sre13_get_active_mod();
     if (!mod || !*mod || !filename || !*filename) return 0;
 
-    /* Check ~/.local/share/swordigo-desktop/mods/<mod>/... if g_sre_vfs_data_dir is set */
+    /* Check ~/.local/share/ricasso/mods/<mod>/... if g_sre_vfs_data_dir is set */
     if (g_sre_vfs_data_dir[0]) {
         char base[512];
         strncpy(base, g_sre_vfs_data_dir, sizeof(base) - 1);

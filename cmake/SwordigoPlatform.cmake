@@ -35,7 +35,7 @@ if (SWORDIGO_USE_DYNARMIC)
 endif()
 
 # --- Runtime search paths ---------------------------------------------------
-set(SWORDIGO_RPATH "$ORIGIN/libs;$ORIGIN;$ORIGIN/../libs;$ORIGIN/../share/swordigo-desktop/libs;/usr/share/swordigo-desktop/libs;/usr/share/swordigo-desktop")
+set(SWORDIGO_RPATH "$ORIGIN/libs;$ORIGIN;$ORIGIN/../libs;$ORIGIN/../share/ricasso/libs;/usr/share/ricasso/libs;/usr/share/ricasso")
 set(FFMPEG_LIB_DIR "${SWORDIGO_FFMPEG_ROOT}/lib")
 
 # --- libm ----------------------------------------------------------------

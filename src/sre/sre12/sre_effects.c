@@ -347,7 +347,7 @@ void sre_cxa_throw(void* thrown_exception, void* tinfo, void(*dest)(void*)) {
     fprintf(stderr, "[SRE/cxa_throw] Exception of type '%s' thrown! recovery_depth=%d\n", type_name, g_sre_recovery_depth);
     
     // Log to file for persistent diagnostics
-    FILE* fp = fopen("/home/quantumcreeper/.local/share/swordigo-desktop/sre_exceptions.log", "a");
+    FILE* fp = fopen("/home/quantumcreeper/.local/share/ricasso/sre_exceptions.log", "a");
     if (fp) {
         fprintf(fp, "[SRE/cxa_throw] Exception of type '%s' thrown! recovery_depth=%d\n", type_name, g_sre_recovery_depth);
         fclose(fp);

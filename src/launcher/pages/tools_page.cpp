@@ -68,7 +68,7 @@ void ToolsPage::setup_ui() {
     d_title->setStyleSheet("font-size: 11px; font-weight: bold; color: #8B949E;");
     d_layout->addWidget(d_title);
 
-    auto* btn_data = new QPushButton("  Open User Data Directory (~/.local/share/swordigo-desktop)", dir_card);
+    auto* btn_data = new QPushButton("  Open User Data Directory (~/.local/share/ricasso)", dir_card);
     btn_data->setIcon(LauncherTheme::fa_icon(ICON_FA_FOLDER_OPEN, QColor(160, 174, 192), 14));
     btn_data->setProperty("class", "SecondaryBtn");
     connect(btn_data, &QPushButton::clicked, this, &ToolsPage::on_open_data_clicked);

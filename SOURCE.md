@@ -18,6 +18,6 @@ Modifications in this tree (2026-10-31): images taken from the game were removed
 
 This repository is a reduced snapshot (2026-11-01): it keeps only the files the Windows client build, its tests, packaging and the starter use (determined from the build graph), plus license notices. The editor suite (`src/ruby/`), research tools, documentation, website and Linux/Android packaging of upstream SwordigoDesktop are not included; they remain available upstream. `src/imgui/LICENSE.txt` is the Dear ImGui MIT license, added next to the vendored sources.
 
-Ricasso (2026-11-06) is the project name of this reduced Windows distribution. The client binary (`swordfare.exe`), its data folders and the upstream notices keep their names.
+Ricasso (2026-11-06) is the project name of this reduced Windows distribution. User data lives in `%APPDATA%\ricasso` and logs in `%LOCALAPPDATA%\Ricasso`. The client binary (`swordfare.exe`) and the upstream notices keep their names.
 
 Client reduction (2026-11-01): the in-game Memory Research subsystem (`src/game/research/`, including its embedded recovery database and memory watchpoints), the scene tooling in `src/tools/` (scene loader, creator, program, schemas, physics, collision, entity, game, terrain, workspace, template sources, v3 biome database, file-format library and terrain generator), the unused SCL parser and the OpenSwordigo host mode were removed from the source tree and the build. The `filerift` library now only carries the host Lua. Hero/scene pointer discovery for the mod tools is kept in `src/main.cpp`.

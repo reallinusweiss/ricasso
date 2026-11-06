@@ -27,7 +27,7 @@ Supported: Swordigo 1.4.13 (recommended) and 1.4.12, each in the 64-bit variant 
 WHAT HAPPENS?
 • The package name, version and checksum of the game library are checked.
 • Only what the game needs (game library, "assets" folder, music) is copied – into the subfolder "app".
-• Nothing is uploaded or downloaded. Your saves are kept separately in %APPDATA%\swordigo-desktop.
+• Nothing is uploaded or downloaded. Your saves are kept separately in %APPDATA%\ricasso.
 
 NEW VERSION OF RICASSO?
 Extract the new ZIP, start Ricasso.exe there and choose "Reuse previous installation" – or drag the old Ricasso folder onto the window.

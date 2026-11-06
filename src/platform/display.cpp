@@ -126,8 +126,8 @@ bool Display::init(int w, int h, const std::string& title, bool hidden) {
             const char* icon_paths[] = {
                 icon_via_data.c_str(),
                 "src/assets/icon_gnome.png",
-                "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
-                "/usr/share/pixmaps/swordigo-desktop.png",
+                "/usr/share/icons/hicolor/128x128/apps/ricasso.png",
+                "/usr/share/pixmaps/ricasso.png",
                 nullptr
             };
             for (int i = 0; icon_paths[i]; i++) {
@@ -190,8 +190,8 @@ bool Display::init_vulkan(int w, int h, const std::string& title) {
             const char* icon_paths[] = {
                 icon_via_data.c_str(),
                 "src/assets/icon_gnome.png",
-                "/usr/share/icons/hicolor/128x128/apps/swordigo-desktop.png",
-                "/usr/share/pixmaps/swordigo-desktop.png",
+                "/usr/share/icons/hicolor/128x128/apps/ricasso.png",
+                "/usr/share/pixmaps/ricasso.png",
                 nullptr
             };
             for (int i = 0; icon_paths[i]; i++) {

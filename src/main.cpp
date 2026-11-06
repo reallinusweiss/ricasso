@@ -7063,7 +7063,7 @@ void load_and_boot_arm64() {
                         if (!s_raijin[0]) {
                             const char* home = getenv("HOME");
                             char p[512];
-                            snprintf(p, sizeof(p), "%s/.local/share/swordigo-desktop/lua_scripts/raijin_script.lua",
+                            snprintf(p, sizeof(p), "%s/.local/share/ricasso/lua_scripts/raijin_script.lua",
                                      home ? home : ".");
                             FILE* f = fopen(p, "rb");
                             if (!f) f = fopen("raijin_script.lua", "rb");
@@ -8952,7 +8952,7 @@ int main(int argc, char* argv[]) {
             asset_manager_init_arm32(get_data_path(g_instance_assets_dir).c_str());
         }
         // Generate manifest.json from engine/ dir and exit
-        // Usage: swordigo-desktop --generate-manifest [engine_dir] [output_path]
+        // Usage: ricasso --generate-manifest [engine_dir] [output_path]
         if (strcmp(argv[i], "--generate-manifest") == 0) {
             std::string eng_path = (i + 1 < argc) ? argv[i + 1] : "engine";
             std::string out_path = (i + 2 < argc) ? argv[i + 2] : eng_path + "/manifest.json";
@@ -8989,7 +8989,7 @@ int main(int argc, char* argv[]) {
     // Set up user-writable directory paths
 #ifdef _WIN32
     // Use the same app-data root as the launcher (get_user_data_dir / APPDATA),
-    // so instance.ini files and setup placed in ..\Roaming\swordigo-desktop are
+    // so instance.ini files and setup placed in ..\Roaming\ricasso are
     // found by both the boot scan and the launcher.
     std::string base_dir = get_user_data_dir();
     while (!base_dir.empty() && (base_dir.back() == '/' || base_dir.back() == '\\'))
@@ -8997,7 +8997,7 @@ int main(int argc, char* argv[]) {
 #else
     std::string home_dir = getenv("HOME") ? getenv("HOME") : ".";
     std::string xdg_data = getenv("XDG_DATA_HOME") ? getenv("XDG_DATA_HOME") : (home_dir + "/.local/share");
-    std::string base_dir = xdg_data + "/swordigo-desktop";
+    std::string base_dir = xdg_data + "/ricasso";
 #endif
 
     fs::create_directories(base_dir + "/save");
@@ -9011,7 +9011,7 @@ int main(int argc, char* argv[]) {
     
     // ========================================================================
     // First-run setup: copy data from system install to user dir
-    // (like Minecraft: /usr/share/swordigo → ~/.local/share/swordigo-desktop/)
+    // (like Minecraft: /usr/share/swordigo → ~/.local/share/ricasso/)
     // ========================================================================
     ensure_user_data();
     
@@ -9019,7 +9019,7 @@ int main(int argc, char* argv[]) {
     // Binary discovery (manifest-first, scan-fallback)
     // ========================================================================
     // Priority: user data dir > CWD > env override > system install
-    std::string data_dir = base_dir;  // ~/.local/share/swordigo-desktop/
+    std::string data_dir = base_dir;  // ~/.local/share/ricasso/
     const char* env_dir = getenv("SWORDIGO_DATA_DIR");
     if (env_dir) data_dir = env_dir;
     
@@ -9037,10 +9037,10 @@ int main(int argc, char* argv[]) {
     std::string user_config_dir;
     const char* xdg_config = getenv("XDG_CONFIG_HOME");
     if (xdg_config) {
-        user_config_dir = std::string(xdg_config) + "/swordigo-desktop";
+        user_config_dir = std::string(xdg_config) + "/ricasso";
     } else {
         const char* home = getenv("HOME");
-        user_config_dir = std::string(home ? home : ".") + "/.config/swordigo-desktop";
+        user_config_dir = std::string(home ? home : ".") + "/.config/ricasso";
     }
     std::string user_instances_path = user_config_dir + "/instances.json";
     std::string registry_path = base_dir + "/swordigo_binaries.json";

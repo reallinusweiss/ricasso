@@ -57,7 +57,7 @@ This branch retains the existing upstream menus but does not add the 1.4.13 mod 
 
 ## Saves and logs
 
-Game data is loaded from the package folder. User profiles and controls use the existing `%APPDATA%/swordigo-desktop/` paths; game saves are under its `save/Documents/` tree. The starter writes `%LOCALAPPDATA%/SwordigoDesktop/logs/latest.log`. Personal saves, controls, traces and logs are not part of the release.
+Game data is loaded from the package folder. User profiles and controls use the existing `%APPDATA%/ricasso/` paths; game saves are under its `save/Documents/` tree. The starter writes `%LOCALAPPDATA%/Ricasso/logs/latest.log`. Personal saves, controls, traces and logs are not part of the release.
 
 ## Build from source
 

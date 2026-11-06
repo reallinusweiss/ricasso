@@ -1023,7 +1023,7 @@ static int filemethod_lines(lua_State* L) {
 
 /* MiniPath translation for io.open — translates Android virtual paths to desktop paths.
  * Uses g_sre_vfs_path_* globals from sre_vfs.c if set, otherwise falls back to
- * hardcoded ~/.local/share/swordigo-desktop/ paths. */
+ * hardcoded ~/.local/share/ricasso/ paths. */
 extern char g_sre_vfs_path_external[512];
 extern char g_sre_vfs_path_files[512];
 extern char g_sre_vfs_path_cache[512];

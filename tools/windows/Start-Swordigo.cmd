@@ -3,7 +3,7 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 set "SWORDIGO_DATA_DIR=%~dp0"
-set "LOGDIR=%LOCALAPPDATA%\SwordigoDesktop\logs"
+set "LOGDIR=%LOCALAPPDATA%\Ricasso\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 set "LOG=%LOGDIR%\latest.log"
 swordfare.exe --check-data --lib engine/v1.4.13/arm64-v8a/libswordigo.so --assets assets > "%LOG%" 2>&1

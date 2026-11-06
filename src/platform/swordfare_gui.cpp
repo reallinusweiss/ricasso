@@ -324,24 +324,24 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Regular.otf",
         "src/assets/fonts/Inter-Regular.ttf",
-        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/Redaction10-Regular.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
-        "/usr/local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
-        "/usr/local/share/swordigo-desktop/launcher/fonts/Redaction10-Regular.otf",
-        "/usr/local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
-        "/usr/share/swordigo-desktop/src/assets/fonts/Redaction10-Regular.otf",
-        "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf"
+        "/usr/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/ricasso/launcher/fonts/Redaction10-Regular.otf",
+        "/usr/share/ricasso/launcher/fonts/Inter-Regular.ttf",
+        "/usr/local/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/local/share/ricasso/launcher/fonts/Redaction10-Regular.otf",
+        "/usr/local/share/ricasso/launcher/fonts/Inter-Regular.ttf",
+        "/usr/share/ricasso/src/assets/fonts/Redaction10-Regular.otf",
+        "/usr/share/ricasso/src/assets/fonts/Inter-Regular.ttf"
     };
     if (!home_dir.empty()) {
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf");
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Redaction10-Regular.otf");
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf");
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Redaction10-Regular.otf");
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fonts/Redaction10-Regular.otf");
-        main_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fonts/Inter-Regular.ttf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/Redaction10-Regular.otf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/Inter-Regular.ttf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/MegalopolisExtra-Regular.otf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/Redaction10-Regular.otf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/Inter-Regular.ttf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso-launcher/src/assets/fonts/Redaction10-Regular.otf");
+        main_font_candidates.push_back(home_dir + "/.local/share/ricasso-launcher/src/assets/fonts/Inter-Regular.ttf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-launcher/src/assets/fonts/Redaction10-Regular.otf");
         main_font_candidates.push_back(home_dir + "/.local/share/swordigo-launcher/src/assets/fonts/Inter-Regular.ttf");
         main_font_candidates.push_back(home_dir + "/.local/share/launcher/src/assets/fonts/Redaction10-Regular.otf");
@@ -358,24 +358,24 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Bold.otf",
         "src/assets/fonts/Inter-Regular.ttf",
-        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/Redaction10-Bold.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
-        "/usr/local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
-        "/usr/local/share/swordigo-desktop/launcher/fonts/Redaction10-Bold.otf",
-        "/usr/local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf",
-        "/usr/share/swordigo-desktop/src/assets/fonts/Redaction10-Bold.otf",
-        "/usr/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf"
+        "/usr/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/ricasso/launcher/fonts/Redaction10-Bold.otf",
+        "/usr/share/ricasso/launcher/fonts/Inter-Regular.ttf",
+        "/usr/local/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/local/share/ricasso/launcher/fonts/Redaction10-Bold.otf",
+        "/usr/local/share/ricasso/launcher/fonts/Inter-Regular.ttf",
+        "/usr/share/ricasso/src/assets/fonts/Redaction10-Bold.otf",
+        "/usr/share/ricasso/src/assets/fonts/Inter-Regular.ttf"
     };
     if (!home_dir.empty()) {
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf");
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Redaction10-Bold.otf");
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf");
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Redaction10-Bold.otf");
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fonts/Redaction10-Bold.otf");
-        button_font_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fonts/Inter-Regular.ttf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/Redaction10-Bold.otf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/Inter-Regular.ttf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/MegalopolisExtra-Regular.otf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/Redaction10-Bold.otf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/Inter-Regular.ttf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso-launcher/src/assets/fonts/Redaction10-Bold.otf");
+        button_font_candidates.push_back(home_dir + "/.local/share/ricasso-launcher/src/assets/fonts/Inter-Regular.ttf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-launcher/src/assets/fonts/Redaction10-Bold.otf");
         button_font_candidates.push_back(home_dir + "/.local/share/swordigo-launcher/src/assets/fonts/Inter-Regular.ttf");
         button_font_candidates.push_back(home_dir + "/.local/share/launcher/src/assets/fonts/Redaction10-Bold.otf");
@@ -401,20 +401,20 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
         // Dev paths
         "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
         "src/assets/fonts/fa-solid-900.ttf",
-        "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
-        "/usr/local/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-        "/usr/local/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf",
-        "/usr/share/swordigo-desktop/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-        "/usr/share/swordigo-desktop/src/assets/fonts/fa-solid-900.ttf"
+        "/usr/share/ricasso/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "/usr/share/ricasso/launcher/fonts/fa-solid-900.ttf",
+        "/usr/local/share/ricasso/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "/usr/local/share/ricasso/launcher/fonts/fa-solid-900.ttf",
+        "/usr/share/ricasso/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "/usr/share/ricasso/src/assets/fonts/fa-solid-900.ttf"
     };
     if (!home_dir.empty()) {
-        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
-        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf");
-        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
-        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/fa-solid-900.ttf");
-        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
-        fa_candidates.push_back(home_dir + "/.local/share/swordigo-desktop-launcher/src/assets/fonts/fa-solid-900.ttf");
+        fa_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
+        fa_candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/fa-solid-900.ttf");
+        fa_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
+        fa_candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/fa-solid-900.ttf");
+        fa_candidates.push_back(home_dir + "/.local/share/ricasso-launcher/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
+        fa_candidates.push_back(home_dir + "/.local/share/ricasso-launcher/src/assets/fonts/fa-solid-900.ttf");
         fa_candidates.push_back(home_dir + "/.local/share/swordigo-launcher/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
         fa_candidates.push_back(home_dir + "/.local/share/swordigo-launcher/src/assets/fonts/fa-solid-900.ttf");
         fa_candidates.push_back(home_dir + "/.local/share/launcher/src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
@@ -543,12 +543,12 @@ void SwordfareGUI::init(SDL_Window* window, SDL_GLContext gl_ctx) {
             "src/assets/fonts/SpaceGrotesk-VariableFont_wght.ttf",
             "src/assets/fonts/static/SpaceGrotesk-Regular.ttf",
             "src/assets/fonts/Inter-Regular.ttf",
-            "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf"
+            "/usr/share/ricasso/launcher/fonts/Inter-Regular.ttf"
         };
         const char* mono_candidates[] = {
             "src/assets/fonts/JetBrainsMono-VariableFont_wght.ttf",
             "src/assets/fonts/static/JetBrainsMono-Regular.ttf",
-            "/usr/share/swordigo-desktop/launcher/fonts/JetBrainsMono-Regular.ttf"
+            "/usr/share/ricasso/launcher/fonts/JetBrainsMono-Regular.ttf"
         };
         std::string ui_font_path   = pick_font(ui_candidates,   4);
         std::string mono_font_path = pick_font(mono_candidates, 3);
@@ -679,10 +679,10 @@ void SwordfareGUI::init_vulkan(SDL_Window* window, VulkanBackend* vk_backend) {
 
     auto find_font = [&](std::vector<std::string> candidates) -> std::string {
         if (!home_dir.empty()) {
-            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf");
-            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/MegalopolisExtra-Regular.otf");
-            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf");
-            candidates.push_back(home_dir + "/.local/share/swordigo-desktop/src/assets/fonts/Inter-Regular.ttf");
+            candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf");
+            candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/MegalopolisExtra-Regular.otf");
+            candidates.push_back(home_dir + "/.local/share/ricasso/launcher/fonts/Inter-Regular.ttf");
+            candidates.push_back(home_dir + "/.local/share/ricasso/src/assets/fonts/Inter-Regular.ttf");
         }
         for (const auto& fp : candidates)
             if (std::filesystem::exists(fp)) return fp;
@@ -693,21 +693,21 @@ void SwordfareGUI::init_vulkan(SDL_Window* window, VulkanBackend* vk_backend) {
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Regular.otf",
         "src/assets/fonts/Inter-Regular.ttf",
-        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf"
+        "/usr/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/ricasso/launcher/fonts/Inter-Regular.ttf"
     });
     std::string button_font_path = find_font({
         "src/assets/fonts/MegalopolisExtra-Regular.otf",
         "src/assets/fonts/Redaction10-Bold.otf",
         "src/assets/fonts/Inter-Regular.ttf",
-        "/usr/share/swordigo-desktop/launcher/fonts/MegalopolisExtra-Regular.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf"
+        "/usr/share/ricasso/launcher/fonts/MegalopolisExtra-Regular.otf",
+        "/usr/share/ricasso/launcher/fonts/Inter-Regular.ttf"
     });
     std::string fa_path = find_font({
         "src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
         "src/assets/fonts/fa-solid-900.ttf",
-        "/usr/share/swordigo-desktop/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
-        "/usr/share/swordigo-desktop/launcher/fonts/fa-solid-900.ttf"
+        "/usr/share/ricasso/launcher/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf",
+        "/usr/share/ricasso/launcher/fonts/fa-solid-900.ttf"
     });
 
     // ── Embedded fonts FIRST (permanent fix) ──
@@ -769,12 +769,12 @@ void SwordfareGUI::init_vulkan(SDL_Window* window, VulkanBackend* vk_backend) {
         "src/assets/fonts/SpaceGrotesk-VariableFont_wght.ttf",
         "src/assets/fonts/static/SpaceGrotesk-Regular.ttf",
         "src/assets/fonts/Inter-Regular.ttf",
-        "/usr/share/swordigo-desktop/launcher/fonts/Inter-Regular.ttf"
+        "/usr/share/ricasso/launcher/fonts/Inter-Regular.ttf"
     });
     std::string mono_font_path = find_font({
         "src/assets/fonts/JetBrainsMono-VariableFont_wght.ttf",
         "src/assets/fonts/static/JetBrainsMono-Regular.ttf",
-        "/usr/share/swordigo-desktop/launcher/fonts/JetBrainsMono-Regular.ttf"
+        "/usr/share/ricasso/launcher/fonts/JetBrainsMono-Regular.ttf"
     });
     const unsigned char* emb_ui = nullptr;    size_t emb_ui_size = 0;
     const unsigned char* emb_mono = nullptr;  size_t emb_mono_size = 0;
@@ -3537,7 +3537,7 @@ void SwordfareGUI::draw_lua_script_editor() {
         if (ImGui::Button(" " ICON_FA_FLOPPY_DISK " Save Script ")) {
             std::string home = os_external::home_dir();
             if (!home.empty()) {
-                std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
+                std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "ricasso" / "lua_scripts";
                 std::error_code ec;
                 std::filesystem::create_directories(save_dir, ec);
                 
@@ -3586,7 +3586,7 @@ void SwordfareGUI::draw_lua_script_editor() {
                 // Syntax OK, proceed to save
                 std::string home = os_external::home_dir();
                 if (!home.empty()) {
-                    std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
+                    std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "ricasso" / "lua_scripts";
                     std::error_code ec;
                     std::filesystem::create_directories(save_dir, ec);
                     std::ofstream out(save_dir / m_script_editor_name);
@@ -3652,7 +3652,7 @@ void SwordfareGUI::draw_lua_script_manager() {
             m_script_list.clear();
             std::string home = os_external::home_dir();
             if (!home.empty()) {
-                std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts";
+                std::filesystem::path save_dir = std::filesystem::path(home) / ".local" / "share" / "ricasso" / "lua_scripts";
                 std::error_code ec;
                 if (std::filesystem::exists(save_dir, ec)) {
                     for (const auto& entry : std::filesystem::directory_iterator(save_dir, ec)) {
@@ -3707,7 +3707,7 @@ void SwordfareGUI::draw_lua_script_manager() {
             if (ImGui::Button("Edit")) {
                 std::string home = os_external::home_dir();
                 if (!home.empty()) {
-                    std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts" / script.filename;
+                    std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "ricasso" / "lua_scripts" / script.filename;
                     std::ifstream in(file_path);
                     if (in.is_open()) {
                         std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -3721,7 +3721,7 @@ void SwordfareGUI::draw_lua_script_manager() {
             if (ImGui::Button("Run")) {
                 std::string home = os_external::home_dir();
                 if (!home.empty()) {
-                    std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "lua_scripts" / script.filename;
+                    std::filesystem::path file_path = std::filesystem::path(home) / ".local" / "share" / "ricasso" / "lua_scripts" / script.filename;
                     std::ifstream in(file_path);
                     if (in.is_open()) {
                         std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -4168,7 +4168,7 @@ void SwordfareGUI::init_scene_shifter(
     m_ss_error_va         = shift_error_va;
     m_ss_active_va        = shift_active_va;
     m_ss_current_scene_va = current_scene_va;
-    m_ss_assets_dir       = assets_dir;  // e.g. ~/.local/share/swordigo-desktop/assets
+    m_ss_assets_dir       = assets_dir;  // e.g. ~/.local/share/ricasso/assets
 
     m_scene_shifter_ready = (guest_memory &&
                              scene_list_count_va &&

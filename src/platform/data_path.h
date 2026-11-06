@@ -4,13 +4,13 @@
 
 // Resolve a relative path to the game data directory.
 // Priority: 
-//   1. ~/.local/share/swordigo-desktop/ (user data — writable, Minecraft-style)
+//   1. ~/.local/share/ricasso/ (user data — writable, Minecraft-style)
 //   2. SWORDIGO_DATA_DIR env variable
 //   3. ./ (development mode)
 //   4. /usr/share/swordigo/ (system install — read-only)
 std::string get_data_path(const std::string& relative_path);
 
-// Get the user data directory (~/.local/share/swordigo-desktop/)
+// Get the user data directory (~/.local/share/ricasso/)
 // Creates it if it doesn't exist.
 std::string get_user_data_dir();
 
@@ -18,7 +18,7 @@ std::string get_user_data_dir();
 // Returns empty string if not found.
 std::string get_system_data_dir();
 
-// Get the VFS save Documents directory (~/.local/share/swordigo-desktop/save/Documents/)
+// Get the VFS save Documents directory (~/.local/share/ricasso/save/Documents/)
 // Ensures the returned path resolves through VFS / g_save_dir and points to the Documents subfolder.
 std::string get_vfs_save_dir(const std::string& custom_base = "");
 

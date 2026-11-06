@@ -51,7 +51,7 @@ public:
     // ── JSON Manifest System ──
     // Primary: load from pre-built JSON manifests (no filesystem scanning at boot)
     //   system_manifest = /usr/share/swordigo/engine/manifest.json (shipped with RPM)
-    //   user_instances   = ~/.config/swordigo-desktop/instances.json (user-added)
+    //   user_instances   = ~/.config/ricasso/instances.json (user-added)
     
     // Load system manifest (read-only, shipped with package)
     void load_manifest(const std::string& manifest_path);

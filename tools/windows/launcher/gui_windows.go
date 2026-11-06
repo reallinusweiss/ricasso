@@ -536,7 +536,7 @@ func (a *app) createShortcuts() {
 }
 
 func (a *app) openSaves() {
-	base := filepath.Join(os.Getenv("APPDATA"), "swordigo-desktop")
+	base := filepath.Join(os.Getenv("APPDATA"), "ricasso")
 	for _, p := range []string{filepath.Join(base, "save", "Documents"), filepath.Join(base, "save"), base} {
 		if dirExists(p) {
 			shellOpen(p, "")

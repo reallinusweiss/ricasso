@@ -36,8 +36,8 @@ PROBLEMS?
   which some scanners wrongly consider suspicious. Only allow it as an exclusion if you trust the source.
 • New version of Ricasso: extract the new ZIP, start Ricasso.exe and choose
   “Reuse previous installation”. Your saves are kept.
-• Log:   %LOCALAPPDATA%\SwordigoDesktop\logs\latest.log
-• Saves: %APPDATA%\swordigo-desktop\save
+• Log:   %LOCALAPPDATA%\Ricasso\logs\latest.log
+• Saves: %APPDATA%\ricasso\save
 
 
 FOR ADVANCED USERS

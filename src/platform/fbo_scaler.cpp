@@ -3521,7 +3521,7 @@ void postfx_apply_preset(PostFXState& s, PostFXPreset p) {
 bool postfx_load_custom_json(PostFXState& state) {
     const char* home = std::getenv("HOME");
     if (!home) return false;
-    std::filesystem::path config_path = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "shaders" / "postfx_config.json";
+    std::filesystem::path config_path = std::filesystem::path(home) / ".local" / "share" / "ricasso" / "shaders" / "postfx_config.json";
     
     std::ifstream file(config_path);
     if (!file.is_open()) return false;
@@ -3630,7 +3630,7 @@ bool postfx_load_custom_json(PostFXState& state) {
 void postfx_save_default_json() {
     const char* home = std::getenv("HOME");
     if (!home) return;
-    std::filesystem::path shaders_dir = std::filesystem::path(home) / ".local" / "share" / "swordigo-desktop" / "shaders";
+    std::filesystem::path shaders_dir = std::filesystem::path(home) / ".local" / "share" / "ricasso" / "shaders";
     std::error_code ec;
     std::filesystem::create_directories(shaders_dir, ec);
     std::filesystem::path config_path = shaders_dir / "postfx_config.json";
@@ -3731,7 +3731,7 @@ bool postfx_save_lighting_level(int level) {
     const char* home = std::getenv("HOME");
     if (!home) return false;
     std::filesystem::path config_path = std::filesystem::path(home) / ".local" /
-                                        "share" / "swordigo-desktop" / "shaders" /
+                                        "share" / "ricasso" / "shaders" /
                                         "postfx_config.json";
 
     std::vector<std::string> lines;

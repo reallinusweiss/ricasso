@@ -29,7 +29,7 @@ func logFilePath() string {
 	if base == "" {
 		base = os.TempDir()
 	}
-	return filepath.Join(base, "SwordigoDesktop", "logs", "latest.log")
+	return filepath.Join(base, "Ricasso", "logs", "latest.log")
 }
 
 func lastInstallFile() string {

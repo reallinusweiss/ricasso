@@ -44,7 +44,7 @@ def main():
     starter = subprocess.run([str(Path(env['SYSTEMROOT'])/'System32/cmd.exe'),'/d','/c',
                               str(client/'Start-Swordigo.cmd')],cwd=elsewhere,env=env,input='\n',
                              capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=30)
-    log = Path(env['LOCALAPPDATA'])/'SwordigoDesktop/logs/latest.log'
+    log = Path(env['LOCALAPPDATA'])/'Ricasso/logs/latest.log'
     record('starter missing-data diagnostic and per-user log',starter.returncode==2 and log.is_file()
            and 'Missing or invalid ARM64 ELF game library' in log.read_text(encoding='utf-8',errors='replace'),
            {'exit':starter.returncode,'stdout':starter.stdout,'stderr':starter.stderr})

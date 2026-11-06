@@ -275,7 +275,7 @@ static AAsset* make_null_asset(const char* filename) {
 
 void asset_manager_init(const char* base_path) {
     /* All game assets live in <data_dir>/<assets_dir>/resources/
-     * e.g. /home/user/.local/share/swordigo-desktop/assets/resources/
+     * e.g. /home/user/.local/share/ricasso/assets/resources/
      * Bake /resources into the base so every open resolves correctly. */
     snprintf(g_mgr.base_path, sizeof(g_mgr.base_path), "%s/resources", base_path);
     g_mgr.base_path[sizeof(g_mgr.base_path) - 1] = '\0';

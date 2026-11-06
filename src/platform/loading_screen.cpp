@@ -93,7 +93,7 @@ struct Mote {
 static std::string get_assets_dir() {
     const char* home = getenv("HOME");
     if (!home) home = ".";
-    return std::string(home) + "/.local/share/swordigo-desktop/assets/resources/";
+    return std::string(home) + "/.local/share/ricasso/assets/resources/";
 }
 
 static unsigned int load_texture_png(const char* path, int* out_w, int* out_h) {

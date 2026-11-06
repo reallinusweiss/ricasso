@@ -34,7 +34,7 @@ namespace fs = std::filesystem;
 std::string launcher_config_path() {
     const char* home = getenv("HOME");
     if (!home) home = ".";
-    return std::string(home) + "/.config/swordigo-desktop/launcher.toml";
+    return std::string(home) + "/.config/ricasso/launcher.toml";
 }
 
 // ============================================================================

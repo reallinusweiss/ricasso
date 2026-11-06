@@ -38,7 +38,7 @@ void LauncherTheme::init_fonts() {
         font_id = QFontDatabase::addApplicationFont("src/assets/fontawesome/otfs/Font Awesome 7 Free-Solid-900.otf");
     }
     if (font_id == -1) {
-        font_id = QFontDatabase::addApplicationFont("/usr/share/swordigo-desktop/fonts/fa-solid-900.ttf");
+        font_id = QFontDatabase::addApplicationFont("/usr/share/ricasso/fonts/fa-solid-900.ttf");
     }
 
     if (font_id != -1) {

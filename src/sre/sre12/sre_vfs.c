@@ -45,7 +45,7 @@ char g_sre_vfs_mod_name[128] = {0};
  * Used for per-profile resource directories. */
 char g_sre_vfs_profile_id[64] = {0};
 
-/* Data directory base path — e.g. "/home/user/.local/share/swordigo-desktop".
+/* Data directory base path — e.g. "/home/user/.local/share/ricasso".
  * All VFS paths are relative to this. */
 char g_sre_vfs_data_dir[512] = {0};
 

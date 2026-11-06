@@ -36,7 +36,7 @@ __attribute__((weak)) std::string g_instance_assets_dir = "assets";
 namespace fs = std::filesystem;
 
 // ============================================================
-//  User data directory: ~/.local/share/swordigo-desktop/
+//  User data directory: ~/.local/share/ricasso/
 //  Like Minecraft's ~/.minecraft/ — writable, user-owned.
 // ============================================================
 
@@ -49,17 +49,17 @@ static void resolve_dirs() {
     s_dirs_resolved = true;
 
 #ifndef _WIN32
-    // User data dir: $XDG_DATA_HOME/swordigo-desktop/ or ~/.local/share/swordigo-desktop/
+    // User data dir: $XDG_DATA_HOME/ricasso/ or ~/.local/share/ricasso/
     const char* xdg = getenv("XDG_DATA_HOME");
     if (xdg && xdg[0]) {
-        s_user_data_dir_cache = std::string(xdg) + "/swordigo-desktop/";
+        s_user_data_dir_cache = std::string(xdg) + "/ricasso/";
     } else {
         const char* home = getenv("HOME");
         if (!home) {
             struct passwd* pw = getpwuid(getuid());
             home = pw ? pw->pw_dir : "/tmp";
         }
-        s_user_data_dir_cache = std::string(home) + "/.local/share/swordigo-desktop/";
+        s_user_data_dir_cache = std::string(home) + "/.local/share/ricasso/";
     }
 
     // System install dir: check standard paths
@@ -77,7 +77,7 @@ static void resolve_dirs() {
 #else
     // Windows fallback
     const char* appdata = getenv("APPDATA");
-    s_user_data_dir_cache = std::string(appdata ? appdata : ".") + "/swordigo-desktop/";
+    s_user_data_dir_cache = std::string(appdata ? appdata : ".") + "/ricasso/";
 #endif
 }
 
@@ -123,7 +123,7 @@ std::string get_vfs_save_dir(const std::string& custom_base) {
 }
 
 // ============================================================
-//  First-run setup: copy from /usr/share/swordigo/ → ~/.local/share/swordigo-desktop/
+//  First-run setup: copy from /usr/share/swordigo/ → ~/.local/share/ricasso/
 // ============================================================
 
 bool ensure_user_data() {
@@ -213,7 +213,7 @@ std::string get_data_path(const std::string& relative_path) {
     }
 #endif
 
-    // 3. User data directory (~/.local/share/swordigo-desktop/)
+    // 3. User data directory (~/.local/share/ricasso/)
     {
         std::string user_dir = get_user_data_dir();
         if (!user_dir.empty()) {

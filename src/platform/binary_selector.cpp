@@ -590,14 +590,14 @@ void BinarySelector::set_default(const std::string& filepath) {
         b.is_default = (b.filepath == filepath);
     }
     
-    // Save to ~/.config/swordigo-desktop/default_instance.txt
+    // Save to ~/.config/ricasso/default_instance.txt
     std::string user_config_dir;
     const char* xdg_config = getenv("XDG_CONFIG_HOME");
     if (xdg_config) {
-        user_config_dir = std::string(xdg_config) + "/swordigo-desktop";
+        user_config_dir = std::string(xdg_config) + "/ricasso";
     } else {
         const char* home = getenv("HOME");
-        user_config_dir = std::string(home ? home : ".") + "/.config/swordigo-desktop";
+        user_config_dir = std::string(home ? home : ".") + "/.config/ricasso";
     }
     try {
         fs::create_directories(user_config_dir);
@@ -1113,10 +1113,10 @@ void BinarySelector::load_manifest(const std::string& manifest_path) {
     std::string user_config_dir;
     const char* xdg_config = getenv("XDG_CONFIG_HOME");
     if (xdg_config) {
-        user_config_dir = std::string(xdg_config) + "/swordigo-desktop";
+        user_config_dir = std::string(xdg_config) + "/ricasso";
     } else {
         const char* home = getenv("HOME");
-        user_config_dir = std::string(home ? home : ".") + "/.config/swordigo-desktop";
+        user_config_dir = std::string(home ? home : ".") + "/.config/ricasso";
     }
     std::string default_txt_path = user_config_dir + "/default_instance.txt";
     std::string saved_default_filepath;
@@ -1314,7 +1314,7 @@ void BinarySelector::load_manifest(const std::string& manifest_path) {
     // Migrate any legacy custom-* folders to lightweight instances/*.ini
     migrate_legacy_custom_instances();
 
-    // Also scan instances/ directory (in engine_dir/instances and ~/.local/share/swordigo-desktop/instances)
+    // Also scan instances/ directory (in engine_dir/instances and ~/.local/share/ricasso/instances)
     scan_instances_directory((engine_dir / "instances").string());
     if (!data_dir.empty()) {
         scan_instances_directory((fs::path(data_dir) / "instances").string());
