@@ -1,13 +1,13 @@
-# Swordigo Windows x64 client
+# Ricasso: Windows x64 client for Swordigo
 
 Native Windows client contribution; core/extras split prepared 25 October 2026. Read README.md and CREDITS.md for origin and license information. This is an experimental client, primarily tested with **Swordigo 1.4.13 ARM64 on Windows 11 x64**.
 
 ## Quick start (no terminal)
 
-The package root contains only `Swordigo.exe`, `README.txt` (a short quick start) and the folder `app/` with the client.
+The package root contains only `Ricasso.exe`, `README.txt` (a short quick start) and the folder `app/` with the client.
 
 1. Extract the ZIP (right-click → *Extract All…*).
-2. Double-click `Swordigo.exe`.
+2. Double-click `Ricasso.exe`.
 3. Pick your own Swordigo 1.4.13/1.4.12 package (`.apkm`, `.apks`, `.xapk`, `.apk`, several split APKs, a folder, or a previous installation) or drag it onto the window.
 
 The starter checks package name, version (ARM64 library SHA-256) and `gamedata.gdata`, copies only the required files into `app/`, offers Desktop/Start-menu shortcuts and then launches the game without a console window. On a crash it shows an explanation plus the log tail. It contains no game data and downloads nothing. Details: `tools/windows/launcher/README.md` in the source archive.
@@ -61,7 +61,7 @@ Game data is loaded from the package folder. User profiles and controls use the 
 
 ## Build from source
 
-Requirements: Windows x64, Python 3.10+, Git, Windows `curl.exe`, 7-Zip and Go 1.22+ for the starter `Swordigo.exe` (`tools/windows/launcher/build_launcher.ps1`; `build.ps1` calls it). The tested toolchain is MinGW-w64 UCRT64 / GCC 16.2; dependencies are downloaded into `.tools/`, not installed globally. Original game data is unnecessary for building and the focused tests.
+Requirements: Windows x64, Python 3.10+, Git, Windows `curl.exe`, 7-Zip and Go 1.22+ for the starter `Ricasso.exe` (`tools/windows/launcher/build_launcher.ps1`; `build.ps1` calls it). The tested toolchain is MinGW-w64 UCRT64 / GCC 16.2; dependencies are downloaded into `.tools/`, not installed globally. Original game data is unnecessary for building and the focused tests.
 
 ```powershell
 python tools/windows/bootstrap.py
@@ -69,7 +69,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows/build.ps1 -Pyt
 python tools/windows/verify_package.py
 ```
 
-The build compiles the host, both ARM64 SREs and all six core client tests, runs CTest and produces `dist-windows/Swordigo-Windows-x64.zip`. `packages.lock.json` fixes package versions and SHA-256 hashes. If an old package is no longer available from the primary MSYS2 mirror, obtain that exact package from a trusted archive/cache; do not silently replace locked versions.
+The build compiles the host, both ARM64 SREs and all six core client tests, runs CTest and produces `dist-windows/Ricasso-Windows-x64.zip`. `packages.lock.json` fixes package versions and SHA-256 hashes. If an old package is no longer available from the primary MSYS2 mirror, obtain that exact package from a trusted archive/cache; do not silently replace locked versions.
 
 An existing compatible toolchain can be reused with `-ToolchainPrefix C:/path/to/ucrt64` on `build.ps1`. It changes only where build dependencies are read.
 

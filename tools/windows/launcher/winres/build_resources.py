@@ -1,7 +1,7 @@
-"""Regenerates ../rsrc_windows_amd64.syso (icon, manifest, version info) for Swordigo.exe.
+"""Regenerates ../rsrc_windows_amd64.syso (icon, manifest, version info) for Ricasso.exe.
 
-Pure Python, no windres/binutils needed. Only needed after changing swordigo.ico,
-Swordigo.exe.manifest or the version strings below. The output is a COFF object
+Pure Python, no windres/binutils needed. Only needed after changing ricasso.ico,
+Ricasso.exe.manifest or the version strings below. The output is a COFF object
 with a single .rsrc section, the same layout windres produces; the Go linker
 picks it up automatically.
 
@@ -13,16 +13,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-VERSION = (1, 1, 0, 0)
+VERSION = (1, 2, 0, 0)
 STRINGS = [
-    ('CompanyName', 'Swordigo Windows port (unofficial)'),
-    ('FileDescription', 'Swordigo – setup and launcher'),
-    ('FileVersion', '1.1.0'),
-    ('InternalName', 'Swordigo'),
+    ('CompanyName', 'Ricasso (unofficial)'),
+    ('FileDescription', 'Ricasso – compatibility layer for Swordigo'),
+    ('FileVersion', '1.2.0'),
+    ('InternalName', 'Ricasso'),
     ('LegalCopyright', 'Starter: GPL-3.0-or-later. Swordigo © Touch Foo – game files not included.'),
-    ('OriginalFilename', 'Swordigo.exe'),
-    ('ProductName', 'Swordigo for Windows (unofficial port)'),
-    ('ProductVersion', '1.1.0'),
+    ('OriginalFilename', 'Ricasso.exe'),
+    ('ProductName', 'Ricasso (unofficial)'),
+    ('ProductVersion', '1.2.0'),
 ]
 LANG_ID, CODEPAGE = 0x0409, 1200  # English (United States), Unicode
 RESOURCE_LANG = 1033
@@ -62,7 +62,7 @@ def version_info(version, strings, lang, codepage):
 def icon_resources(ico):
     reserved, kind, count = struct.unpack_from('<HHH', ico, 0)
     if reserved != 0 or kind != 1 or count == 0:
-        raise SystemExit('swordigo.ico is not a valid icon file')
+        raise SystemExit('ricasso.ico is not a valid icon file')
     images, group = [], struct.pack('<HHH', 0, 1, count)
     for i in range(count):
         w, h, colors, res, planes, bits, size, offset = struct.unpack_from('<BBBBHHII', ico, 6 + 16 * i)
@@ -127,12 +127,12 @@ def coff_resources(resources):
 
 
 def main():
-    images, group = icon_resources((HERE / 'swordigo.ico').read_bytes())
+    images, group = icon_resources((HERE / 'ricasso.ico').read_bytes())
     resources = {
         RT_ICON: {i + 1: img for i, img in enumerate(images)},
         RT_GROUP_ICON: {1: group},
         RT_VERSION: {1: version_info(VERSION, STRINGS, LANG_ID, CODEPAGE)},
-        RT_MANIFEST: {1: (HERE / 'Swordigo.exe.manifest').read_bytes()},
+        RT_MANIFEST: {1: (HERE / 'Ricasso.exe.manifest').read_bytes()},
     }
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE.parent / 'rsrc_windows_amd64.syso'
     out.write_bytes(coff_resources(resources))

@@ -2,7 +2,7 @@
 
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Swordigo.exe – sets up and starts the Swordigo Windows port without a terminal.
+// Ricasso.exe – sets up and starts Swordigo through Ricasso without a terminal.
 //
 // License: GPL-3.0-or-later (like the SwordigoDesktop launcher/frontend).
 // Contains no game files and downloads nothing.
@@ -19,10 +19,10 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"swordigo-launcher/importer"
+	"ricasso-launcher/importer"
 )
 
-const launcherVersion = "1.1.0"
+const launcherVersion = "1.2.0"
 
 func init() {
 	// All windows belong to the main thread.
@@ -31,17 +31,17 @@ func init() {
 
 func main() {
 	// Load DLLs from System32 (or WinSxS) only – protection in case foreign DLLs
-	// sit next to Swordigo.exe in the Downloads folder.
+	// sit next to Ricasso.exe in the Downloads folder.
 	windows.SetDefaultDllDirectories(windows.LOAD_LIBRARY_SEARCH_SYSTEM32)
 	defer func() {
 		if r := recover(); r != nil {
-			messageBox(0, "Swordigo – internal error", fmt.Sprintf("%v\n\n%s", r, debug.Stack()), mbIconError)
+			messageBox(0, "Ricasso – internal error", fmt.Sprintf("%v\n\n%s", r, debug.Stack()), mbIconError)
 		}
 	}()
 
 	exe, err := os.Executable()
 	if err != nil {
-		messageBox(0, "Swordigo", "Unknown program path: "+err.Error(), mbIconError)
+		messageBox(0, "Ricasso", "Unknown program path: "+err.Error(), mbIconError)
 		return
 	}
 	exeDir := filepath.Dir(exe)
@@ -53,29 +53,29 @@ func main() {
 
 	if runningFromTemp(exeDir) {
 		messageBox(0, "Please extract the ZIP first",
-			"Swordigo was started directly from inside the ZIP file. It can't work like that.\n\n"+
+			"Ricasso was started directly from inside the ZIP file. It can't work like that.\n\n"+
 				"1. Close this window.\n"+
 				"2. Right-click the ZIP file → “Extract All…” → “Extract”.\n"+
-				"3. Open the extracted folder and start Swordigo.exe there.", mbIconInfo)
+				"3. Open the extracted folder and start Ricasso.exe there.", mbIconInfo)
 		return
 	}
 	appDir := findAppDir(exeDir)
 	if appDir == "" {
 		messageBox(0, "Program files missing",
-			"The folder “app” with the program files is missing next to Swordigo.exe.\n\n"+
-				"Please extract the complete ZIP file (right-click → “Extract All…”) and start Swordigo.exe in the extracted folder. "+
-				"Don't move Swordigo.exe on its own – create a shortcut instead.", mbIconError)
+			"The folder “app” with the program files is missing next to Ricasso.exe.\n\n"+
+				"Please extract the complete ZIP file (right-click → “Extract All…”) and start Ricasso.exe in the extracted folder. "+
+				"Don't move Ricasso.exe on its own – create a shortcut instead.", mbIconError)
 		return
 	}
 
 	// Only one starter at a time.
-	mutex, err := windows.CreateMutex(nil, false, u16(`Local\SwordigoWindowsStarter`))
+	mutex, err := windows.CreateMutex(nil, false, u16(`Local\RicassoStarter`))
 	if err == windows.ERROR_ALREADY_EXISTS {
 		if hwnd := call(pFindWindowW, uintptr(unsafe.Pointer(u16(className))), 0); hwnd != 0 && call(pIsWindowVisible, hwnd) != 0 {
 			call(pShowWindow, hwnd, swRestore)
 			call(pSetForegroundWindow, hwnd)
 		} else {
-			messageBox(0, "Swordigo", "Swordigo is already running.", mbIconInfo)
+			messageBox(0, "Ricasso", "Ricasso is already running.", mbIconInfo)
 		}
 		return
 	}
@@ -99,7 +99,7 @@ func main() {
 	a := &app{exePath: exe, exeDir: exeDir, appDir: appDir, extra: os.Args[1:], mutex: mutex}
 	theApp = a
 	if err := a.createWindow(); err != nil {
-		messageBox(0, "Swordigo", "The window could not be opened: "+err.Error(), mbIconError)
+		messageBox(0, "Ricasso", "The window could not be opened: "+err.Error(), mbIconError)
 		return
 	}
 	a.run()
@@ -109,7 +109,7 @@ func main() {
 // selfTest checks without a window whether the package is complete.
 // Exit codes: 0 = complete, 3 = folder "app" missing, 4 = program files missing.
 func selfTest(exeDir string) int {
-	fmt.Println("Swordigo starter", launcherVersion)
+	fmt.Println("Ricasso starter", launcherVersion)
 	appDir := findAppDir(exeDir)
 	if appDir == "" {
 		fmt.Println("ERROR: folder app with swordfare.exe is missing")
@@ -131,7 +131,7 @@ func selfTest(exeDir string) int {
 }
 
 // findAppDir looks for the folder with swordfare.exe: normally "app" next to
-// Swordigo.exe, alternatively the same folder (older package layout).
+// Ricasso.exe, alternatively the same folder (older package layout).
 func findAppDir(exeDir string) string {
 	for _, dir := range []string{filepath.Join(exeDir, "app"), exeDir} {
 		if fileExists(filepath.Join(dir, "swordfare.exe")) {

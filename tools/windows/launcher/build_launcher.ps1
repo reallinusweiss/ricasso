@@ -1,16 +1,16 @@
-# Builds tools/windows/launcher/bin/Swordigo.exe (the no-terminal starter).
+# Builds tools/windows/launcher/bin/Ricasso.exe (the no-terminal starter).
 # Requires Go 1.22+ (https://go.dev/dl/). Dependencies are vendored; no download needed.
 param([string]$Go = 'go')
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
-$out = Join-Path $here 'bin/Swordigo.exe'
+$out = Join-Path $here 'bin/Ricasso.exe'
 $goCmd = Get-Command $Go -ErrorAction SilentlyContinue
 if (-not $goCmd) {
     if (Test-Path $out) {
         Write-Warning "Go not found - reusing existing $out"
         exit 0
     }
-    throw 'Go 1.22+ is required to build the starter Swordigo.exe (https://go.dev/dl/).'
+    throw 'Go 1.22+ is required to build the starter Ricasso.exe (https://go.dev/dl/).'
 }
 Push-Location $here
 try {

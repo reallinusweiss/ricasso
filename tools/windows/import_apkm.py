@@ -53,7 +53,7 @@ def main():
         if sum(map(len,files.values()))>512*1024*1024:raise ValueError('Asset tree too large')
     pointer=ROOT/'.tools/latest-package.txt'
     source=Path(pointer.read_text(encoding='utf-8')) if pointer.is_file() else ROOT
-    if (source/'app'/'swordfare.exe').is_file():source=source/'app'  # package root with Swordigo.exe
+    if (source/'app'/'swordfare.exe').is_file():source=source/'app'  # package root with Ricasso.exe
     if not (source/'swordfare.exe').is_file() or not (source/'libs/libsre13.so').is_file():
         raise SystemExit('Build/package the source checkout first, or run this importer from the extracted Windows client ZIP.')
     output=ROOT/'play-windows'/('Swordigo '+version)

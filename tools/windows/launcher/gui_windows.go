@@ -18,10 +18,10 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"swordigo-launcher/importer"
+	"ricasso-launcher/importer"
 )
 
-const className = "SwordigoWindowsStarter"
+const className = "RicassoStarter"
 
 type page int
 
@@ -171,10 +171,10 @@ func (a *app) createControls() {
 	all := pgSetup | pgBusy | pgReady | pgError | pgHelp
 	grey := rgb(100, 100, 100)
 
-	a.title = a.label("Swordigo for Windows", 24, 16, 552, 40, all, fTitle)
+	a.title = a.label("Ricasso", 24, 16, 552, 40, all, fTitle)
 	a.subtitle = a.label("", 24, 56, 552, 22, all, fNormal)
 	a.subtitle.color = grey
-	a.footer = a.label("Unofficial fan port, not made by Touch Foo. Swordigo © Touch Foo – game files are not included.", 24, 414, 552, 18, all, fSmall)
+	a.footer = a.label("Unofficial fan project, not made by Touch Foo. Swordigo © Touch Foo – game files are not included.", 24, 414, 552, 18, all, fSmall)
 	a.footer.color = rgb(120, 120, 120)
 
 	// Setup
@@ -264,7 +264,7 @@ func (a *app) showPage(p page) {
 	subtitles := map[page]string{
 		pgSetup: "One-time setup: choose your own Swordigo file.",
 		pgBusy:  "Please wait…",
-		pgReady: "Unofficial Windows port of Swordigo",
+		pgReady: "Unofficial compatibility layer for Swordigo",
 		pgError: "Something went wrong.",
 		pgHelp:  "How to get your Swordigo file – no terminal needed",
 	}
@@ -522,7 +522,7 @@ func (a *app) createShortcuts() {
 			continue
 		}
 		lnk := filepath.Join(dir, "Swordigo.lnk")
-		if err := createShortcut(lnk, a.exePath, a.exeDir, "Swordigo (unofficial Windows port)", icon, idx); err != nil {
+		if err := createShortcut(lnk, a.exePath, a.exeDir, "Swordigo (via Ricasso)", icon, idx); err != nil {
 			failed = append(failed, lnk+": "+err.Error())
 		} else {
 			made = append(made, lnk)
@@ -753,7 +753,7 @@ func (a *app) createWindow() error {
 	}
 	style := uint32(wsOverlapped | wsCaption | wsSysMenu | wsMinimizeBox | wsClipChildren)
 	ex := uint32(wsExControlPar | wsExAcceptFiles)
-	a.hwnd = call(pCreateWindowExW, uintptr(ex), uintptr(unsafe.Pointer(u16(className))), uintptr(unsafe.Pointer(u16("Swordigo for Windows"))),
+	a.hwnd = call(pCreateWindowExW, uintptr(ex), uintptr(unsafe.Pointer(u16(className))), uintptr(unsafe.Pointer(u16("Ricasso"))),
 		uintptr(style), cwUseDefault, cwUseDefault, 640, 480, 0, 0, a.inst, 0)
 	if a.hwnd == 0 {
 		return errors.New("CreateWindowEx failed")

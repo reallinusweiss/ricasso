@@ -18,7 +18,7 @@ def main():
     test = Path(tempfile.mkdtemp(prefix='Paketprüfung ä ', dir=ROOT/'.tools'))
     package = test/'Spiel Ordner ü'
     shutil.copytree(source,package)
-    client = package/'app'  # Swordigo.exe + README.txt at the root, the client in app/
+    client = package/'app'  # Ricasso.exe + README.txt at the root, the client in app/
     elsewhere = test/'Anderer Arbeitsordner'
     elsewhere.mkdir()
     env = os.environ.copy()
@@ -48,16 +48,16 @@ def main():
     record('starter missing-data diagnostic and per-user log',starter.returncode==2 and log.is_file()
            and 'Missing or invalid ARM64 ELF game library' in log.read_text(encoding='utf-8',errors='replace'),
            {'exit':starter.returncode,'stdout':starter.stdout,'stderr':starter.stderr})
-    starter = (package/'Swordigo.exe').read_bytes()
+    starter = (package/'Ricasso.exe').read_bytes()
     spe = struct.unpack_from('<I',starter,0x3c)[0]
     record('starter is a Windows x64 GUI program',struct.unpack_from('<H',starter,spe+4)[0]==0x8664 and
-           struct.unpack_from('<H',starter,spe+24+68)[0]==2,'Swordigo.exe, IMAGE_SUBSYSTEM_WINDOWS_GUI')
-    p = subprocess.run([str(package/'Swordigo.exe'),'--selftest'],cwd=elsewhere,env=env,
+           struct.unpack_from('<H',starter,spe+24+68)[0]==2,'Ricasso.exe, IMAGE_SUBSYSTEM_WINDOWS_GUI')
+    p = subprocess.run([str(package/'Ricasso.exe'),'--selftest'],cwd=elsewhere,env=env,
                        capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=45)
     record('starter self-test (no window)',p.returncode==0 and 'OK' in p.stdout,{'exit':p.returncode,'stdout':p.stdout,'stderr':p.stderr})
-    with zipfile.ZipFile(ROOT/'dist-windows/Swordigo-Windows-x64.zip') as archive:
+    with zipfile.ZipFile(ROOT/'dist-windows/Ricasso-Windows-x64.zip') as archive:
         names = set(archive.namelist())
-        top = ['Swordigo Windows x64/Swordigo.exe','Swordigo Windows x64/README.txt','Swordigo Windows x64/app/swordfare.exe']
+        top = ['Ricasso Windows x64/Ricasso.exe','Ricasso Windows x64/README.txt','Ricasso Windows x64/app/swordfare.exe']
         record('archive layout (starter at top level, client in app/)',all(n in names for n in top),top)
         bad = [n for n in archive.namelist() if Path(n).name.lower().startswith('libswordigo') or n.lower().endswith('.apk')]
         record('archive excludes original game binaries/APKs',not bad,bad)

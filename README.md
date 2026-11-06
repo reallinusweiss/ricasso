@@ -1,12 +1,12 @@
-# Swordigo for Windows (unofficial port)
+# Ricasso
 
-Play **your own copy** of the Android game *Swordigo* on Windows 10/11 (x64). This is an unofficial fan
-project. It is not made, endorsed or supported by Touch Foo, and it contains **no game files**.
+An unofficial Windows compatibility layer for **your own copy** of the Android game *Swordigo* (Windows 10/11, x64).
+Ricasso is a fan project. It is not made, endorsed or supported by Touch Foo, and it contains **no game files**.
 
 ## For players
 
-1. Download `Swordigo-Windows-x64.zip` from the releases page and extract it (right-click → *Extract All…*).
-2. Start `Swordigo.exe`.
+1. Download `Ricasso-Windows-x64.zip` from the releases page and extract it (right-click → *Extract All…*).
+2. Start `Ricasso.exe`.
 3. Choose your own Swordigo 1.4.13 or 1.4.12 package (`.apkm`, `.apks`, `.xapk`, `.apk` or several split APKs),
    e.g. exported from your own phone, or drag it onto the window. The starter checks it, copies only what the
    game needs and offers desktop and Start-menu shortcuts.
@@ -16,7 +16,7 @@ and `README.txt` in the download.
 
 Please don't download APK files from third-party websites, and don't share game files.
 
-## What this port does and doesn't do
+## What Ricasso does and doesn't do
 
 - The client (`swordfare.exe`) loads the original ARM64 game library from the player's own package and runs it
   through the Dynarmic JIT on x64.
@@ -32,7 +32,7 @@ AevoraLabs and the Lawncher Team. It contains only what the Windows client and i
 
 - `src/`, `cmake/`, `include/`, `deps/dynarmic/`, `tests/`: the client, its runtime (SRE) and the client tests
 - `tools/windows/`: toolchain bootstrap, build, packaging and verification scripts
-- `tools/windows/launcher/`: the starter `Swordigo.exe` (Go)
+- `tools/windows/launcher/`: the starter `Ricasso.exe` (Go)
 
 The editor suite, research tools, documentation and website of the upstream project are not part of this
 repository; see the upstream project for those. The client itself is reduced as well: the in-game Memory
@@ -49,7 +49,7 @@ powershell -ExecutionPolicy Bypass -File tools/windows/build.ps1
 python tools/windows/verify_package.py
 ```
 
-The package is written to `dist-windows/Swordigo-Windows-x64.zip`. See [`WINDOWS_CLIENT.md`](WINDOWS_CLIENT.md).
+The package is written to `dist-windows/Ricasso-Windows-x64.zip`. See [`WINDOWS_CLIENT.md`](WINDOWS_CLIENT.md).
 
 ## License and credits
 

@@ -99,7 +99,7 @@ func write(t *testing.T, dir, name string, data []byte) string {
 
 func clientDir(t *testing.T) string {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "Swordigo Windows x64", "app")
+	dir := filepath.Join(t.TempDir(), "Ricasso Windows x64", "app")
 	for _, rel := range RequiredClientFiles {
 		write(t, dir, rel, []byte("x"))
 	}

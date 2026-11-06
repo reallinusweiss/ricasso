@@ -1,4 +1,4 @@
-module swordigo-launcher
+module ricasso-launcher
 
 go 1.22
 

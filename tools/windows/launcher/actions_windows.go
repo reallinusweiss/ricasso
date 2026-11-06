@@ -21,7 +21,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"swordigo-launcher/importer"
+	"ricasso-launcher/importer"
 )
 
 func logFilePath() string {
@@ -37,7 +37,7 @@ func lastInstallFile() string {
 	if base == "" {
 		base = os.TempDir()
 	}
-	return filepath.Join(base, "SwordigoWindows", "last-install.txt")
+	return filepath.Join(base, "Ricasso", "last-install.txt")
 }
 
 func fileExists(p string) bool {
@@ -110,7 +110,7 @@ func (a *app) runGame(st importer.Installed) {
 	a.mu.Lock()
 	a.logPath = logPath
 	a.mu.Unlock()
-	fmt.Fprintf(out, "[Starter] Swordigo starter %s · %s\r\n[Starter] Program folder: %s\r\n[Starter] Game version: %s\r\n",
+	fmt.Fprintf(out, "[Starter] Ricasso starter %s · %s\r\n[Starter] Program folder: %s\r\n[Starter] Game version: %s\r\n",
 		launcherVersion, time.Now().Format("2006-01-02 15:04:05"), a.appDir, st.Version)
 
 	fail := func(f gameFailure) {
@@ -207,11 +207,11 @@ func describeStartError(err error) (string, string) {
 		case 2, 3:
 			return "swordfare.exe was not found.", "Extract the ZIP file again completely. Also check your antivirus quarantine."
 		case 5:
-			return "Windows refused to start the program (access denied).", "Often an antivirus program blocks it. Add the Swordigo folder as an exclusion there."
+			return "Windows refused to start the program (access denied).", "Often an antivirus program blocks it. Add the Ricasso folder as an exclusion there."
 		case 225, 226:
 			return "Your antivirus program blocked swordfare.exe.",
 				"The client translates ARM code at runtime; some antivirus programs wrongly consider that suspicious. " +
-					"Restore the file from quarantine and add the Swordigo folder as an exclusion – only if you trust the source of the port."
+					"Restore the file from quarantine and add the Ricasso folder as an exclusion – only if you trust the source of Ricasso."
 		case 4551, 1260:
 			return "Windows is blocking the program (app control).",
 				"Windows 11 “Smart App Control” or a company policy doesn't allow unsigned programs. " +
@@ -257,15 +257,15 @@ func (a *app) startupChecks() {
 	if writable(a.appDir) {
 		return
 	}
-	target := filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Swordigo Windows")
-	text := "Swordigo is not allowed to write to this folder:\n\n" + a.exeDir +
-		"\n\nThis happens, for example, in the “Program Files” folder. Swordigo needs a folder it can copy your game files into." +
-		"\n\nCopy Swordigo here now and start it from there?\n\n" + target
+	target := filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "Ricasso")
+	text := "Ricasso is not allowed to write to this folder:\n\n" + a.exeDir +
+		"\n\nThis happens, for example, in the “Program Files” folder. Ricasso needs a folder it can copy your game files into." +
+		"\n\nCopy Ricasso here now and start it from there?\n\n" + target
 	if messageBox(a.hwnd, "Different location needed", text, mbYesNo|mbIconQuestion) != idYes {
 		return
 	}
 	a.copyTarget = target
-	a.setBusy("Copying Swordigo…", target)
+	a.setBusy("Copying Ricasso…", target)
 	go func() {
 		err := copyTree(a.exeDir, target, a.reportProgress)
 		a.mu.Lock()
@@ -293,7 +293,7 @@ func (a *app) onCopyDone() {
 	cmd := exec.Command(exe)
 	cmd.Dir = a.copyTarget
 	if err := cmd.Start(); err != nil {
-		messageBox(a.hwnd, "Swordigo", "Copied to:\n\n"+a.copyTarget+"\n\nPlease start Swordigo.exe there.", mbIconInfo)
+		messageBox(a.hwnd, "Ricasso", "Copied to:\n\n"+a.copyTarget+"\n\nPlease start Ricasso.exe there.", mbIconInfo)
 	}
 	call(pDestroyWindow, a.hwnd)
 }

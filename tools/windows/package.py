@@ -2,8 +2,8 @@
 Original game libraries, APK contents and user saves are deliberately never inputs.
 
 Package layout (end users only see two entries next to the app folder):
-    Swordigo Windows x64/
-        Swordigo.exe      no-terminal setup wizard + launcher (tools/windows/launcher)
+    Ricasso Windows x64/
+        Ricasso.exe      no-terminal setup wizard + launcher (tools/windows/launcher)
         README.txt        English quick start
         app/              the client exactly as before (swordfare.exe, DLLs, libs/, ...)
 """
@@ -20,11 +20,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     prefix = Path(os.environ.get('SWORDIGO_TOOLCHAIN_PREFIX', ROOT / '.tools/msys2/ucrt64'))
-    out = ROOT / 'dist-windows/Swordigo Windows x64'
+    out = ROOT / 'dist-windows/Ricasso Windows x64'
     suffix = 1
     while out.exists():
         suffix += 1
-        out = ROOT / ('dist-windows/Swordigo Windows x64-' + str(suffix))
+        out = ROOT / ('dist-windows/Ricasso Windows x64-' + str(suffix))
     out.mkdir(parents=True, exist_ok=True)
     # Refuse stale contents so a prior local game-data copy cannot enter an archive.
     if any(out.iterdir()):
@@ -32,7 +32,7 @@ def main():
     root = out
     out = root / 'app'
     out.mkdir()
-    starter = ROOT / 'tools/windows/launcher/bin/Swordigo.exe'
+    starter = ROOT / 'tools/windows/launcher/bin/Ricasso.exe'
     if not starter.is_file():
         raise SystemExit('Missing starter. Build it first: tools/windows/launcher/build_launcher.ps1 (needs Go 1.22+).')
     def copy(src, relative):
@@ -89,7 +89,7 @@ def main():
     copy(source_notice, 'SOURCE.md')
     copy(ROOT/'tools/windows/launcher/README.md', 'licenses/project/Starter-README.md')
     copy(ROOT/'tools/windows/launcher/vendor/golang.org/x/sys/LICENSE', 'licenses/vendored/golang.org-x-sys/LICENSE')
-    shutil.copy2(starter, root/'Swordigo.exe')
+    shutil.copy2(starter, root/'Ricasso.exe')
     shutil.copy2(ROOT/'tools/windows/README.txt', root/'README.txt')
     (out/'imports.json').write_text(json.dumps(imports,indent=2)+'\n')
     # Keep exact notices for bundled JIT dependencies in addition to MSYS2 DLLs.
@@ -101,10 +101,10 @@ def main():
     # the two top-level files are listed with a ../ prefix.
     hashes={p.relative_to(out).as_posix():hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(out.rglob('*')) if p.is_file()}
-    for name in ['Swordigo.exe', 'README.txt']:
+    for name in ['Ricasso.exe', 'README.txt']:
         hashes['../'+name]=hashlib.sha256((root/name).read_bytes()).hexdigest()
     (out/'SHA256SUMS.json').write_text(json.dumps(hashes,indent=2)+'\n')
-    archive=root.parent/'Swordigo-Windows-x64.zip'
+    archive=root.parent/'Ricasso-Windows-x64.zip'
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
         for p in sorted(root.rglob('*')):
             z.write(p,p.relative_to(root.parent))

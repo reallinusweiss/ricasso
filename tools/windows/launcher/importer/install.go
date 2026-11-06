@@ -71,12 +71,12 @@ func Install(s *Scan, appDir string, progress Progress) (*Result, error) {
 	absApp, _ := filepath.Abs(appDir)
 	if n := len([]rune(absApp)) + 1 + len([]rune(longest)); n > maxWindowsLen {
 		return nil, userErr("Folder path too long", fmt.Sprintf("The location is nested too deeply (%d of at most %d characters).", n, maxWindowsLen),
-			"Move the Swordigo folder to a shorter location, e.g. “C:\\Games\\Swordigo”, and start Swordigo.exe there again.")
+			"Move the Ricasso folder to a shorter location, e.g. “C:\\Games\\Ricasso”, and start Ricasso.exe there again.")
 	}
 	if FreeSpace != nil {
 		if free, err := FreeSpace(appDir); err == nil && free < uint64(s.TotalBytes)+(64<<20) {
 			return nil, userErr("Not enough disk space", fmt.Sprintf("The game files need about %s, but only %s is free.",
-				humanBytes(uint64(s.TotalBytes)), humanBytes(free)), "Free up disk space or move the Swordigo folder to another drive.")
+				humanBytes(uint64(s.TotalBytes)), humanBytes(free)), "Free up disk space or move the Ricasso folder to another drive.")
 		}
 	}
 
@@ -165,7 +165,7 @@ func Install(s *Scan, appDir string, progress Progress) (*Result, error) {
 	for _, name := range managed {
 		if err := os.RemoveAll(filepath.Join(appDir, name)); err != nil {
 			return nil, userErr("Files in use", "The old game files could not be replaced.",
-				"Close Swordigo (and File Explorer windows showing the Swordigo folder) and try again.")
+				"Close Swordigo (and File Explorer windows showing the Ricasso folder) and try again.")
 		}
 	}
 	for _, name := range managed {
@@ -212,13 +212,13 @@ func writeErr(appDir string, err error) error {
 	msg := err.Error()
 	if errors.Is(err, os.ErrPermission) || strings.Contains(strings.ToLower(msg), "access is denied") {
 		return userErr("No write access", "Writing to the folder “"+appDir+"” is not allowed.",
-			"Move the Swordigo folder, e.g. to “Documents”, and start Swordigo.exe there again. Sometimes the antivirus program blocks it, too (“Controlled folder access”).")
+			"Move the Ricasso folder, e.g. to “Documents”, and start Ricasso.exe there again. Sometimes the antivirus program blocks it, too (“Controlled folder access”).")
 	}
 	return userErr("Copying failed", "An error occurred while writing the game files.", msg)
 }
 
 // updateStarterScript adapts Start-Swordigo.cmd to the installed version
-// (like import_apkm.py), so that the route without Swordigo.exe works too.
+// (like import_apkm.py), so that the route without Ricasso.exe works too.
 func updateStarterScript(appDir, version string) {
 	p := filepath.Join(appDir, "Start-Swordigo.cmd")
 	data, err := os.ReadFile(p)

@@ -7,7 +7,7 @@ package main
 // helpText is shown on the help page "How do I get the file?".
 const helpText = `HOW TO GET YOUR SWORDIGO FILE
 
-Swordigo belongs to Touch Foo. This Windows port contains no game files. You need your own copy of the Android version – ideally the one you installed yourself from Google Play on your phone. Don't download APK files from third-party websites, and don't share the game files with others.
+Swordigo belongs to Touch Foo. Ricasso contains no game files. You need your own copy of the Android version – ideally the one you installed yourself from Google Play on your phone. Don't download APK files from third-party websites, and don't share the game files with others.
 
 Supported: Swordigo 1.4.13 (recommended) and 1.4.12, each in the 64-bit variant (arm64-v8a). Practically every phone from about 2017 onwards has it.
 
@@ -29,7 +29,7 @@ WHAT HAPPENS?
 • Only what the game needs (game library, "assets" folder, music) is copied – into the subfolder "app".
 • Nothing is uploaded or downloaded. Your saves are kept separately in %APPDATA%\swordigo-desktop.
 
-NEW VERSION OF THE PORT?
-Extract the new ZIP, start Swordigo.exe there and choose "Reuse previous installation" – or drag the old Swordigo folder onto the window.
+NEW VERSION OF RICASSO?
+Extract the new ZIP, start Ricasso.exe there and choose "Reuse previous installation" – or drag the old Ricasso folder onto the window.
 
 This is not legal advice. Follow the terms of use of Swordigo and Google Play.`

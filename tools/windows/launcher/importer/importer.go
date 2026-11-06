@@ -357,7 +357,7 @@ func (c *collector) addGameFile(e *entry) error {
 // addDir supports three kinds of folders:
 //  1. a folder with package files (e.g. base.apk + split_config.arm64_v8a.apk),
 //  2. an extracted APK (lib/arm64-v8a/…, assets/, res/raw/),
-//  3. an existing Swordigo Windows installation (engine/v*/arm64-v8a/…, assets/, res/raw/),
+//  3. an existing Ricasso installation (engine/v*/arm64-v8a/…, assets/, res/raw/),
 //     including its main folder with the subfolder "app".
 func (c *collector) addDir(dir string) error {
 	if fileExists(filepath.Join(dir, "app", "swordfare.exe")) {
@@ -497,7 +497,7 @@ func (c *collector) finish() error {
 	if s.lib == nil {
 		switch {
 		case c.hasARMv7 || c.hasX86:
-			return userErr("Wrong device variant", "The file only contains the 32-bit variant of the game. The Windows port needs the 64-bit variant (arm64-v8a).",
+			return userErr("Wrong device variant", "The file only contains the 32-bit variant of the game. Ricasso needs the 64-bit variant (arm64-v8a).",
 				"Export Swordigo from a 64-bit phone (almost every phone from about 2017 onwards).")
 		default:
 			return userErr("Part missing", "The game library (arm64-v8a) is missing. For split apps it is inside “split_config.arm64_v8a.apk”.",
@@ -523,7 +523,7 @@ func (c *collector) finish() error {
 		if s.DeclaredVersion != "" {
 			found = " Your file: version " + s.DeclaredVersion + "."
 		}
-		return userErr("Version not supported", "This Swordigo version is not supported by the Windows port yet."+found+
+		return userErr("Version not supported", "This Swordigo version is not supported by Ricasso yet."+found+
 			" Supported: "+SupportedVersionsText+".",
 			"The checksum of the game library matches no tested version. Other versions don't run reliably.")
 	}
@@ -585,7 +585,7 @@ func (s *Scan) targets() (map[string]*entry, error) {
 		if prev, ok := folded[key]; ok {
 			if !s.files[prev].sameAs(s.files[name]) {
 				return nil, userErr("File name conflict", "“"+prev+"” and “"+name+"” differ only in upper/lower case.",
-					"Windows can't store both at the same time. Please report this to the port developer.")
+					"Windows can't store both at the same time. Please report this to the Ricasso developer.")
 			}
 			continue
 		}
@@ -598,7 +598,7 @@ func (s *Scan) targets() (map[string]*entry, error) {
 		for i := 1; i < len(parts); i++ {
 			if _, clash := out[strings.Join(parts[:i], "/")]; clash {
 				return nil, userErr("File name conflict", "“"+strings.Join(parts[:i], "/")+"” is both a file and a folder.",
-					"Please report this to the port developer.")
+					"Please report this to the Ricasso developer.")
 			}
 		}
 	}
