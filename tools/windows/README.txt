@@ -44,8 +44,10 @@ FOR ADVANCED USERS
 The folder “app” contains the actual client (swordfare.exe) together with Start-Swordigo.cmd and
 the Python importer tools\windows\import_apkm.py – both work as before.
 Licenses: app\LICENSE.md and app\licenses\   Source notes: app\SOURCE.md
-The starter Ricasso.exe is licensed under GPL-3.0-or-later; its source code is in the source
-archive under tools/windows/launcher/.
+The starter Ricasso.exe is licensed under GPL-3.0-or-later; its source code is at
+https://github.com/reallinusweiss/ricasso (tools/windows/launcher/).
+Bundled libraries and their sources: app\THIRD_PARTY_SOURCES.md
 
 
+Ricasso's own parts are vibe-coded (written with AI tools). Experimental, no warranty.
 Unofficial fan project. Swordigo © Touch Foo. Not affiliated with Touch Foo.

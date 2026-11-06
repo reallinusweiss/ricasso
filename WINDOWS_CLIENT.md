@@ -1,6 +1,6 @@
 # Ricasso: Windows x64 client for Swordigo
 
-Native Windows client contribution; core/extras split prepared 25 October 2026. Read README.md and CREDITS.md for origin and license information. This is an experimental client, primarily tested with **Swordigo 1.4.13 ARM64 on Windows 11 x64**.
+Setup, controls and build notes for the Windows client. Read README.md and CREDITS.md for origin and license information. This is an experimental client, primarily tested with **Swordigo 1.4.13 ARM64 on Windows 11 x64**.
 
 ## Quick start (no terminal)
 
@@ -53,11 +53,11 @@ Game Over accepts the original on-screen action and the supported keyboard input
 
 **In-app purchases and ads.** The desktop client has no Google Play Billing and no ad SDK. Every in-app product (including "Remove Ads", the compass and the coin doubler) counts as not purchased; nothing paid is unlocked. Ad requests are answered as "no ad available": no ad is shown, and the death screen continues through the game's own continue path.
 
-This branch retains the existing upstream menus but does not add the 1.4.13 mod adapter, upgrade/item actions, physics tracing or performance simulation. Those additions are isolated on `codex/windows-extras`, which builds on this branch. Existing upstream practice controls do not establish speedrun eligibility.
+The client keeps the existing upstream menus. The in-game Memory Research console and the scene tooling of upstream SwordigoDesktop are not part of it. Existing upstream practice controls do not establish speedrun eligibility.
 
 ## Saves and logs
 
-Game data is loaded from the package folder. User profiles and controls use the existing `%APPDATA%/ricasso/` paths; game saves are under its `save/Documents/` tree. The starter writes `%LOCALAPPDATA%/Ricasso/logs/latest.log`. Personal saves, controls, traces and logs are not part of the release.
+Game data is loaded from the package folder. User profiles and controls use `%APPDATA%/ricasso/`; game saves are under its `save/Documents/` tree. The starter writes `%LOCALAPPDATA%/Ricasso/logs/latest.log`. Personal saves, controls, traces and logs are not part of the release.
 
 ## Build from source
 
@@ -73,4 +73,4 @@ The build compiles the host, both ARM64 SREs and all six core client tests, runs
 
 An existing compatible toolchain can be reused with `-ToolchainPrefix C:/path/to/ucrt64` on `build.ps1`. It changes only where build dependencies are read.
 
-Upstream/editor instructions remain in BUILD.md and README.md; those targets have not been revalidated as part of this Windows client contribution.
+Editor tools and other platforms are not part of this repository; see upstream SwordigoDesktop for those.

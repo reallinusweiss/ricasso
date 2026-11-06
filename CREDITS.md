@@ -5,8 +5,9 @@
 - **Lawncher Team** — SRE runtime work, jointly credited with AevoraLabs. The upstream notices name Raijin and Kiziyon.
 - **Rinnegatamante and other upstream contributors** — prior porting work and components identified in the original notices and Git history.
 - **Windows client adaptation** — Windows build and runtime compatibility fixes and input persistence, developed by the Windows port maintainer with OpenAI Codex assistance. Upstream authorship and ownership notices are retained.
+- **Ricasso** — the starter, packaging, cleanup and this reduced distribution, by reallinusweiss. This part is vibe-coded: written with AI tools (Claude and OpenAI Codex).
 
-The launcher/UI images in `src/assets/` (backgrounds, profile icons, window icons, splash) and the Android launcher icons in `res/` are original artwork generated procedurally by `tools/windows/make_original_assets.ps1`. Images taken from the game (logo, key art, app icon, character renders, level backgrounds, UI atlas) were removed from this tree. The sword-in-block icon (`icon_app.png`, `launcer_icon.png`) and `web/assets/hero_bg0.png` are upstream project artwork.
+The launcher/UI images in `src/assets/` (backgrounds, profile icons, window icons, splash) are original artwork generated procedurally by `tools/windows/make_original_assets.ps1`. Images taken from the game (logo, key art, app icon, character renders, level backgrounds, UI atlas) were removed from this tree. The sword-in-block icon (`icon_app.png`, `launcer_icon.png`) is upstream project artwork.
 
 Upstream: https://github.com/TheAevoraLabs/SwordigoDesktop
 

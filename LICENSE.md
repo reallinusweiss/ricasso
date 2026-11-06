@@ -31,7 +31,7 @@ The following subsystems and directories are licensed under the terms of the **G
   - SCL/Scene to graph converters, boulder terrain generator, rubymesh formats, glTF bridge, and asset compilers.
 
 **Copyright © 2026 Lawncher Team & AevoraLabs.**
-Licensed under GPLv3. See [`src/sre/LICENSE.md`](src/sre/LICENSE.md), [`src/ruby/LICENSE.md`](src/ruby/LICENSE.md), and [`src/platform/LICENSE.md`](src/platform/LICENSE.md).
+Licensed under GPLv3. See [`src/sre/LICENSE.md`](src/sre/LICENSE.md), [`src/ruby/LICENSE.md`](https://github.com/TheAevoraLabs/SwordigoDesktop/blob/master/src/ruby/LICENSE.md), and [`src/platform/LICENSE.md`](src/platform/LICENSE.md).
 
 ---
 
@@ -87,10 +87,10 @@ Third-party vendored components retain their respective upstream licenses:
 ## 4. Community Agreements & Governance Policies
 
 All contributions and usage of online project infrastructure are subject to the following companion agreements:
-- **Contributor License Agreement**: See [`.github/CLA.md`](.github/CLA.md) for contribution terms and 50/50 copyright retention rules.
-- **Project Governance**: See [`.github/GOVERNANCE.md`](.github/GOVERNANCE.md) for project stewardship and decision-making authority.
-- **Terms of Use**: See [`.github/TERMS_OF_USE.md`](.github/TERMS_OF_USE.md) for Online Mod Store and network infrastructure terms of use.
-- **Code of Conduct**: See [`.github/CODE_OF_CONDUCT.md`](.github/CODE_OF_CONDUCT.md) for community standards.
+- **Contributor License Agreement**: See [`.github/CLA.md`](https://github.com/TheAevoraLabs/SwordigoDesktop/blob/master/.github/CLA.md) for contribution terms and 50/50 copyright retention rules.
+- **Project Governance**: See [`.github/GOVERNANCE.md`](https://github.com/TheAevoraLabs/SwordigoDesktop/blob/master/.github/GOVERNANCE.md) for project stewardship and decision-making authority.
+- **Terms of Use**: See [`.github/TERMS_OF_USE.md`](https://github.com/TheAevoraLabs/SwordigoDesktop/blob/master/.github/TERMS_OF_USE.md) for Online Mod Store and network infrastructure terms of use.
+- **Code of Conduct**: See [`.github/CODE_OF_CONDUCT.md`](https://github.com/TheAevoraLabs/SwordigoDesktop/blob/master/.github/CODE_OF_CONDUCT.md) for community standards.
 
 ---
 

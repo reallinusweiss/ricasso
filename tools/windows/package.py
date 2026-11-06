@@ -69,6 +69,7 @@ def main():
     for src, dst in [('WINDOWS_CLIENT.md','WINDOWS_CLIENT.md'), ('LICENSE.md','LICENSE.md'),
                      ('WINDOWS_CLIENT.md','README.md'), ('CREDITS.md','CREDITS.md'),
                      ('COPYING.GPL-3.0.txt','COPYING.GPL-3.0.txt'),
+                     ('THIRD_PARTY_SOURCES.md','THIRD_PARTY_SOURCES.md'),
                      ('src/sre/LICENSE.md','licenses/project/SRE-LICENSE.md'),
                      ('src/platform/LICENSE.md','licenses/project/Platform-LICENSE.md'),
                      ('tools/windows/import_apkm.py','tools/windows/import_apkm.py'),
