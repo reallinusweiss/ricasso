@@ -151,7 +151,9 @@ static unsigned int upload_rgba_tex(const unsigned char* rgba, int w, int h) {
 
 // ── Fullscreen quad (GL 2.1 fixed-function) ──────────────────────────────
 
-static void draw_fullscreen_quad(unsigned int tex, int tw, int th, int win_w, int win_h) {
+// Game textures are stored bottom-up; pass top_down for ordinary images.
+static void draw_fullscreen_quad(unsigned int tex, int tw, int th, int win_w, int win_h,
+                                 bool top_down = false) {
     if (!tex || tw <= 0 || th <= 0) return;
     glDisable(GL_DEPTH_TEST);
     glEnable(GL_TEXTURE_2D);
@@ -176,11 +178,13 @@ static void draw_fullscreen_quad(unsigned int tex, int tw, int th, int win_w, in
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
+    const float v_top = top_down ? 0.0f : 1.0f;
+    const float v_bottom = 1.0f - v_top;
     glBegin(GL_QUADS);
-    glTexCoord2f(0, 1); glVertex2f(ox, oy);
-    glTexCoord2f(1, 1); glVertex2f(ox + qw, oy);
-    glTexCoord2f(1, 0); glVertex2f(ox + qw, oy + qh);
-    glTexCoord2f(0, 0); glVertex2f(ox, oy + qh);
+    glTexCoord2f(0, v_top); glVertex2f(ox, oy);
+    glTexCoord2f(1, v_top); glVertex2f(ox + qw, oy);
+    glTexCoord2f(1, v_bottom); glVertex2f(ox + qw, oy + qh);
+    glTexCoord2f(0, v_bottom); glVertex2f(ox, oy + qh);
     glEnd();
 
     glDisable(GL_TEXTURE_2D);
@@ -268,6 +272,7 @@ bool LoadingScreen::init(SDL_Window* window, void* imgui_ctx) {
     // ── Logo: try swordigo_title PVR first, then embedded PNGs ──
     logo_tex_ = pvr_load_texture((base + "swordigo_title_2x.pvr").c_str(),
                                   &logo_w_, &logo_h_);
+    logo_flip_v_ = logo_tex_ != 0;
     if (!logo_tex_) {
         const char* fallbacks[] = {"icon_app.png", "launcher_icon.png", "startup.png"};
         for (const char* name : fallbacks) {
@@ -308,6 +313,7 @@ bool LoadingScreen::init(SDL_Window* window, void* imgui_ctx) {
                 bg_tex_ = upload_rgba_tex(px, w, h);
                 bg_w_ = w;
                 bg_h_ = h;
+                bg_top_down_ = true;
                 asset_image_free(px);
             }
         }
@@ -430,7 +436,7 @@ void LoadingScreen::frame() {
     glClear(GL_COLOR_BUFFER_BIT);
 
     // ── Background scenery ──
-    draw_fullscreen_quad(bg_tex_, bg_w_, bg_h_, fb_w, fb_h);
+    draw_fullscreen_quad(bg_tex_, bg_w_, bg_h_, fb_w, fb_h, bg_top_down_);
 
     // ── Dark scrim (top + bottom) for readability ──
     glDisable(GL_TEXTURE_2D);
@@ -584,6 +590,7 @@ void LoadingScreen::draw_overlay() {
         // Delete old texture
         if (bg_tex_) glDeleteTextures(1, &bg_tex_);
         bg_tex_ = load_game_texture(kBackgrounds[bg_slideshow_idx_], &bg_w_, &bg_h_);
+        bg_top_down_ = false;
         bg_slideshow_next_ = now + 8.0;
     }
 
@@ -614,11 +621,12 @@ void LoadingScreen::draw_overlay() {
                           IM_COL32(233, 69, 96, (int)(glow_a * 255)));
         }
 
-        // PVR/software-decoded data is top-to-bottom, but glTexImage2D
-        // treats row 0 as bottom — so the image is upside-down.  Flip V.
+        // The PVR title is stored bottom-up and needs a V flip; the PNG
+        // fallbacks are ordinary top-down images.
+        const float logo_v0 = logo_flip_v_ ? 1.0f : 0.0f;
         dl->AddImage((ImTextureID)(intptr_t)logo_tex_,
                       ImVec2(lx, ly), ImVec2(lx + lw, ly + lh),
-                      ImVec2(0, 1), ImVec2(1, 0));
+                      ImVec2(0, logo_v0), ImVec2(1, 1.0f - logo_v0));
     }
 
     // ── Flavor line (centered, below logo) ──

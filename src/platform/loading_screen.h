@@ -97,11 +97,13 @@ private:
     unsigned int logo_tex_ = 0;
     int          logo_w_   = 0;
     int          logo_h_   = 0;
+    bool         logo_flip_v_ = false;  // PVR data is bottom-up; PNGs are not
 
     // Full-screen scenery background (real game .tex.png) for a rich backdrop.
     unsigned int bg_tex_   = 0;
     int          bg_w_     = 0;
     int          bg_h_     = 0;
+    bool         bg_top_down_ = false;  // embedded PNG; game textures are bottom-up
     // Slideshow: cycle backgrounds every few seconds.
     int    bg_slideshow_idx_ = 0;  // current index in kBackgrounds
     double bg_slideshow_next_ = 0; // next swap time
