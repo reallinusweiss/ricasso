@@ -499,9 +499,15 @@ func (c *collector) finish() error {
 		case c.hasARMv7 || c.hasX86:
 			return userErr("Wrong device variant", "The file only contains the 32-bit variant of the game. Ricasso needs the 64-bit variant (arm64-v8a).",
 				"Export Swordigo from a 64-bit phone (almost every phone from about 2017 onwards).")
+		case s.files["assets/resources/gamedata.gdata"] != nil || s.files["assets/gamedata.gdata"] != nil:
+			// Typical for exporters that copy only base.apk of a split app.
+			return userErr("Only the main part", "This is only the main part of Swordigo (base.apk). The game itself is in a second part "+
+				"(“split_config.arm64_v8a.apk”). Apps such as “APK Extractor” save only the main part.",
+				"Export Swordigo with an app that saves all parts as one file, e.g. “XAPK Extractor” (.xapk) or SAI (.apks). "+
+					"If you have several APK files, choose them all together (Ctrl+A in the file dialog).")
 		default:
 			return userErr("Part missing", "The game library (arm64-v8a) is missing. For split apps it is inside “split_config.arm64_v8a.apk”.",
-				"Choose all APK files together (Ctrl+A in the file dialog) or export Swordigo as a single .apks file.")
+				"Choose all APK files together (Ctrl+A in the file dialog) or export Swordigo as one .xapk or .apks file.")
 		}
 	}
 	c.progress("Checking the game version…", -1, -1)
@@ -530,7 +536,7 @@ func (c *collector) finish() error {
 	s.Version = version
 	if s.files["assets/resources/gamedata.gdata"] == nil && s.files["assets/gamedata.gdata"] == nil {
 		return userErr("Part missing", "The game data (gamedata.gdata) is missing. It is inside “base.apk”.",
-			"Choose all APK files together (Ctrl+A in the file dialog) or export Swordigo as a single .apks file.")
+			"Choose all APK files together (Ctrl+A in the file dialog) or export Swordigo as one .xapk or .apks file.")
 	}
 	var total int64 = s.lib.size
 	for name, e := range s.files {

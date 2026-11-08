@@ -248,6 +248,13 @@ func TestErrors(t *testing.T) {
 	base := write(t, src, "base.apk", baseAPK(t, PackageName, nil))
 
 	_, err := ScanInputs([]string{base}, nil)
+	wantUserErr(t, err, "Only the main part")
+	if !strings.Contains(err.Error(), "XAPK Extractor") {
+		t.Fatal(err)
+	}
+
+	lang := write(t, src, "split_config.de.apk", zipBytes(t, map[string][]byte{"AndroidManifest.xml": manifest(PackageName)}))
+	_, err = ScanInputs([]string{lang}, nil)
 	wantUserErr(t, err, "Part missing")
 
 	v7 := write(t, src, "split_config.armeabi_v7a.apk", splitAPK(t, "armeabi-v7a", []byte("arm32")))

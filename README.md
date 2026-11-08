@@ -33,7 +33,7 @@ The file can be an `.apkm`, `.apks`, `.xapk`, `.apk`, several split APKs or a fo
 
 ### Where do I get the file?
 
-From your own phone: install Swordigo from Google Play, export it with an app such as [SAI](https://github.com/Aefyr/SAI) and copy the result to your PC. Ricasso explains the steps under *How do I get the file?*
+From your own phone: install Swordigo from Google Play, export it with an app that saves all parts of an app as one file, such as XAPK Extractor (`.xapk`) or [SAI](https://github.com/Aefyr/SAI) (`.apks`), and copy the result to your PC. Apps such as APK Extractor save only the main part (`base.apk`), which does not contain the game itself. Ricasso explains the steps under *How do I get the file?*
 
 Please don't download APK files from third-party websites, and don't share game files. Issues that link to them will be deleted.
 

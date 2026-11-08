@@ -22,7 +22,7 @@ import (
 	"ricasso-launcher/importer"
 )
 
-const launcherVersion = "1.2.0"
+const launcherVersion = "1.2.1"
 
 func init() {
 	// All windows belong to the main thread.

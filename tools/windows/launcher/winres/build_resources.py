@@ -13,16 +13,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-VERSION = (1, 2, 0, 0)
+VERSION = (1, 2, 1, 0)
 STRINGS = [
     ('CompanyName', 'Ricasso (unofficial)'),
     ('FileDescription', 'Ricasso – compatibility layer for Swordigo'),
-    ('FileVersion', '1.2.0'),
+    ('FileVersion', '1.2.1'),
     ('InternalName', 'Ricasso'),
     ('LegalCopyright', 'Starter: GPL-3.0-or-later. Swordigo © Touch Foo – game files not included.'),
     ('OriginalFilename', 'Ricasso.exe'),
     ('ProductName', 'Ricasso (unofficial)'),
-    ('ProductVersion', '1.2.0'),
+    ('ProductVersion', '1.2.1'),
 ]
 LANG_ID, CODEPAGE = 0x0409, 1200  # English (United States), Unicode
 RESOURCE_LANG = 1033

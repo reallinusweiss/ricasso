@@ -13,8 +13,9 @@ Supported: Swordigo 1.4.13 (recommended) and 1.4.12, each in the 64-bit variant 
 
 1) ON YOUR PHONE
 • Install Swordigo from Google Play (if you haven't already).
-• Install an app that can export installed apps including their "split APKs", e.g. "SAI (Split APKs Installer)" (open source: github.com/Aefyr/SAI).
-• Select Swordigo in it and export or back it up. You get an .apks file or several .apk files (e.g. base.apk and split_config.arm64_v8a.apk).
+• Install an app that exports installed apps with all their parts ("split APKs") as one file, e.g. "XAPK Extractor" (gives an .xapk file) or "SAI (Split APKs Installer)" (gives an .apks file; open source: github.com/Aefyr/SAI).
+• Select Swordigo in it and export or back it up. Some apps give several .apk files instead (e.g. base.apk and split_config.arm64_v8a.apk) – then copy all of them.
+• Not suitable: apps such as "APK Extractor" that save only a single .apk file. Swordigo consists of several parts, and the game itself is not in the main part (base.apk).
 
 2) COPY IT TO YOUR PC
 • With a USB cable: connect the phone, choose "File transfer" on the phone and copy the file in File Explorer, e.g. to "Downloads".
