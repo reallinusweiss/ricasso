@@ -99,6 +99,11 @@ private:
     int          logo_h_   = 0;
     bool         logo_flip_v_ = false;  // PVR data is bottom-up; PNGs are not
 
+    // Swordfare logo (embedded icon_app.png), drawn left of the game title.
+    unsigned int brand_tex_ = 0;
+    int          brand_w_   = 0;
+    int          brand_h_   = 0;
+
     // Full-screen scenery background (real game .tex.png) for a rich backdrop.
     unsigned int bg_tex_   = 0;
     int          bg_w_     = 0;

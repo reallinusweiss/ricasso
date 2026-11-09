@@ -106,9 +106,11 @@ def main():
         hashes['../'+name]=hashlib.sha256((root/name).read_bytes()).hexdigest()
     (out/'SHA256SUMS.json').write_text(json.dumps(hashes,indent=2)+'\n')
     archive=root.parent/'Ricasso-Windows-x64.zip'
+    # The archive root is always "Ricasso Windows x64/", even when the staging
+    # folder got a -2/-3 suffix because an older (possibly installed) copy exists.
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
         for p in sorted(root.rglob('*')):
-            z.write(p,p.relative_to(root.parent))
+            z.write(p,Path('Ricasso Windows x64')/p.relative_to(root))
     print('Package:',archive)
     (ROOT/'.tools').mkdir(exist_ok=True)
     (ROOT/'.tools/latest-package.txt').write_text(str(root), encoding='utf-8')

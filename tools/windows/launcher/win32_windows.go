@@ -78,6 +78,7 @@ var (
 	pDragAcceptFiles = shell32.NewProc("DragAcceptFiles")
 	pDragQueryFileW  = shell32.NewProc("DragQueryFileW")
 	pDragFinish      = shell32.NewProc("DragFinish")
+	pSHChangeNotify  = shell32.NewProc("SHChangeNotify")
 
 	pGetOpenFileNameW = comdlg32.NewProc("GetOpenFileNameW")
 
@@ -279,6 +280,12 @@ func u16(s string) *uint16 {
 func call(p *windows.LazyProc, args ...uintptr) uintptr {
 	r, _, _ := p.Call(args...)
 	return r
+}
+
+// shellIconsChanged asks Explorer to reload icons (SHCNE_ASSOCCHANGED), so
+// shortcuts show a rewritten game-icon.ico without a restart.
+func shellIconsChanged() {
+	call(pSHChangeNotify, 0x08000000, 0, 0, 0)
 }
 
 func rgb(r, g, b byte) uintptr { return uintptr(r) | uintptr(g)<<8 | uintptr(b)<<16 }

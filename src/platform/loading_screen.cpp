@@ -1,10 +1,12 @@
 // loading_screen.cpp — Swordigo Desktop boot loading screen
 //
-// Renders hiro POD animation + scenery background + logo + progress bar
-// during the gap between window creation and game first frame.
+// Renders the game's title logo over Ricasso's own calm background, with a
+// progress bar, during the gap between window creation and the first game frame.
 //
-// Fixed: hiro size/position, background fallback, slideshow cycling,
-//        proper GL 2.1 fixed-function POD rendering.
+// The game's background textures (*_bg_2x.tex.png) are parallax atlases with
+// several layers in one image, not finished pictures; stretched over the screen
+// they looked torn and tinted. The hero model rendered as a dark blob. Both are
+// therefore no longer drawn; only the title logo comes from the player's files.
 
 #include "loading_screen.h"
 #include "gl_inc.h"
@@ -31,19 +33,6 @@
 #include <algorithm>
 
 namespace fs = std::filesystem;
-
-// ── Scenery backgrounds (game .tex.png files) ────────────────────────────
-static const char* kBackgrounds[] = {
-    "forest_background_2x.tex.png",
-    "grasslandsbackground_day_2x.tex.png",
-    "grove_bg_2x.tex.png",
-    "cavesbackground2_2x.tex.png",
-    "florennum_night_bg_2x.tex.png",
-    "wasteland_bg_2x.tex.png",
-    "woodkeep_bg_2x.tex.png",
-    "grassbg_night_2x.tex.png",
-};
-static const int kNumBackgrounds = sizeof(kBackgrounds) / sizeof(kBackgrounds[0]);
 
 // ── Flavor quotes ────────────────────────────────────────────────────────
 static const char* kFlavorLines[] = {
@@ -90,10 +79,15 @@ struct Mote {
 
 // ── Texture loading helpers ──────────────────────────────────────────────
 
+// The player's own game textures: <data dir>/<assets>/resources/, which is
+// app/assets/resources next to swordfare.exe on Windows. The previous fixed
+// ~/.local/share path never exists on Windows, so the loading screen always
+// fell back to the built-in images there.
 static std::string get_assets_dir() {
-    const char* home = getenv("HOME");
-    if (!home) home = ".";
-    return std::string(home) + "/.local/share/ricasso/assets/resources/";
+    extern std::string g_assets_dir;
+    std::string dir = get_data_path(g_assets_dir + "/resources");
+    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += '/';
+    return dir;
 }
 
 static unsigned int load_texture_png(const char* path, int* out_w, int* out_h) {
@@ -113,26 +107,6 @@ static unsigned int load_texture_png(const char* path, int* out_w, int* out_h) {
 
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
-    return tex;
-}
-
-static unsigned int load_game_texture(const char* name, int* out_w, int* out_h) {
-    std::string base = get_assets_dir();
-
-    // Try .tex.png first (stbi loads these directly)
-    std::string png_path = base + name;
-    unsigned int tex = load_texture_png(png_path.c_str(), out_w, out_h);
-    if (tex) return tex;
-
-    // Try .pvr fallback (strip _2x if present)
-    std::string pvr_name = name;
-    auto pos = pvr_name.find("_2x");
-    if (pos != std::string::npos) pvr_name.erase(pos, 3);
-    tex = pvr_load_texture((base + pvr_name).c_str(), out_w, out_h);
-    if (tex) return tex;
-
-    // Try original name as .pvr
-    tex = pvr_load_texture((base + std::string(name)).c_str(), out_w, out_h);
     return tex;
 }
 
@@ -299,11 +273,25 @@ bool LoadingScreen::init(SDL_Window* window, void* imgui_ctx) {
     std::cout << "[LoadingScreen] Logo: " << (logo_tex_ ? "OK" : "MISSING")
               << " (" << logo_w_ << "x" << logo_h_ << ")" << std::endl;
 
-    // ── Background scenery ──
-    int bg_idx = rand() % kNumBackgrounds;
-    bg_tex_ = load_game_texture(kBackgrounds[bg_idx], &bg_w_, &bg_h_);
-    if (!bg_tex_) {
-        // Fallback: try embedded launcher background
+    // ── Swordfare logo next to the game title (only when the title itself
+    //    came from the game; otherwise icon_app.png already is the logo) ──
+    if (logo_tex_ && logo_flip_v_) {
+        const unsigned char* raw = nullptr;
+        size_t raw_sz = 0;
+        if (embedded_asset("icon_app.png", &raw, &raw_sz)) {
+            unsigned char* px = nullptr;
+            int w = 0, h = 0;
+            if (asset_decode_image(raw, raw_sz, &px, &w, &h) && px && w > 0 && h > 0) {
+                brand_tex_ = upload_rgba_tex(px, w, h);
+                brand_w_ = w;
+                brand_h_ = h;
+                asset_image_free(px);
+            }
+        }
+    }
+
+    // ── Background: Ricasso's own image (see the note at the top) ──
+    {
         const unsigned char* raw = nullptr;
         size_t raw_sz = 0;
         if (embedded_asset("launcher_bg.png", &raw, &raw_sz)) {
@@ -318,19 +306,14 @@ bool LoadingScreen::init(SDL_Window* window, void* imgui_ctx) {
             }
         }
     }
-    bg_slideshow_idx_ = bg_idx;
-    bg_slideshow_next_ = SDL_GetTicks() / 1000.0 + 8.0; // first swap at 8s
-    std::cout << "[LoadingScreen] Background: " << kBackgrounds[bg_idx]
+    std::cout << "[LoadingScreen] Background: " << (bg_tex_ ? "launcher_bg.png" : "plain")
               << " (" << bg_w_ << "x" << bg_h_ << ")" << std::endl;
 
     // ── Spark sprite ──
     spark_tex_ = load_texture_png((base + "spark.png").c_str(), nullptr, nullptr);
 
-    // ── Hiro POD animation ──
-    load_hiro_animation();
-
     // ── Motes ──
-    mote_count_ = 12;
+    mote_count_ = 10;
     auto* motes = new std::vector<Mote>(mote_count_);
     for (int i = 0; i < mote_count_; i++) {
         Mote& m = (*motes)[i];
@@ -338,8 +321,8 @@ bool LoadingScreen::init(SDL_Window* window, void* imgui_ctx) {
         m.y = (float)(rand() % 1000) / 1000.0f;
         m.vx = ((float)(rand() % 200) - 100.0f) / 500.0f;
         m.vy = -((float)(rand() % 100) + 50.0f) / 500.0f;
-        m.size = 1.5f + (float)(rand() % 30) / 10.0f;
-        m.alpha = 0.15f + (float)(rand() % 20) / 100.0f;
+        m.size = 1.0f + (float)(rand() % 20) / 10.0f;
+        m.alpha = 0.10f + (float)(rand() % 15) / 100.0f;
         m.phase = (float)(rand() % 628) / 100.0f;
     }
     motes_ = motes;
@@ -481,33 +464,6 @@ void LoadingScreen::frame() {
         auto* tex_vec = static_cast<std::vector<GLuint>*>(hiro_mat_tex_);
         draw_pod_gl21(*model, (int)hiro_frame_, *tex_vec,
                        hiro_cx, hiro_cy, hiro_scale, time);
-    } else {
-        // Spinner fallback
-        glDisable(GL_TEXTURE_2D);
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0, fb_w, fb_h, 0, -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-
-        float cx = fb_w * 0.5f;
-        float cy = fb_h * 0.55f;
-        float r = 20.0f;
-        float angle = time * 3.0f;
-
-        glLineWidth(3.0f);
-        glBegin(GL_LINE_LOOP);
-        for (int i = 0; i < 24; i++) {
-            float a = angle + (float)i / 24.0f * 6.2832f;
-            float alpha = 0.2f + 0.6f * ((float)i / 24.0f);
-            glColor4f(0.91f, 0.27f, 0.38f, alpha);
-            glVertex2f(cx + cosf(a) * r, cy + sinf(a) * r);
-        }
-        glEnd();
-        glLineWidth(1.0f);
-        glDisable(GL_BLEND);
     }
 
     // ── Ambient motes ──
@@ -537,7 +493,7 @@ void LoadingScreen::frame() {
             float a = m.alpha * pulse;
 
             glBegin(GL_TRIANGLE_FAN);
-            glColor4f(0.91f, 0.27f, 0.38f, a);
+            glColor4f(0.75f, 0.88f, 0.95f, a);
             glVertex2f(px, py);
             for (int s = 0; s <= 8; s++) {
                 float ang = (float)s / 8.0f * 6.2832f;
@@ -584,16 +540,6 @@ void LoadingScreen::draw_overlay() {
         flavor_next_swap_ = now + 5.0;
     }
 
-    // ── Slideshow background cycling ──
-    if (bg_slideshow_mode_ && now > bg_slideshow_next_) {
-        bg_slideshow_idx_ = (bg_slideshow_idx_ + 1) % kNumBackgrounds;
-        // Delete old texture
-        if (bg_tex_) glDeleteTextures(1, &bg_tex_);
-        bg_tex_ = load_game_texture(kBackgrounds[bg_slideshow_idx_], &bg_w_, &bg_h_);
-        bg_top_down_ = false;
-        bg_slideshow_next_ = now + 8.0;
-    }
-
     // ── Logo (centered, upper third) ──
     if (logo_tex_ && logo_w_ > 0 && logo_h_ > 0) {
         float max_logo_w = ds.x * 0.45f;
@@ -607,8 +553,25 @@ void LoadingScreen::draw_overlay() {
             lh = max_logo_h;
             lw = lh * ar;
         }
-        float lx = (ds.x - lw) * 0.5f;
+        // With the Swordfare logo, both sit side by side as one centred group.
+        float bw = 0.0f, bh = 0.0f, gap = 0.0f;
+        if (brand_tex_ && brand_w_ > 0 && brand_h_ > 0) {
+            bh = lh * 1.15f;
+            bw = bh * (float)brand_w_ / (float)brand_h_;
+            gap = lh * 0.10f;
+            const float max_group = ds.x * 0.70f;
+            if (bw + gap + lw > max_group) {
+                const float k = max_group / (bw + gap + lw);
+                bw *= k; bh *= k; gap *= k; lw *= k; lh *= k;
+            }
+        }
+        float lx = (ds.x - (bw + gap + lw)) * 0.5f + bw + gap;
         float ly = ds.y * 0.08f;
+        if (bw > 0.0f) {
+            const float bx = lx - gap - bw;
+            const float by = ly + (lh - bh) * 0.5f;
+            dl->AddImage((ImTextureID)(intptr_t)brand_tex_, ImVec2(bx, by), ImVec2(bx + bw, by + bh));
+        }
 
         // Spark glow behind logo
         if (spark_tex_) {
@@ -618,7 +581,7 @@ void LoadingScreen::draw_overlay() {
                           ImVec2(lx + lw * 0.5f - glow_s * 0.5f, ly + lh * 0.3f),
                           ImVec2(lx + lw * 0.5f + glow_s * 0.5f, ly + lh * 0.3f + glow_s),
                           ImVec2(0, 0), ImVec2(1, 1),
-                          IM_COL32(233, 69, 96, (int)(glow_a * 255)));
+                          IM_COL32(150, 210, 235, (int)(glow_a * 255)));
         }
 
         // The PVR title is stored bottom-up and needs a V flip; the PNG
@@ -632,24 +595,24 @@ void LoadingScreen::draw_overlay() {
     // ── Flavor line (centered, below logo) ──
     const char* flavor = kFlavorLines[flavor_idx_];
     ImVec2 fsz = ImGui::CalcTextSize(flavor);
-    float flavor_alpha = 0.4f + 0.3f * sinf(now * 1.5f);
-    dl->AddText(ImVec2((ds.x - fsz.x) * 0.5f, ds.y * 0.32f),
-                IM_COL32(180, 190, 210, (int)(flavor_alpha * 255)), flavor);
+    float flavor_alpha = 0.70f + 0.10f * sinf(now * 1.2f);
+    dl->AddText(ImVec2((ds.x - fsz.x) * 0.5f, ds.y * 0.33f),
+                IM_COL32(205, 220, 230, (int)(flavor_alpha * 255)), flavor);
 
     // ── Progress bar (bottom area) ──
-    float bar_w = ds.x * 0.50f;
-    float bar_h = 6.0f;
+    float bar_w = ds.x * 0.36f;
+    float bar_h = 4.0f;
     float bar_x = (ds.x - bar_w) * 0.5f;
     float bar_y = ds.y - 70.0f;
 
     // Track
     dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w, bar_y + bar_h),
-                       IM_COL32(40, 50, 70, 200), 3.0f);
+                       IM_COL32(255, 255, 255, 40), 2.0f);
     // Fill
     float pct = progress_.load();
     if (pct > 0.001f) {
         dl->AddRectFilled(ImVec2(bar_x, bar_y), ImVec2(bar_x + bar_w * pct, bar_y + bar_h),
-                           IM_COL32(233, 69, 96, 230), 3.0f);
+                           IM_COL32(140, 205, 230, 235), 2.0f);
         // Glow on fill tip
         if (spark_tex_) {
             float tip_x = bar_x + bar_w * pct;
@@ -659,7 +622,7 @@ void LoadingScreen::draw_overlay() {
                           ImVec2(tip_x - glow_s, bar_y - glow_s),
                           ImVec2(tip_x + glow_s, bar_y + bar_h + glow_s),
                           ImVec2(0, 0), ImVec2(1, 1),
-                          IM_COL32(233, 69, 96, (int)(glow_a * 255)));
+                          IM_COL32(150, 210, 235, (int)(glow_a * 255)));
         }
     }
 
@@ -671,7 +634,7 @@ void LoadingScreen::draw_overlay() {
     }
     ImVec2 ssz = ImGui::CalcTextSize(stage_text.c_str());
     dl->AddText(ImVec2((ds.x - ssz.x) * 0.5f, bar_y - 22.0f),
-                IM_COL32(130, 140, 160, 180), stage_text.c_str());
+                IM_COL32(170, 190, 205, 200), stage_text.c_str());
 
     // ── Watchdog messages ──
     float elapsed_secs = (float)now - (float)start_time_;
@@ -689,9 +652,10 @@ void LoadingScreen::draw_overlay() {
         last_watchdog_ = 0;
     }
 
-    // Version tag
-    dl->AddText(ImVec2(ds.x - 120.0f, ds.y - 20.0f),
-                IM_COL32(80, 90, 110, 100), "v8.0 Remaster");
+    // Name tag (the old upstream "v8.0 Remaster" label meant nothing here)
+    const char* tag = "Ricasso";
+    dl->AddText(ImVec2(ds.x - ImGui::CalcTextSize(tag).x - 16.0f, ds.y - 26.0f),
+                IM_COL32(150, 170, 185, 90), tag);
 
     ImGui::End(); // close ##loading_overlay
     ImGui::PopStyleColor();
@@ -711,6 +675,7 @@ void LoadingScreen::shutdown() {
 
     if (bg_tex_) { glDeleteTextures(1, &bg_tex_); bg_tex_ = 0; }
     if (logo_tex_) { glDeleteTextures(1, &logo_tex_); logo_tex_ = 0; }
+    if (brand_tex_) { glDeleteTextures(1, &brand_tex_); brand_tex_ = 0; }
     if (spark_tex_) { glDeleteTextures(1, &spark_tex_); spark_tex_ = 0; }
 
     if (hiro_model_) {

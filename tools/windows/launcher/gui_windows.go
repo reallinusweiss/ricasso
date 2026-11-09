@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"ricasso-launcher/importer"
+	"ricasso-launcher/update"
 )
 
 const className = "RicassoStarter"
@@ -42,6 +43,7 @@ const (
 	msgGameFailed
 	msgCopyDone
 	msgStartup
+	msgUpdateFound
 )
 
 // Fonts
@@ -120,12 +122,14 @@ type app struct {
 	copyErr     error
 	copyTarget  string
 	logPath     string
+	newRelease  update.Release // newer Ricasso release on GitHub, if any
 
 	// Controls
 	title, subtitle, footer                                                     *control
 	intro, cmdChoose, cmdHelp, cmdPrev, btnSetupBack                            *control
 	busyLbl, busyBar, busyMarquee, busyDetail                                   *control
 	status, cmdPlay, controlsLbl, btnShortcut, btnSaves, btnLog, btnRe, warnLbl *control
+	btnUpdate, btnUninstall                                                     *control
 	errTitle, errHint, errLog, btnRetry, btnOpenLog, btnErrBack                 *control
 	helpText, btnHelpChoose, btnHelpBack                                        *control
 }
@@ -179,7 +183,7 @@ func (a *app) createControls() {
 
 	// Setup
 	a.intro = a.label("To play, you need your own copy of Swordigo for Android "+
-		"(supported: "+importer.SupportedVersionsText+"). This program contains no game files and downloads nothing from the internet.",
+		"(supported: "+importer.SupportedVersionsText+"). Ricasso contains no game files and never downloads any.",
 		24, 88, 552, 54, pgSetup, fNormal)
 	a.cmdChoose = a.cmdLink("Choose file…", "Your own copy of Swordigo (.apkm, .apks, .xapk or .apk)", 24, 270, 270, 70, pgSetup, a.chooseFile)
 	a.cmdHelp = a.cmdLink("How do I get the file?", "Guide: get Swordigo from your own phone", 306, 270, 270, 70, pgSetup, func() { a.showPage(pgHelp) })
@@ -201,15 +205,19 @@ func (a *app) createControls() {
 	a.status = a.label("", 24, 88, 552, 24, pgReady, fBold)
 	a.status.color = rgb(24, 120, 48)
 	a.cmdPlay = a.cmdLink("Play", "", 24, 120, 552, 74, pgReady, a.play)
-	a.controlsLbl = a.label("Controls (keyboard)\r\n"+
-		"A / D or arrow keys: move   ·   Space or W: jump   ·   Attack/magic: see F2\r\n"+
-		"F1: menu   ·   F2: change keys (R = rebind, F2 = save)   ·   F3: performance overlay",
-		24, 206, 552, 62, pgReady, fNormal)
-	a.btnShortcut = a.button("Desktop shortcut", 24, 282, 132, 34, pgReady, a.createShortcuts)
-	a.btnSaves = a.button("Saves", 164, 282, 132, 34, pgReady, a.openSaves)
-	a.btnLog = a.button("Log", 304, 282, 132, 34, pgReady, a.openLog)
-	a.btnRe = a.button("Set up again…", 444, 282, 132, 34, pgReady, func() { a.showPage(pgSetup) })
-	a.warnLbl = a.label("", 24, 330, 552, 74, pgReady, fNormal)
+	a.controlsLbl = a.label("Keyboard: A / D or arrow keys: move  ·  Space or W: jump  ·  attack/magic: see F2\r\n"+
+		"Controller: stick or D-pad: move  ·  A: jump  ·  X: attack  ·  Y: magic  ·  B: item\r\n"+
+		"Start: menu  ·  in menus the right stick moves the pointer and RT clicks\r\n"+
+		"F1: menu  ·  F2: change keys (R = rebind, F2 = save)  ·  F3: performance overlay",
+		24, 200, 552, 76, pgReady, fNormal)
+	a.btnShortcut = a.button("Desktop shortcut", 24, 284, 132, 32, pgReady, a.createShortcuts)
+	a.btnSaves = a.button("Saves", 164, 284, 132, 32, pgReady, a.openSaves)
+	a.btnLog = a.button("Log", 304, 284, 132, 32, pgReady, a.openLog)
+	a.btnRe = a.button("Set up again…", 444, 284, 132, 32, pgReady, func() { a.showPage(pgSetup) })
+	a.btnUpdate = a.button("", 24, 324, 412, 32, pgReady, a.openRelease)
+	a.btnUpdate.hidden = true
+	a.btnUninstall = a.button("Uninstall…", 444, 324, 132, 32, pgReady, a.uninstall)
+	a.warnLbl = a.label("", 24, 364, 552, 46, pgReady, fNormal)
 	a.warnLbl.color = rgb(150, 90, 0)
 
 	// Error while playing
@@ -271,6 +279,9 @@ func (a *app) showPage(p page) {
 	setText(a.subtitle.hwnd, subtitles[p])
 	a.btnSetupBack.hidden = !a.installed.OK
 	a.cmdPrev.hidden = a.prevInstall == ""
+	a.mu.Lock()
+	a.btnUpdate.hidden = a.newRelease.Version == ""
+	a.mu.Unlock()
 	for _, c := range a.controls {
 		show := c.pages&p != 0 && !c.hidden
 		if show {
@@ -289,6 +300,9 @@ func (a *app) showPage(p page) {
 // refresh re-detects the state and shows the matching page.
 func (a *app) refresh() {
 	a.installed = importer.DetectInstalled(a.appDir)
+	if a.installed.HasIcon && importer.RefreshIcon(a.appDir) {
+		shellIconsChanged() // older setups: shortcuts pick up the new icon sizes
+	}
 	if a.installed.OK {
 		setText(a.status.hwnd, "Ready: Swordigo "+a.installed.Version+" is set up.")
 		a.setNote(a.cmdPlay, "Starts Swordigo "+a.installed.Version+". The first start can take a few seconds.")
@@ -713,6 +727,16 @@ func wndProc(hwnd uintptr, m uint32, wp, lp uintptr) (ret uintptr) {
 		return 0
 	case msgStartup:
 		a.startupChecks()
+		go a.checkForUpdate()
+		return 0
+	case msgUpdateFound:
+		a.mu.Lock()
+		rel := a.newRelease
+		a.mu.Unlock()
+		setText(a.btnUpdate.hwnd, "Ricasso "+rel.Version+" is available – open the download page")
+		if !a.busy {
+			a.showPage(a.page)
+		}
 		return 0
 	case wmClose:
 		call(pDestroyWindow, hwnd)

@@ -16,10 +16,10 @@ Ricasso is a fan project. It is not made, endorsed or supported by Touch Foo, an
 
 | | |
 | --- | --- |
-| Stage | Alpha |
+| Stage | 1.0.0 |
 | Game versions | Swordigo 1.4.13 (recommended) and 1.4.12, 64-bit (arm64-v8a) |
 | Windows | Built and tested on Windows 11 x64. Windows 10 should work but is untested. |
-| Testing | Automated client and package tests pass. Gameplay testing is limited so far. |
+| Testing | Automated client and package tests pass. Gameplay is tested with Swordigo 1.4.13 (keyboard and controller); 1.4.12 is not yet tested in play. |
 
 ## Getting started
 
@@ -30,6 +30,24 @@ You need 64-bit Windows, an up-to-date graphics driver and your own copy of Swor
 3. Choose your Swordigo file or drag it onto the window. Ricasso checks it, copies only what the game needs and offers desktop and Start-menu shortcuts.
 
 The file can be an `.apkm`, `.apks`, `.xapk`, `.apk`, several split APKs or a folder containing them.
+
+### Controls
+
+| | Keyboard | Controller |
+| --- | --- | --- |
+| Move | A / D or arrow keys | Left stick or D-pad |
+| Jump | Space or W | A |
+| Attack / magic | see F2 | X / Y |
+| Use item | see F2 | B |
+| Game menu | Escape | Start |
+| Menus and dialogs | Mouse | Right stick moves the pointer, RT clicks |
+
+F2 opens the key editor (R = rebind, F2 = save), F1 the Ricasso menu and F3 the performance overlay.
+
+### Updating and uninstalling
+
+- When a newer Ricasso release is on GitHub, `Ricasso.exe` shows a button that opens the download page. It asks GitHub at most once a day; set the environment variable `RICASSO_NO_UPDATE_CHECK=1` to turn this off. To update, extract the new ZIP, start `Ricasso.exe` and choose *Reuse previous installation*.
+- *Uninstall…* in `Ricasso.exe` removes the shortcuts, the game files Ricasso set up and the Ricasso folder. Your saves in `%APPDATA%\ricasso` stay.
 
 ### Where do I get the file?
 
@@ -51,7 +69,7 @@ So it is neither an Android emulator nor a source port or static recompilation.
 - **No game files.** Neither this repository nor the releases contain any, and no game artwork either. The images in `src/assets/` are original ([generator](tools/windows/make_original_assets.ps1)).
 - **No unlocked purchases.** Every in-app product counts as not purchased, because there is no store on desktop.
 - **No ads.** There is no ad service on desktop, so ad requests are answered as "no ad available".
-- **No downloads by the starter.** Ricasso uploads and downloads nothing during setup or when starting the game. The optional mod store in the client's own launcher, which the starter skips, fetches community mods from a third party.
+- **No game downloads.** Ricasso uploads nothing and never downloads game files. The only network request is the starter's update check: at most once a day it reads the public list of Ricasso releases on GitHub (`RICASSO_NO_UPDATE_CHECK=1` turns it off). The optional mod store in the client's own launcher, which the starter skips, fetches community mods from a third party.
 
 ## Saves, logs and problems
 

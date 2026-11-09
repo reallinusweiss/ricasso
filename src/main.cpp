@@ -51,6 +51,8 @@ extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp �
 #include "platform/input_config.h"
 #include <cstring>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 #define GL_GLEXT_PROTOTYPES
 #include "platform/gl_inc.h"
 #include <GL/glext.h>
@@ -1531,8 +1533,11 @@ uint64_t setup_jni_env_arm64(uint8_t* memory) {
     return env_ptr;
 }
 
+static bool arm64_mod_quick_action(GuiAction a);  // defined next to the ARM64 hero roots
+
 void process_gui_action(GuiAction gui_action, bool& running) {
     if (gui_action == GUI_NONE) return;
+    if (arm64_mod_quick_action(gui_action)) return;
     switch (gui_action) {
         case GUI_EXIT:
             running = false;
@@ -3279,6 +3284,18 @@ static uint32_t read_guest_ptr32(uint64_t va) {
     return v;
 }
 
+// Mod tools only write to the hero while these checks pass (see below).
+static bool s_arm64_hero_ok = false;
+static uint64_t s_gsc_vtable = 0, s_hero_vtable = 0;
+
+// The hero SceneObject keeps its identifier as a libc++ short std::string at
+// +0x50 (size byte, then the characters); for the hero it is "hero".
+static bool hero_identifier_ok(uint32_t obj) {
+    const uint64_t id = static_cast<uint64_t>(obj) + 0x51;
+    return g_guest_memory && obj >= 0x10000 && id + 5 < GUEST_MEM_SIZE &&
+           std::memcmp(g_guest_memory + id, "hero", 5) == 0;
+}
+
 // Resolve libsre13's gsc_get() once, after the SRE module is loaded.
 static void resolve_arm64_hero_roots() {
     s_gsc_get_fn = 0;
@@ -3318,12 +3335,382 @@ static void update_arm64_hero_roots() {
     }
 
     const uint32_t gsc = g_game_scene_controller;
-    if (gsc == 0) return;
+    if (gsc == 0) {
+        // No level running: drop the old pointers so nothing writes through them.
+        g_hero_obj = g_hero_char_ctrl_comp = g_hero_health_comp = g_hero_mana_comp = 0;
+        s_arm64_hero_ok = false;
+        return;
+    }
     const uint64_t base = static_cast<uint64_t>(gsc);
     g_hero_obj            = read_guest_ptr32(base + kGscOffHero);
     g_hero_char_ctrl_comp = read_guest_ptr32(base + kGscOffCharCtrl);
     g_hero_health_comp    = read_guest_ptr32(base + kGscOffHealth);
     g_hero_mana_comp      = read_guest_ptr32(base + kGscOffMana);
+
+    // Verify once per controller/hero pair that +0xD8 really is the hero and
+    // remember both vtables, so arm64_mod_targets_live() can detect a freed or
+    // replaced controller cheaply every frame.
+    static uint32_t s_checked_gsc = 0, s_checked_hero = 0;
+    if (gsc != s_checked_gsc || g_hero_obj != s_checked_hero) {
+        s_checked_gsc  = gsc;
+        s_checked_hero = g_hero_obj;
+        s_arm64_hero_ok = hero_identifier_ok(g_hero_obj);
+        if (s_arm64_hero_ok) {
+            std::memcpy(&s_gsc_vtable, g_guest_memory + base, 8);
+            std::memcpy(&s_hero_vtable, g_guest_memory + g_hero_obj, 8);
+        }
+        std::cout << "[Roots] ARM64: hero @ 0x" << std::hex << g_hero_obj << std::dec
+                  << (s_arm64_hero_ok ? " (identifier \"hero\" verified)"
+                                      : " (identifier check failed; mod tools paused)")
+                  << std::endl;
+    }
+}
+
+// True while the controller and hero found above are still the live objects:
+// both vtables unchanged (a freed object loses them) and the identifier intact.
+static bool arm64_mod_targets_live() {
+    if (!s_arm64_hero_ok || !g_guest_memory || g_game_scene_controller == 0) return false;
+    uint64_t vt_gsc = 0, vt_hero = 0;
+    std::memcpy(&vt_gsc, g_guest_memory + g_game_scene_controller, 8);
+    std::memcpy(&vt_hero, g_guest_memory + g_hero_obj, 8);
+    return vt_gsc == s_gsc_vtable && vt_hero == s_hero_vtable && hero_identifier_ok(g_hero_obj);
+}
+
+// Guest memory accessors for the ARM64 mod tools (bounds-checked by the caller).
+static bool guest_range_ok(uint64_t va, uint64_t len) {
+    return va >= 0x10000 && va + len < GUEST_MEM_SIZE;
+}
+static int32_t gread_i32(uint64_t va) { int32_t v; std::memcpy(&v, g_guest_memory + va, 4); return v; }
+static float gread_f32(uint64_t va) { float v; std::memcpy(&v, g_guest_memory + va, 4); return v; }
+static void gwrite_i32(uint64_t va, int32_t v) { std::memcpy(g_guest_memory + va, &v, 4); }
+static void gwrite_f32(uint64_t va, float v) { std::memcpy(g_guest_memory + va, &v, 4); }
+
+// ARM64 (1.4.13) offsets of the hero components. Health/Mana/GameState come
+// from upstream's IDA notes (docs/sre13/HealthComponent.md,
+// GameSceneController.md, CharacterState.md); the CharControllerComponent
+// fields match libsre13's caver/Component/CharControllerComponent.h, which its
+// Mini.Character Get/Set{Walk,Run,Jump}Speed API also uses.
+static constexpr uint32_t kHpIsDead     = 0x70;  // bool
+static constexpr uint32_t kHpHealth     = 0x74;  // int, value loaded at spawn
+static constexpr uint32_t kHpCurrent    = 0x78;  // int, lowered by TakeDamage
+static constexpr uint32_t kHpInitial    = 0x7C;  // int
+static constexpr uint32_t kManaA        = 0x68;  // int (current/max pair)
+static constexpr uint32_t kManaB        = 0x6C;  // int
+static constexpr uint32_t kCcAirJumps   = 0x258; // int, air jumps used
+static constexpr uint32_t kCcJumpSpeed  = 0x264; // float
+static constexpr uint32_t kCcWalkSpeed  = 0x270; // float ("runSpeed" in libsre13)
+static constexpr uint32_t kCcRunSpeed   = 0x278; // float ("fastRunSpeed")
+static constexpr uint32_t kGscOffGameState = 0x08; // GameState*
+static constexpr uint32_t kGscLevelUpTimer = 0x17C; // float; Update checks for a level-up only while > 0
+static constexpr uint32_t kGsCoins      = 0x98;  // GameState-relative (embedded CharacterState)
+static constexpr uint32_t kGsXP         = 0x9C;
+static constexpr uint32_t kGsLevel      = 0xA0;
+static constexpr uint32_t kGsCharacterState = 0x10;
+static constexpr int32_t  kMaxLevel     = 99;    // Update only levels up while level <= 98
+
+static bool hero_full_health(uint64_t hc, int32_t* out) {
+    const int32_t full = std::max({gread_i32(hc + kHpHealth), gread_i32(hc + kHpInitial), gread_i32(hc + kHpCurrent)});
+    if (full <= 0 || full > 100000) return false;
+    *out = full;
+    return true;
+}
+
+static bool hero_full_mana(uint64_t mc, int32_t* out) {
+    const int32_t a = gread_i32(mc + kManaA), b = gread_i32(mc + kManaB);
+    const int32_t full = std::max(a, b);
+    if (a < 0 || b < 0 || full <= 0 || full > 100000) return false;
+    *out = full;
+    return true;
+}
+
+// XP the game requires for `level`, computed by the game itself
+// (CharacterState::ExperiencePointsRequiredForLevel, a pure function).
+static bool xp_required_for_level(uint64_t gs, int32_t level, int32_t* out) {
+    static uint64_t s_fn = 0;
+    if (level < 2) { *out = 0; return true; }
+    if (!s_fn && g_loader_64) {
+        s_fn = g_loader_64->get_symbol_vaddr(&g_main_mod_64,
+            "_ZN5Caver14CharacterState32ExperiencePointsRequiredForLevelEi");
+    }
+    if (!s_fn || !g_emulator_64) return false;
+    const int32_t v = static_cast<int32_t>(g_emulator_64->call(s_fn, {gs + kGsCharacterState, static_cast<uint64_t>(level)}));
+    if (v <= 0) return false;  // a faulted call returns 0
+    *out = v;
+    return true;
+}
+
+// Redraws the XP bar from the GameState, as the game does after XP changes
+// (GameSceneController::Update calls the same function on the overlay's bar).
+static void refresh_xp_bar(uint64_t gsc, uint64_t gs) {
+    static uint64_t s_update = 0, s_vtable = 0;
+    if (!s_update && g_loader_64) {
+        s_update = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver13ExperienceBar16UpdateExperienceEv");
+        const uint64_t vt = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZTVN5Caver13ExperienceBarE");
+        s_vtable = vt ? vt + 0x10 : 0;
+    }
+    if (!s_update || !s_vtable || !g_emulator_64) return;
+    uint64_t overlay = 0, bar = 0, bar_vt = 0, bar_gs = 0;
+    std::memcpy(&overlay, g_guest_memory + gsc + 0x30, 8);   // GameOverlay
+    if (!guest_range_ok(overlay, 0x220)) return;
+    std::memcpy(&bar, g_guest_memory + overlay + 0x210, 8);  // ExperienceBar
+    if (!guest_range_ok(bar, 0x130)) return;
+    std::memcpy(&bar_vt, g_guest_memory + bar, 8);
+    std::memcpy(&bar_gs, g_guest_memory + bar + 0x110, 8);   // the GameState it shows
+    if (bar_vt != s_vtable || bar_gs != gs) return;
+    g_emulator_64->call(s_update, {bar});
+}
+
+// Level and XP cheats run here, between frames, because they call into the game.
+static GuiAction s_pending_xp_action = GUI_NONE;
+
+// Level-ups go through the game's own flow: the hero gets exactly the XP the
+// next level needs and the level-up check is started, so the game shows its
+// upgrade dialog and raises the level itself (ApplyLevelUp). Writing the level
+// directly skipped the dialog and left the XP below the next threshold.
+static void run_arm64_xp_action(GuiAction a) {
+    const uint64_t gsc = g_game_scene_controller;
+    uint64_t gs = 0;
+    std::memcpy(&gs, g_guest_memory + gsc + kGscOffGameState, 8);
+    const int32_t lv = guest_range_ok(gs, 0x120) ? gread_i32(gs + kGsLevel) : 0;
+    const int32_t xp = lv ? gread_i32(gs + kGsXP) : -1;
+    if (lv < 1 || lv > kMaxLevel || xp < 0) {
+        mod_toast("Not available right now", 1.5f);
+        return;
+    }
+    auto start_level_up_check = [&]() {
+        if (gread_f32(gsc + kGscLevelUpTimer) <= 0.0f) gwrite_f32(gsc + kGscLevelUpTimer, 0.2f);
+    };
+    char msg[64];
+    int32_t need = 0;
+    if (a == GUI_MOD_LEVEL_UP) {
+        if (lv >= kMaxLevel) {
+            mod_toast("Already at the highest level", 1.5f);
+            return;
+        }
+        if (!xp_required_for_level(gs, lv + 1, &need)) {
+            mod_toast("Not available right now", 1.5f);
+            return;
+        }
+        if (xp < need) gwrite_i32(gs + kGsXP, need);
+        refresh_xp_bar(gsc, gs);
+        start_level_up_check();
+        mod_toast("Level up! Choose an upgrade", 2.0f);
+        return;
+    }
+    if (a == GUI_MOD_LEVEL_DOWN) {
+        if (lv <= 1) {
+            mod_toast("Already at level 1", 1.5f);
+            return;
+        }
+        if (!xp_required_for_level(gs, lv - 1, &need)) {
+            mod_toast("Not available right now", 1.5f);
+            return;
+        }
+        // XP drops to the start of the lower level, so the game does not level
+        // straight back up. Upgrades already chosen are kept.
+        gwrite_i32(gs + kGsLevel, lv - 1);
+        gwrite_i32(gs + kGsXP, need);
+        refresh_xp_bar(gsc, gs);
+        snprintf(msg, sizeof(msg), "Level: %d (upgrades kept)", lv - 1);
+        mod_toast(msg, 1.5f);
+        return;
+    }
+    if (a == GUI_MOD_EXP_UP) {
+        const int32_t nxp = std::min(xp + 500, 99999999);
+        gwrite_i32(gs + kGsXP, nxp);
+        start_level_up_check();  // crossing a threshold opens the upgrade dialog
+        snprintf(msg, sizeof(msg), "XP: %d", nxp);
+    } else {
+        // Never below the start of the current level (the game clamps loaded
+        // saves the same way).
+        if (!xp_required_for_level(gs, lv, &need)) {
+            mod_toast("Not available right now", 1.5f);
+            return;
+        }
+        const int32_t nxp = std::max(need, xp - 500);
+        gwrite_i32(gs + kGsXP, nxp);
+        snprintf(msg, sizeof(msg), "XP: %d", nxp);
+    }
+    refresh_xp_bar(gsc, gs);
+    mod_toast(msg, 1.5f);
+}
+
+// Per-frame cheats for the ARM64 path (mod_apply_frame() is the ARM32 version).
+static void apply_arm64_mods() {
+    static uint32_t s_cc_seen = 0;
+    static float s_walk = 0.0f, s_run = 0.0f, s_jump = 0.0f;
+    static bool s_speed_applied = false;
+    if (swordi_abi < 13 || !arm64_mod_targets_live()) {
+        s_cc_seen = 0;
+        s_speed_applied = false;
+        if (s_pending_xp_action != GUI_NONE) {
+            s_pending_xp_action = GUI_NONE;
+            mod_toast("Cheats only work inside a level", 1.5f);
+        }
+        return;
+    }
+    if (s_pending_xp_action != GUI_NONE) {
+        const GuiAction pending = s_pending_xp_action;
+        s_pending_xp_action = GUI_NONE;
+        run_arm64_xp_action(pending);
+    }
+
+    const uint64_t hc = g_hero_health_comp;
+    if (g_gui.mod_god_mode && guest_range_ok(hc, 0xC0)) {
+        int32_t full = 0;
+        if (hero_full_health(hc, &full)) {
+            gwrite_i32(hc + kHpCurrent, full);
+            g_guest_memory[hc + kHpIsDead] = 0;
+        }
+    }
+
+    const uint64_t mc = g_hero_mana_comp;
+    if (g_gui.mod_infinite_mana && guest_range_ok(mc, 0x80)) {
+        int32_t full = 0;
+        if (hero_full_mana(mc, &full)) {
+            gwrite_i32(mc + kManaA, full);
+            gwrite_i32(mc + kManaB, full);
+        }
+    }
+
+    const uint64_t cc = g_hero_char_ctrl_comp;
+    if (!guest_range_ok(cc, 0x300)) return;
+    if (cc != s_cc_seen) {
+        // New controller (level or room change): remember the game's own values.
+        auto sane = [](float v) { return std::isfinite(v) && v > 0.0f && v < 100000.0f ? v : 0.0f; };
+        s_cc_seen = static_cast<uint32_t>(cc);
+        s_walk = sane(gread_f32(cc + kCcWalkSpeed));
+        s_run  = sane(gread_f32(cc + kCcRunSpeed));
+        s_jump = sane(gread_f32(cc + kCcJumpSpeed));
+        s_speed_applied = false;
+    }
+    const bool speed_mod = std::fabs(g_gui.mod_walk_speed - 1.0f) > 0.01f ||
+                           std::fabs(g_gui.mod_run_speed - 1.0f) > 0.01f ||
+                           std::fabs(g_gui.mod_jump_height - 1.0f) > 0.01f;
+    if (speed_mod || s_speed_applied) {
+        // While a multiplier is active it is applied every frame; once all are
+        // back at 1.0 the original values are written back exactly once.
+        const float w = speed_mod ? g_gui.mod_walk_speed : 1.0f;
+        const float r = speed_mod ? g_gui.mod_run_speed : 1.0f;
+        const float j = speed_mod ? g_gui.mod_jump_height : 1.0f;
+        if (s_walk > 0.0f) gwrite_f32(cc + kCcWalkSpeed, s_walk * w);
+        if (s_run > 0.0f)  gwrite_f32(cc + kCcRunSpeed, s_run * r);
+        if (s_jump > 0.0f) gwrite_f32(cc + kCcJumpSpeed, s_jump * j);
+        s_speed_applied = speed_mod;
+    }
+    if (g_gui.mod_infinite_jump) {
+        const int32_t used = gread_i32(cc + kCcAirJumps);
+        if (used > 0 && used <= 16) gwrite_i32(cc + kCcAirJumps, 0);
+    }
+}
+
+// One-shot cheats from the mod menu on the ARM64 path. libsre13 exports no
+// GameState pointer (the old code path needs g_sre_gamestate_ptr), so the
+// GameState is taken from the live GameSceneController instead.
+// Returns true if the action was handled here.
+static bool arm64_mod_quick_action(GuiAction a) {
+    switch (a) {
+    case GUI_MOD_HEAL_FULL: case GUI_MOD_REFILL_MANA: case GUI_MOD_ADD_COINS:
+    case GUI_MOD_LEVEL_UP: case GUI_MOD_LEVEL_DOWN: case GUI_MOD_EXP_UP: case GUI_MOD_EXP_DOWN:
+        break;
+    default:
+        return false;
+    }
+    if (!g_emulator_64 || swordi_abi < 13) return false;
+    if (!arm64_mod_targets_live()) {
+        mod_toast("Cheats only work inside a level", 1.5f);
+        return true;
+    }
+    char msg[64];
+    if (a == GUI_MOD_HEAL_FULL || a == GUI_MOD_REFILL_MANA) {
+        const bool heal = (a == GUI_MOD_HEAL_FULL);
+        const uint64_t comp = heal ? g_hero_health_comp : g_hero_mana_comp;
+        int32_t full = 0;
+        if (guest_range_ok(comp, 0xC0) && (heal ? hero_full_health(comp, &full) : hero_full_mana(comp, &full))) {
+            if (heal) {
+                gwrite_i32(comp + kHpCurrent, full);
+                g_guest_memory[comp + kHpIsDead] = 0;
+            } else {
+                gwrite_i32(comp + kManaA, full);
+                gwrite_i32(comp + kManaB, full);
+            }
+            mod_toast(heal ? "HP restored to full!" : "Mana restored to full!", 1.5f);
+        } else {
+            mod_toast("Not available right now", 1.5f);
+        }
+        return true;
+    }
+
+    uint64_t gs = 0;
+    std::memcpy(&gs, g_guest_memory + g_game_scene_controller + kGscOffGameState, 8);
+    const bool gs_ok = guest_range_ok(gs, 0x120) && gread_i32(gs + kGsLevel) >= 1 && gread_i32(gs + kGsLevel) <= 99 &&
+                       gread_i32(gs + kGsCoins) >= 0 && gread_i32(gs + kGsXP) >= 0;
+    if (!gs_ok) {
+        mod_toast("Not available right now", 1.5f);
+        return true;
+    }
+    if (a == GUI_MOD_ADD_COINS) {
+        const int32_t coins = std::min(gread_i32(gs + kGsCoins) + 100, 99999999);
+        gwrite_i32(gs + kGsCoins, coins);
+        snprintf(msg, sizeof(msg), "Coins: %d (+100)", coins);
+        mod_toast(msg, 1.5f);
+    } else {
+        s_pending_xp_action = a;  // handled by apply_arm64_mods() after this frame
+    }
+    return true;
+}
+
+// Controller pointer: the right stick moves the mouse pointer and the right
+// trigger clicks, so menus and dialogs that the game only offers as touch
+// targets (upgrade choice, inventory, map) also work with a controller.
+// The click goes through the normal mouse path as a synthetic SDL event.
+static void gamepad_pointer_update() {
+    extern Display* g_display_ptr;
+    static bool s_down = false;
+    static Uint64 s_last_ns = 0;
+    SDL_Window* win = g_display_ptr ? g_display_ptr->get_window() : nullptr;
+    if (!g_gamepad || !win) {
+        s_down = false;
+        s_last_ns = 0;
+        return;
+    }
+    const Uint64 now = SDL_GetTicksNS();
+    const float dt = s_last_ns ? std::min((now - s_last_ns) / 1e9f, 0.1f) : 0.0f;
+    s_last_ns = now;
+
+    auto shape = [](float v) {  // dead zone, then a soft curve for fine aiming
+        const float a = std::fabs(v);
+        if (a < 0.2f) return 0.0f;
+        const float t = std::min((a - 0.2f) / 0.8f, 1.0f);
+        return std::copysign(t * t, v);
+    };
+    const float rx = shape(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX) / 32767.0f);
+    const float ry = shape(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY) / 32767.0f);
+    int w = 0, h = 0;
+    SDL_GetWindowSize(win, &w, &h);
+    float mx = 0.0f, my = 0.0f;
+    SDL_GetMouseState(&mx, &my);
+    if ((rx != 0.0f || ry != 0.0f) && dt > 0.0f && w > 0 && h > 0) {
+        const float speed = 1.1f * (float)std::max(w, h);  // full stroke: ~1 screen per second
+        mx = std::clamp(mx + rx * speed * dt, 0.0f, (float)(w - 1));
+        my = std::clamp(my + ry * speed * dt, 0.0f, (float)(h - 1));
+        SDL_WarpMouseInWindow(win, mx, my);
+    }
+
+    const bool down = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000;
+    if (down != s_down) {
+        s_down = down;
+        SDL_Event ev;
+        SDL_zero(ev);
+        ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+        ev.button.windowID = SDL_GetWindowID(win);
+        ev.button.button = SDL_BUTTON_LEFT;
+        ev.button.down = down;
+        ev.button.clicks = 1;
+        ev.button.x = mx;
+        ev.button.y = my;
+        SDL_PushEvent(&ev);
+    }
 }
 
 void load_and_boot_arm64() {
@@ -6956,6 +7343,7 @@ void load_and_boot_arm64() {
             g_swordfare_gui.update_console_backend();
 
             update_arm64_hero_roots();
+            apply_arm64_mods();
 
             // ── Auto Console Test (debug)──────────────────────────────────
             // SWORDIGO_AUTO_CONSOLE=1  submits two console commands headlessly
@@ -8616,6 +9004,11 @@ void load_and_boot_arm64() {
                             keys = sdl_keys;
                         }
                     }
+                    // Controller: each control button carries a gamepad button
+                    // in controls_arm64.ini (D-pad, A/X/Y/B, Start, Back), and the
+                    // left stick also moves left and right.
+                    const bool pad = keys && g_gamepad;
+                    const float pad_lx = pad ? SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f : 0.0f;
                     for (int bi = 0; bi < g_input_config.button_count(); bi++) {
                         TouchButton* btn = g_input_config.get_button(bi);
                         if (!btn) continue;
@@ -8643,7 +9036,17 @@ void load_and_boot_arm64() {
                                 }
                             }
                         }
-                        
+                        if (!is_down && pad) {
+                            if (btn->gamepad_button >= 0 && btn->gamepad_button < SDL_GAMEPAD_BUTTON_COUNT)
+                                is_down = SDL_GetGamepadButton(g_gamepad, (SDL_GamepadButton)btn->gamepad_button);
+                            if (!is_down && btn->gamepad_axis >= 0 && btn->gamepad_axis < SDL_GAMEPAD_AXIS_COUNT)
+                                is_down = std::fabs(SDL_GetGamepadAxis(g_gamepad, (SDL_GamepadAxis)btn->gamepad_axis) / 32767.0f)
+                                          >= btn->axis_threshold;
+                            if (!is_down && !g_cam_active) {
+                                if (btn->name == "left")  is_down = pad_lx < -0.35f;
+                                if (btn->name == "right") is_down = pad_lx > 0.35f;
+                            }
+                        }
 
                         // Resolve player's GameSceneController / listener safely
                         uint64_t gamesceneview = 0;
@@ -8728,6 +9131,7 @@ void load_and_boot_arm64() {
                         [&](int action, int id, double time, float x, float y, float ox, float oy, int tap) {
                             call_touch_64(action, id, time, x, y, ox, oy, tap);
                         });
+                    gamepad_pointer_update();
                 }
             }
             

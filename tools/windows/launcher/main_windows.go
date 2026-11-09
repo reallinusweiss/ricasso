@@ -5,7 +5,8 @@
 // Ricasso.exe – sets up and starts Swordigo through Ricasso without a terminal.
 //
 // License: GPL-3.0-or-later (like the SwordigoDesktop launcher/frontend).
-// Contains no game files and downloads nothing.
+// Contains no game files and never downloads any; it only looks up the newest
+// Ricasso release on GitHub (at most once a day).
 package main
 
 import (
@@ -22,7 +23,11 @@ import (
 	"ricasso-launcher/importer"
 )
 
-const launcherVersion = "1.2.1"
+const launcherVersion = "1.3.0"
+
+// releaseVersion is the Ricasso package version (GitHub release); the update
+// notice compares it with the newest release. Raise it for every release.
+const releaseVersion = "1.0.0"
 
 func init() {
 	// All windows belong to the main thread.

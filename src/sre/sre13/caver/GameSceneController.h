@@ -10,7 +10,13 @@ typedef struct GameSceneController {
 	void *vtable;
 	char _pad0[archSplit(0x04, 0x08)];
 	CharacterState *CharacterState;
-	char _pad1[archSplit(0x08, 0x10)];
+	/* 64-bit: one pointer of padding, not two. Upstream's IDA notes
+	 * (docs/sre13/GameSceneController.md) place Scene* at +0x20 and the hero
+	 * SceneObject* at +0xD8, followed by the CharController, Entity, Health and
+	 * Mana component pointers at +0xE0..+0xF8. With 0x10 here every field from
+	 * Scene on was read 8 bytes too late, so gsc->hero returned the
+	 * CharControllerComponent and the hero position telemetry was garbage. */
+	char _pad1[archSplit(0x08, 0x08)];
 	void *Scene;
 	char _pad2[archSplit(0x90, 0xb0)];
 	SceneObject *hero;
@@ -23,6 +29,15 @@ typedef struct GameSceneController {
 	Vector3 spawnPosition;
 	char _pad4[archSplit(0x20, 0x30)];
 } GameSceneController;
+
+#if defined(__aarch64__)
+/* Offsets verified for Swordigo 1.4.13 ARM64; the host's mod tools use the same
+ * values (kGscOff* in main.cpp). */
+_Static_assert(offsetof(GameSceneController, Scene) == 0x20, "GameSceneController.Scene");
+_Static_assert(offsetof(GameSceneController, hero) == 0xD8, "GameSceneController.hero");
+_Static_assert(offsetof(GameSceneController, HealthComponent) == 0xF0, "GameSceneController.HealthComponent");
+_Static_assert(offsetof(GameSceneController, ManaComponent) == 0xF8, "GameSceneController.ManaComponent");
+#endif
 
 GameSceneController *gsc_from_L(lua_State *L);
 GameSceneController *gsc_get(void);

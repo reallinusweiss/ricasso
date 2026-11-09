@@ -3918,9 +3918,11 @@ GuiAction SwordfareGUI::draw_control_panel(bool* p_open) {
     bar_menu("Cheats", [&]() {
         ImGui::MenuItem(g_gui.mod_god_mode      ? "[ON]  God Mode"      : "[OFF] God Mode",      nullptr, &g_gui.mod_god_mode);
         ImGui::MenuItem(g_gui.mod_infinite_mana ? "[ON]  Infinite Mana" : "[OFF] Infinite Mana", nullptr, &g_gui.mod_infinite_mana);
-        ImGui::MenuItem(g_gui.mod_fly_mode      ? "[ON]  Fly Mode"      : "[OFF] Fly Mode",      nullptr, &g_gui.mod_fly_mode);
         ImGui::MenuItem(g_gui.mod_infinite_jump ? "[ON]  Infinite Jump" : "[OFF] Infinite Jump", nullptr, &g_gui.mod_infinite_jump);
-        ImGui::MenuItem(g_gui.mod_coin_break    ? "[ON]  Coin Break"    : "[OFF] Coin Break",    nullptr, &g_gui.mod_coin_break);
+        // Fly Mode and Coin Break were never implemented; show them as unavailable.
+        g_gui.mod_fly_mode = g_gui.mod_coin_break = false;
+        ImGui::MenuItem("Fly Mode (not available)", nullptr, false, false);
+        ImGui::MenuItem("Coin Break (not available)", nullptr, false, false);
         ImGui::Separator();
         if (ImGui::MenuItem("Heal Full HP"))    action = GUI_MOD_HEAL_FULL;
         if (ImGui::MenuItem("Refill Mana"))     action = GUI_MOD_REFILL_MANA;
@@ -4027,9 +4029,13 @@ GuiAction SwordfareGUI::draw_settings_panel(bool* p_open) {
 
         ImGui::Checkbox("God Mode (Invincible)", &g_gui.mod_god_mode);
         ImGui::Checkbox("Infinite Mana", &g_gui.mod_infinite_mana);
-        ImGui::Checkbox("Fly Mode (Noclip-ish)", &g_gui.mod_fly_mode);
         ImGui::Checkbox("Infinite Jump", &g_gui.mod_infinite_jump);
-        ImGui::Checkbox("Coin Break (Insta-break objects)", &g_gui.mod_coin_break);
+        // Fly Mode and Coin Break were never implemented; show them as unavailable.
+        g_gui.mod_fly_mode = g_gui.mod_coin_break = false;
+        ImGui::BeginDisabled();
+        ImGui::Checkbox("Fly Mode (not available)", &g_gui.mod_fly_mode);
+        ImGui::Checkbox("Coin Break (not available)", &g_gui.mod_coin_break);
+        ImGui::EndDisabled();
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.18f, 0.54f, 0.82f, 1.0f), "MOVEMENT & PHYSICS MULTIPLIERS");

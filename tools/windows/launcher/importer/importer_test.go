@@ -6,9 +6,13 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -413,5 +417,67 @@ func TestCheckName(t *testing.T) {
 		if checkName(ok) != nil {
 			t.Errorf("%q should have been allowed", ok)
 		}
+	}
+}
+
+func TestIconHasStandardSizes(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 192, 192))
+	for y := 0; y < 192; y++ {
+		for x := 0; x < 192; x++ {
+			if x >= 48 && x < 144 && y >= 48 && y < 144 {
+				src.SetNRGBA(x, y, color.NRGBA{R: 200, G: 40, B: 10, A: 255})
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		t.Fatal(err)
+	}
+	pngData := buf.Bytes()
+
+	ico := pngToICO(pngData)
+	count := int(binary.LittleEndian.Uint16(ico[4:6]))
+	if count != len(iconSizes)+1 {
+		t.Fatalf("expected %d images, got %d", len(iconSizes)+1, count)
+	}
+	for i := 0; i < count; i++ {
+		e := ico[6+16*i:]
+		size := int(binary.LittleEndian.Uint32(e[8:12]))
+		off := int(binary.LittleEndian.Uint32(e[12:16]))
+		if off+size > len(ico) {
+			t.Fatalf("entry %d out of bounds", i)
+		}
+		if i == count-1 {
+			if e[0] != 192 || !bytes.Equal(ico[off:off+size], pngData) {
+				t.Fatal("last entry should be the original PNG")
+			}
+			continue
+		}
+		s := iconSizes[i]
+		bmp := ico[off : off+size]
+		if int(e[0]) != s || binary.LittleEndian.Uint32(bmp[0:4]) != 40 ||
+			int(binary.LittleEndian.Uint32(bmp[8:12])) != 2*s || size != 40+s*s*4+(s+31)/32*4*s {
+			t.Fatalf("bad bitmap entry for %d px", s)
+		}
+		// Centre pixel (bottom-up rows, BGRA): opaque red; corner: transparent.
+		centre := 40 + ((s/2)*s+s/2)*4
+		if bmp[centre+2] < 150 || bmp[centre+3] != 255 || bmp[40+3] != 0 {
+			t.Fatalf("unexpected pixels at %d px", s)
+		}
+	}
+
+	// An older setup with a single-image icon is upgraded once.
+	dir := t.TempDir()
+	write(t, dir, iconPNGFile, pngData)
+	write(t, dir, iconFile, pngToICO(tinyPNG))
+	if !RefreshIcon(dir) {
+		t.Fatal("RefreshIcon should upgrade a single-image icon")
+	}
+	if RefreshIcon(dir) {
+		t.Fatal("RefreshIcon should leave an upgraded icon alone")
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, iconFile))
+	if !bytes.Equal(got, ico) {
+		t.Fatal("refreshed icon differs from pngToICO output")
 	}
 }

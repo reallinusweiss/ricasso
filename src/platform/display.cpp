@@ -6,6 +6,10 @@
 #include "platform/gl_inc.h"
 #include <SDL3_image/SDL_image.h>
 
+#ifdef _WIN32
+static void apply_win32_window_icon(SDL_Window* window);  // defined at the end of this file
+#endif
+
 // Load the launcher icon from the binary's embedded assets (permanent fix —
 // works even when deb/rpm packaging drops the launcher/ asset directory).
 static SDL_Surface* load_embedded_icon() {
@@ -142,6 +146,9 @@ bool Display::init(int w, int h, const std::string& title, bool hidden) {
             std::cerr << "[Display] Could not load icon: " << SDL_GetError() << std::endl;
         }
     }
+#ifdef _WIN32
+    apply_win32_window_icon(window);
+#endif
 
     return true;
 }
@@ -229,3 +236,47 @@ void Display::poll_events() {
         }
     }
 }
+
+#ifdef _WIN32
+// The taskbar, Alt+Tab and the title bar show the window's HICONs. Prefer the
+// player's own game icon that the Ricasso starter saves next to swordfare.exe
+// (game-icon.ico, the file its shortcuts use); otherwise use the Ricasso icon
+// from the executable's resources (ID 101, windows_client.rc). Loading each
+// icon at the system's size keeps it sharp instead of letting Windows scale
+// one large bitmap.
+static void apply_win32_window_icon(SDL_Window* window) {
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    if (!hwnd) return;
+    const int big_w = GetSystemMetrics(SM_CXICON), big_h = GetSystemMetrics(SM_CYICON);
+    const int small_w = GetSystemMetrics(SM_CXSMICON), small_h = GetSystemMetrics(SM_CYSMICON);
+
+    HICON big = nullptr, small = nullptr;
+    const char* source = "game-icon.ico";
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* dir_end = (n > 0 && n < MAX_PATH) ? wcsrchr(path, wchar_t(92)) : nullptr;  // last backslash
+    if (dir_end && (dir_end - path) + 15 < MAX_PATH) {
+        wcscpy(dir_end + 1, L"game-icon.ico");
+        big = static_cast<HICON>(LoadImageW(nullptr, path, IMAGE_ICON, big_w, big_h, LR_LOADFROMFILE));
+        small = static_cast<HICON>(LoadImageW(nullptr, path, IMAGE_ICON, small_w, small_h, LR_LOADFROMFILE));
+    }
+    if (!big || !small) {
+        if (big) DestroyIcon(big);
+        if (small) DestroyIcon(small);
+        HINSTANCE self = GetModuleHandleW(nullptr);
+        big = static_cast<HICON>(LoadImageW(self, MAKEINTRESOURCEW(101), IMAGE_ICON, big_w, big_h, LR_DEFAULTCOLOR));
+        small = static_cast<HICON>(LoadImageW(self, MAKEINTRESOURCEW(101), IMAGE_ICON, small_w, small_h, LR_DEFAULTCOLOR));
+        source = "Ricasso";
+    }
+    if (!big || !small) {
+        if (big) DestroyIcon(big);
+        if (small) DestroyIcon(small);
+        return;  // keep the icon SDL set
+    }
+    // The icons stay alive for the lifetime of the window.
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+    std::cout << "[Display] Windows icon: " << source << std::endl;
+}
+#endif

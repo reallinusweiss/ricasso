@@ -61,6 +61,10 @@ if (SWORDIGO_BUILD_SRE)
         endforeach()
         list(APPEND SRE13_SRCS ${SRE_BASE_DIR}/sre_setjmp.S)
 
+        # Each object also depends on every SRE13 header, so a changed struct
+        # layout (caver/*.h) rebuilds the library, not only edited .c files.
+        file(GLOB_RECURSE SRE13_HEADERS CONFIGURE_DEPENDS "${SRE_V13_DIR}/*.h")
+
         set(SRE13_OBJECTS)
         foreach(source IN LISTS SRE13_SRCS)
             file(RELATIVE_PATH relative "${SRC_DIR}" "${source}")
@@ -70,7 +74,7 @@ if (SWORDIGO_BUILD_SRE)
             add_custom_command(OUTPUT "${object}"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/sre13"
                 COMMAND ${AARCH64_CC} ${SWORDIGO_GUEST_FLAGS} -fPIC -O2 -nostdlib -fno-builtin -fno-stack-protector -I${SRE_BASE_DIR}/include -I${SRE_BASE_DIR} -I${SRE_V13_DIR} -I${SRE_V13_DIR}/core -I${SRE_V13_DIR}/caver -I${SRE_V13_DIR}/hooks -I${SRE_V13_DIR}/ui -I${SRE_BASE_DIR}/lua/src -c "${source}" -o "${object}"
-                DEPENDS "${source}" "${SRE_V13_DIR}/program_state_resume.h" VERBATIM)
+                DEPENDS "${source}" ${SRE13_HEADERS} "${SRE_V13_DIR}/program_state_resume.h" VERBATIM)
             list(APPEND SRE13_OBJECTS "${object}")
         endforeach()
         # A response file avoids cmd.exe command-length limits in long source paths.
