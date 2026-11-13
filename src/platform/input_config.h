@@ -79,10 +79,26 @@ public:
 
     // Editor mode
     bool is_editing() const { return editing_mode; }
-    void toggle_editor() { editing_mode = !editing_mode; if (!editing_mode) editor_mode = EDITOR_POSITION; }
-    void set_editing(bool e) { editing_mode = e; if (!e) editor_mode = EDITOR_POSITION; }
+    void toggle_editor() { editing_mode = !editing_mode; if (!editing_mode) { editor_mode = EDITOR_POSITION; cancel_capture(); placing_tap = false; } }
+    void set_editing(bool e) { editing_mode = e; if (!e) { editor_mode = EDITOR_POSITION; cancel_capture(); placing_tap = false; } }
     EditorMode get_editor_mode() const { return editor_mode; }
     void set_editor_mode(EditorMode m) { editor_mode = m; }
+
+    // Binding capture: slot 0 = primary key, 1 = second key, 2 = controller button
+    void begin_capture(int index, int slot);
+    void cancel_capture() { capture_index = -1; capture_slot = -1; }
+    bool is_capturing() const { return capture_index >= 0; }
+    int  capture_button_index() const { return capture_index; }
+    int  get_capture_slot() const { return capture_slot; }
+    bool editor_handle_gamepad_button(int button);   // true if consumed by a capture
+    void clear_binding(int index, int slot);          // slot 0/1 key -> 0, slot 2 -> gamepad_button=-1 and gamepad_axis=-1
+    // Tap points: the next editor click on the screen creates a custom button there
+    void begin_place_tap() { placing_tap = true; cancel_capture(); }
+    void cancel_place_tap() { placing_tap = false; }
+    bool is_placing_tap() const { return placing_tap; }
+    void reset_to_defaults();                         // load_defaults() + save_after_edit()
+    void commit_edit() { save_after_edit(); }         // save after the GUI changed a button directly
+    std::string display_name_of(int index) const;     // custom name or default display name
 
     // Render overlays
     void render_touch_zones(int win_w, int win_h, bool show_labels = false);
@@ -128,8 +144,10 @@ private:
     EditorMode editor_mode = EDITOR_POSITION;
     int dragging_button = -1;
     float drag_offset_x = 0, drag_offset_y = 0;
-    int rebind_target = -1;         // Button index being rebound
     int next_custom_touch_id = 40;  // Auto-assign touch IDs for custom buttons
+    int capture_index = -1;         // Button index waiting for a key/button press
+    int capture_slot = -1;          // Slot being captured (0, 1 = keys, 2 = controller)
+    bool placing_tap = false;       // Next editor click creates a tap point
 
     void draw_circle(float cx, float cy, float r, uint8_t red, uint8_t g, uint8_t b, uint8_t a, bool filled = true);
 };

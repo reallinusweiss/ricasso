@@ -197,7 +197,7 @@ void GuiRenderer::init() {
         m.items.push_back(MenuItem("---", GUI_NONE, false));
         m.items.push_back(MenuItem("Save Editor", GUI_OPEN_SAVE_EDITOR));
         m.items.push_back(MenuItem("---", GUI_NONE, false));
-        m.items.push_back(MenuItem("God Mode", GUI_MOD_GOD_MODE));
+        m.items.push_back(MenuItem("Infinite Health", GUI_MOD_GOD_MODE));
         m.items.push_back(MenuItem("Infinite Mana", GUI_MOD_INFINITE_MANA));
         m.items.push_back(MenuItem("Fly Mode (N/A)", GUI_MOD_FLY_MODE, false));
         m.items.push_back(MenuItem("Infinite Jump", GUI_MOD_INFINITE_JUMP));
@@ -385,7 +385,7 @@ void GuiRenderer::render(int mouse_x, int mouse_y, bool mouse_click, int win_w, 
                 menus[i].items[j].label = g_game_paused ? "Resume" : "Pause";
             }
             if (menus[i].items[j].action == GUI_MOD_GOD_MODE) {
-                menus[i].items[j].label = mod_god_mode ? "[ON]  God Mode" : "[OFF] God Mode";
+                menus[i].items[j].label = mod_god_mode ? "[ON]  Infinite Health" : "[OFF] Infinite Health";
             }
             if (menus[i].items[j].action == GUI_MOD_INFINITE_MANA) {
                 menus[i].items[j].label = mod_infinite_mana ? "[ON]  Infinite Mana" : "[OFF] Infinite Mana";
@@ -695,7 +695,7 @@ void GuiRenderer::render(int mouse_x, int mouse_y, bool mouse_click, int win_w, 
 
         // ── Mod Tools ──
         draw_section("Mod Tools (Coming Soon)");
-        draw_checkbox("God Mode", false, false);
+        draw_checkbox("Infinite Health", false, false);
         draw_checkbox("Infinite Mana", false, false);
         draw_checkbox("Fly Mode", false, false);
         draw_value("Walk Speed", "1.0x", false);
@@ -1074,7 +1074,7 @@ void GuiRenderer::render_mod_panel(float fwin_w, float fwin_h, int mouse_x, int 
 
     // ── COMBAT ──
     draw_section("COMBAT");
-    draw_checkbox("God Mode", mod_god_mode, true);
+    draw_checkbox("Infinite Health", mod_god_mode, true);
     draw_checkbox("Infinite Mana", mod_infinite_mana, true);
 
     // ── MOVEMENT ──
@@ -1228,7 +1228,7 @@ void GuiRenderer::render_mod_sidebar(float fwin_w, float fwin_h, int mouse_x, in
     };
 
     draw_sec("COMBAT");
-    draw_cb("God Mode", mod_god_mode, true);
+    draw_cb("Infinite Health", mod_god_mode, true);
     draw_cb("Inf. Mana", mod_infinite_mana, true);
 
     draw_sec("MOVEMENT");

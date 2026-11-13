@@ -7,6 +7,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 swordigo_library(swordfare
     ${SRC_DIR}/platform/swordfare_theme.cpp
     ${SRC_DIR}/platform/swordfare_gui.cpp
+    ${SRC_DIR}/platform/win32_menu.cpp
     ${SRC_DIR}/launcher/launcher_theme.cpp
     ${SRC_DIR}/launcher/profile_manager.cpp
     ${SRC_DIR}/launcher/pages/play_page.cpp

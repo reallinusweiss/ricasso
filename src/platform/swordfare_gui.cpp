@@ -56,6 +56,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <cstdlib>
+#include <string>
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1978,7 +1980,7 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
     spec.eyebrow   = "SWORDFARE";
     spec.title     = m_f11_overlay_active ? "Scene & Display" : "Mod Hub";
     spec.subtitle  = m_f11_overlay_active
-        ? "Scene teleport, render resolution, output, upscaling and post-processing"
+        ? "Display mode, upscaling and post-processing"
         : "SRE runtime, Lua tooling, diagnostics and mod compatibility";
     spec.close_hint = m_f11_overlay_active ? "F11" : "F4";
 
@@ -2114,8 +2116,6 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
 
             if (m_overlay_tab == 1) {
                 ImGui::Spacing();
-                extern void apply_render_preset(int preset);
-                extern int  g_render_preset;
                 extern int  GAME_W, GAME_H;
                 extern int  g_win_w, g_win_h;
                 extern PostFXState  g_postfx;
@@ -2132,145 +2132,7 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                                       ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, 14));
                     }
 
-                    // ── RENDER RESOLUTION ──────────────────────────────────────────────
-                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_DISPLAY "  RENDER RESOLUTION");
-                    ImGui::TextDisabled("Internal FBO resolution the game renders at. Upscaled to output by the active filter.");
-                    ImGui::Separator();
-                    ImGui::Spacing();
-
-                    ImGui::Text("Active render: "); ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "%d x %d", GAME_W, GAME_H);
-                    ImGui::Spacing();
-
-                    struct ResPreset { const char* label; const char* desc; int idx; int w; int h; };
-                    static const ResPreset render_presets[] = {
-                        { "4K      (3840 x 2160)", "Ultra HD — huge GPU cost",                                    10, 3840, 2160 },
-                        { "1440p   (2560 x 1440)", "2K — sharp, moderate GPU cost",                              9,  2560, 1440 },
-                        { "1080p   (1920 x 1080)", "Full HD — best quality/perf tradeoff",                       0,  1920, 1080 },
-                        { "900p    (1600 x  900)", "High — ~30% less GPU than 1080p",                           11,  1600,  900 },
-                        { "768p    (1366 x  768)", "Laptop native — balanced",                                  12,  1366,  768 },
-                        { "720p    (1280 x  720)", "HD — ~44% GPU savings vs 1080p",                             1,  1280,  720 },
-                        { "600p    (1024 x  600)", "Tablet — good for low-end GPU",                             13,  1024,  600 },
-                        { "540p    ( 960 x  544)", "Android native — fastest, ~75% savings",                    2,   960,  544 },
-                        { "480p    ( 854 x  480)", "WVGA — very fast",                                          14,   854,  480 },
-                        { "360p    ( 640 x  360)", "Low — maximum performance",                                 15,   640,  360 },
-                        { "240p    ( 426 x  240)", "Retro-low — extreme performance mode",                     16,   426,  240 },
-                        { "WUXGA   (1920 x 1200)", "16:10 — slightly taller than 1080p",                       17,  1920, 1200 },
-                        { "1440x900 (1440 x  900)", "Older widescreen laptop",                                 18,  1440,  900 },
-                        { "1280x800 (1280 x  800)", "iPad-like — 16:10",                                       19,  1280,  800 },
-                        { "UWQHD   (3440 x 1440)", "21:9 ultrawide",                                            20,  3440, 1440 },
-                        { "UWHD    (2560 x 1080)", "21:9 ultrawide Full HD",                                    21,  2560, 1080 },
-                        { "UWQHD+  (3840 x 1600)", "24:10 ultrawide workstation",                              22,  3840, 1600 },
-                        { "Retina  (2880 x 1800)", "16:10 high-density laptop",                                23,  2880, 1800 },
-                        { "WSXGA+  (1680 x 1050)", "16:10 desktop and laptop",                                 24,  1680, 1050 },
-                        { "SXGA    (1280 x 1024)", "5:4 legacy display",                                        25,  1280, 1024 },
-                        { "XGA     (1024 x  768)", "4:3 legacy display",                                        26,  1024,  768 },
-                        { "Window  (match output)",  "1:1 pixel mapping — no upscaling",                        3,     0,    0 },
-                    };
-                    static const int render_preset_count = (int)(sizeof(render_presets)/sizeof(render_presets[0]));
-
-                    const float preset_gap = 6.0f;
-                    const int preset_cols = std::max(1, std::min(3,
-                        (int)((ImGui::GetContentRegionAvail().x + preset_gap) / 250.0f)));
-                    const float preset_w = (ImGui::GetContentRegionAvail().x -
-                                            preset_gap * (preset_cols - 1)) / preset_cols;
-                    for (int pi = 0; pi < render_preset_count; pi++) {
-                        const ResPreset& pr = render_presets[pi];
-                        bool selected = (g_render_preset == pr.idx);
-                        if (pi % preset_cols != 0) ImGui::SameLine(0, preset_gap);
-                        if (selected) {
-                            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.52f, 0.18f, 1.0f));
-                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.65f, 0.22f, 1.0f));
-                            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.14f, 0.42f, 0.14f, 1.0f));
-                        }
-                        ImGui::PushID(100 + pi);
-                        if (ImGui::Button(pr.label, ImVec2(preset_w, 30))) {
-                            apply_render_preset(pr.idx);
-                            m_status_msg = std::string("Render res: ") + pr.label;
-                            m_status_timer = 3.0f;
-                        }
-                        ImGui::PopID();
-                        if (selected) ImGui::PopStyleColor(3);
-                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", pr.desc);
-                    }
-
-                    // Custom render resolution
-                    ImGui::Spacing();
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Custom render resolution:");
-                    static int custom_rw = 1280, custom_rh = 720;
-                    ImGui::SetNextItemWidth(120); ImGui::InputInt("W##crw", &custom_rw); ImGui::SameLine();
-                    ImGui::SetNextItemWidth(120); ImGui::InputInt("H##crh", &custom_rh); ImGui::SameLine();
-                    if (ImGui::Button("Apply Custom Render Res")) {
-                        custom_rw = std::max(160, std::min(custom_rw, 7680));
-                        custom_rh = std::max(120, std::min(custom_rh, 4320));
-                        GAME_W = custom_rw & ~1; GAME_H = custom_rh & ~1;
-                        extern void fbo_destroy(); extern bool fbo_init(int, int);
-                        fbo_destroy(); fbo_init(GAME_W, GAME_H);
-                        g_render_preset = -1;
-                        m_status_msg = "Custom render res: " + std::to_string(GAME_W) + "x" + std::to_string(GAME_H);
-                        m_status_timer = 3.0f;
-                    }
-
-                    ImGui::Spacing();
-                    ImGui::Separator();
-                    ImGui::Spacing();
-
-                    // ── OUTPUT / WINDOW RESOLUTION ────────────────────────────────────
-                    ImGui::TextColored(ImVec4(0.00f, 0.85f, 1.00f, 1.0f), ICON_FA_IMAGE "  OUTPUT RESOLUTION (WINDOW SIZE)");
-                    ImGui::TextDisabled("OS window size. The render FBO is upscaled to this by the active filter.");
-                    ImGui::Separator();
-                    ImGui::Spacing();
-
-                    ImGui::Text("Current output: "); ImGui::SameLine();
-                    ImGui::TextColored(ImVec4(0.30f, 0.90f, 0.50f, 1.0f), "%d x %d", g_win_w, g_win_h);
-                    ImGui::Spacing();
-
-                    struct OutPreset { const char* label; int w; int h; };
-                    static const OutPreset out_presets[] = {
-                        { "3840x2160 (4K)",  3840, 2160 }, { "2560x1440 (2K)",  2560, 1440 },
-                        { "1920x1080",        1920, 1080 }, { "1600x900",         1600,  900 },
-                        { "1366x768",         1366,  768 }, { "1280x720",         1280,  720 },
-                        { "3440x1440 (21:9)", 3440, 1440 }, { "2560x1080 (21:9)", 2560, 1080 },
-                        { "1920x1200 (16:10)",1920, 1200 }, { "1680x1050 (16:10)",1680, 1050 },
-                        { "1440x900 (16:10)", 1440,  900 }, { "1280x800 (16:10)", 1280,  800 },
-                        { "1280x1024 (5:4)",  1280, 1024 }, { "1024x768 (4:3)",   1024,  768 },
-                        { "960x544 (native)",  960,  544 }, { "854x480",            854,  480 },
-                    };
-                    const int out_count = (int)(sizeof(out_presets) / sizeof(out_presets[0]));
-                    const int out_cols = std::max(1, std::min(3,
-                        (int)((ImGui::GetContentRegionAvail().x + 6.0f) / 210.0f)));
-                    const float out_w = (ImGui::GetContentRegionAvail().x - 6.0f * (out_cols - 1)) / out_cols;
-                    for (int oi = 0; oi < out_count; oi++) {
-                        if (oi % out_cols != 0) ImGui::SameLine(0, 6);
-                        ImGui::PushID(200 + oi);
-                        if (ImGui::Button(out_presets[oi].label, ImVec2(out_w, 30))) {
-                            if (m_window) {
-                                SDL_SetWindowSize(m_window, out_presets[oi].w, out_presets[oi].h);
-                                m_status_msg = std::string("Output: ") + out_presets[oi].label;
-                                m_status_timer = 3.0f;
-                            }
-                        }
-                        ImGui::PopID();
-                    }
-
-                    // Custom output resolution
-                    ImGui::Spacing();
-                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Custom output size:");
-                    static int custom_ow = 1280, custom_oh = 720;
-                    ImGui::SetNextItemWidth(120); ImGui::InputInt("W##cow", &custom_ow); ImGui::SameLine();
-                    ImGui::SetNextItemWidth(120); ImGui::InputInt("H##coh", &custom_oh); ImGui::SameLine();
-                    if (ImGui::Button("Apply Custom Output")) {
-                        if (m_window) {
-                            SDL_SetWindowSize(m_window,
-                                std::max(320, std::min(custom_ow, 7680)),
-                                std::max(240, std::min(custom_oh, 4320)));
-                            m_status_msg = "Output: " + std::to_string(custom_ow) + "x" + std::to_string(custom_oh);
-                            m_status_timer = 3.0f;
-                        }
-                    }
-
-                    ImGui::Spacing();
-                    ImGui::Separator();
+                    ImGui::TextDisabled("Window size and render resolution: View menu in the menu bar.");
                     ImGui::Spacing();
 
                     // ── DISPLAY / FULLSCREEN ───────────────────────────────────────────
@@ -2299,14 +2161,8 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
                         // Fullscreen toggle
                         if (ImGui::Button(is_fs ? "  Exit Fullscreen" : "  Enter Fullscreen",
                                           ImVec2(210, 0))) {
-                            SDL_SetWindowFullscreen(m_window, !is_fs);
-                            // Sync host window state so FBO/game view follow
-                            int fw, fh;
-                            SDL_GetWindowSize(m_window, &fw, &fh);
-                            extern int g_win_w, g_win_h;
-                            extern int g_draw_w, g_draw_h;
-                            g_win_w = fw; g_win_h = fh;
-                            SDL_GetWindowSizeInPixels(m_window, &g_draw_w, &g_draw_h);
+                            extern void toggle_fullscreen();
+                            toggle_fullscreen();
                             m_status_msg = is_fs ? "Windowed mode" : "Fullscreen";
                             m_status_timer = 2.0f;
                         }
@@ -3208,38 +3064,7 @@ bool SwordfareGUI::write_save(const std::string& path) {
 }
 
 // ============================================================================
-//  Swordfare GUI — Remastered Command Overlay (v2)
-// ----------------------------------------------------------------------------
-//  Drop-in replacement for SwordfareGUI::draw_control_panel().
-//
-//  WHAT CHANGED VS THE OLD VERSION
-//  --------------------------------
-//  1) Bar now docks to the TOP of the screen, not the bottom.
-//  2) The old code pushed one single Header/HeaderHovered color pair before
-//     Begin() and left it active for the *entire* window — every top-level
-//     menu button and every item inside every dropdown shared the exact same
-//     solid, fully-opaque highlight block. That's why clicking one button
-//     made the whole section look "selected": there was nothing visually
-//     distinguishing hover-state from open-state from click-state, they all
-//     rendered the same full-width solid rectangle.
-//     Fixed by: giving each state its own color (subtle hover tint, a
-//     slightly stronger but still translucent active tint, and an underline
-//     accent for the currently-open menu) instead of one flat opaque block.
-//  3) Split into a real header bar (branding + top-level menus + status +
-//     close) plus dedicated modal-style panels for About / Help, so the bar
-//     itself stays razor-thin and everything heavy lives in popups.
-//  4) All existing GuiAction values are preserved 1:1 — no gameplay-facing
-//     capability was removed, only reorganized and restyled. Nothing new
-//     was added to the GuiAction enum.
-//
-//  HEADER FILE — please add these two members to the SwordfareGUI class:
-//      bool m_show_about = false;
-//      bool m_show_help  = false;
-//  (They're purely UI state for the new About/Help panels below and don't
-//  need a GuiAction — the panels are opened/closed entirely inside this file.)
-//
-//  Everything else (m_initialized, m_imgui_ctx, m_font_button, GuiRenderer,
-//  g_game_paused, GuiAction enum) is used exactly as it was declared before.
+//  About / Help panels and the windows opened from the native menu bar.
 // ============================================================================
 
 #include "imgui.h"
@@ -3267,203 +3092,34 @@ namespace SwordfareTheme {
     inline const ImVec4 kOk          = xpera::palette.success;
 }
 
-// Small helper: draws a 1px cyan->purple gradient line under a rect, used
-// under the whole bar and under the active menu to give it a "current tab"
-// accent instead of a filled highlight block.
-static void DrawAccentUnderline(ImVec2 p0, ImVec2 p1) {
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImU32 c0 = ImGui::ColorConvertFloat4ToU32(xpera::palette.accent);
-    ImU32 c1 = ImGui::ColorConvertFloat4ToU32(xpera::palette.secondary);
-    dl->AddLine(p0, ImVec2(p1.x, p0.y), c0, 1.5f);
-    dl->AddRectFilledMultiColor(p0, p1, c0, c1, c1, c0);
-}
-
 // ============================================================================
-//  TOP HEADER BAR  —  File · Tools · Cheats · Speed · Camera · Audio · About · Help
+//  Windows opened from the native menu bar (win32_menu.cpp): Help, About and
+//  the Physics Editor sliders, which a native menu cannot hold.
 // ============================================================================
-GuiAction SwordfareGUI::draw_control_panel(bool* p_open) {
-    if (!m_initialized || !*p_open) return GUI_NONE;
+void SwordfareGUI::draw_menu_windows() {
+    if (!m_initialized) return;
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
 
-    GuiAction action = GUI_NONE;
-    ImGuiIO& io = ImGui::GetIO();
-    float win_w = io.DisplaySize.x;
-    float win_h = io.DisplaySize.y;
+    if (m_show_about) draw_about_panel(&m_show_about, 0.0f);
+    if (m_show_help)  draw_help_panel(&m_show_help, 0.0f);
 
-    extern GuiRenderer g_gui;
-    extern bool g_game_paused;
-    extern const char* mod_speed_label();
-
-    float scale = win_h / 720.0f;
-    if (scale < 1.0f) scale = 1.0f;
-
-    // Modern clean dark charcoal palette
-    ImVec4 kBg          = ImVec4(0.07f, 0.08f, 0.10f, 1.00f);
-    ImVec4 kBgPopup     = ImVec4(0.09f, 0.10f, 0.12f, 1.00f);
-    ImVec4 kBorder      = ImVec4(0.20f, 0.22f, 0.26f, 0.50f);
-    ImVec4 kText        = ImVec4(0.85f, 0.88f, 0.92f, 1.00f);
-    ImVec4 kCyan        = xpera::palette.accent;             // Xpera indigo accent
-
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * scale, 3.5f * scale)); // reduced height and padding
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(14.0f * scale, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 4.0f);
-
-    ImGui::PushStyleColor(ImGuiCol_MenuBarBg,     kBg);
-    ImGui::PushStyleColor(ImGuiCol_PopupBg,       kBgPopup);
-    ImGui::PushStyleColor(ImGuiCol_Border,        kBorder);
-    ImGui::PushStyleColor(ImGuiCol_Text,          kText);
-    ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0.00f, 0.55f, 1.00f, 0.20f)); // active tint
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.00f, 0.55f, 1.00f, 0.35f)); // hover tint
-    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.00f, 0.55f, 1.00f, 0.50f));
-
-    ImFont* bar_font = static_cast<ImFont*>(m_font_button);
-    float font_size = 9.5f * scale; // compact font size
-    if (bar_font) ImGui::PushFont(bar_font);
-
-    float bar_h = 24.0f * scale;
-
-    if (ImGui::BeginMainMenuBar()) {
-        bar_h = ImGui::GetWindowHeight();
-
-        auto menu = [&](const char* label, auto fn) {
-            if (ImGui::BeginMenu(label)) {
-                fn();
-                ImGui::EndMenu();
-            }
-        };
-
-        // ── File ─────────────────────────────────────────────────────────
-        menu("File", [&]() {
-            if (ImGui::MenuItem("Save State"))        action = GUI_SAVE_STATE;
-            if (ImGui::MenuItem("Load State"))        action = GUI_LOAD_STATE;
-            ImGui::Separator();
-            if (ImGui::MenuItem("Exit Game"))         action = GUI_EXIT;
-        });
-
-        // ── Emulation ────────────────────────────────────────────────────
-        menu("Emulation", [&]() {
-            if (ImGui::MenuItem(g_game_paused ? "Resume" : "Pause", "F8"))
-                action = GUI_PAUSE;
-            ImGui::Separator();
-            if (ImGui::MenuItem("Speed Up",   "+")) action = GUI_GAME_SPEED_UP;
-            if (ImGui::MenuItem("Speed Down", "-")) action = GUI_GAME_SPEED_DOWN;
-            if (ImGui::MenuItem("Speed Reset","0")) action = GUI_GAME_SPEED_RESET;
-        });
-
-        // ── Config ───────────────────────────────────────────────────────
-        menu("Config", [&]() {
-            if (ImGui::MenuItem("Customize Controls", "F2")) action = GUI_CUSTOMIZE_CONTROLS;
-        });
-
-        // ── Mods ─────────────────────────────────────────────────────────
-        menu("Mods", [&]() {
-            ImGui::TextDisabled("CHEAT TOGGLES");
-            ImGui::Separator();
-            // Provenance is per-control. Offsets cross-checked against
-            // docs/sre13/HealthComponent.md; the rest are unverified heuristics.
-            ImGui::MenuItem("God Mode       (verified)", nullptr, &g_gui.mod_god_mode);
-            ImGui::TextDisabled("    HealthComponent currentHealth @ +0x78");
-            ImGui::MenuItem("Infinite Mana  (partial)", nullptr, &g_gui.mod_infinite_mana);
-            ImGui::TextDisabled("    ManaComponent +0x40 = max (+0x3C)");
-            ImGui::MenuItem("Infinite Jump  (partial)", nullptr, &g_gui.mod_infinite_jump);
-            ImGui::TextDisabled("    clears CharController air-jump count @ +0x158");
-            {
-                bool fly_dummy  = false;
-                bool coin_dummy = false;
-                ImGui::BeginDisabled();
-                ImGui::MenuItem("Fly Mode       (not implemented)", nullptr, &fly_dummy);
-                ImGui::MenuItem("Coin Break     (not implemented)", nullptr, &coin_dummy);
-                ImGui::EndDisabled();
-            }
-            
-            ImGui::Separator();
-            
-            if (ImGui::BeginMenu("Stats Editor")) {
-                if (ImGui::MenuItem("Heal Full HP"))  action = GUI_MOD_HEAL_FULL;
-                if (ImGui::MenuItem("Refill Mana"))   action = GUI_MOD_REFILL_MANA;
-                if (ImGui::MenuItem("+100 Coins"))    action = GUI_MOD_ADD_COINS;
-                ImGui::Separator();
-                if (ImGui::MenuItem("Level Up (+1)")) action = GUI_MOD_LEVEL_UP;
-                if (ImGui::MenuItem("Level Down (-1)")) action = GUI_MOD_LEVEL_DOWN;
-                if (ImGui::MenuItem("XP +500"))       action = GUI_MOD_EXP_UP;
-                if (ImGui::MenuItem("XP -500"))       action = GUI_MOD_EXP_DOWN;
-                ImGui::EndMenu();
-            }
-            
-            if (ImGui::BeginMenu("Physics Editor")) {
-                ImGui::SetNextItemWidth(120.0f * scale);
-                ImGui::SliderFloat("Walk Speed", &g_gui.mod_walk_speed,  0.5f, 10.0f, "%.1f");
-                ImGui::SetNextItemWidth(120.0f * scale);
-                ImGui::SliderFloat("Run Speed",  &g_gui.mod_run_speed,   0.5f, 10.0f, "%.1f");
-                ImGui::SetNextItemWidth(120.0f * scale);
-                ImGui::SliderFloat("Jump Height", &g_gui.mod_jump_height, 0.5f, 10.0f, "%.1f");
-                ImGui::EndMenu();
-            }
-        });
-
-        // ── Settings ─────────────────────────────────────────────────────
-        menu("Settings", [&]() {
-            if (ImGui::MenuItem("Toggle Cam Override", "F5")) action = GUI_TOGGLE_CAM;
-            if (ImGui::MenuItem("Toggle Smooth Cam"))          action = GUI_TOGGLE_SMOOTH_CAM;
-            ImGui::Separator();
-            if (ImGui::MenuItem("Mute Music"))     action = GUI_MUSIC_MUTE;
-            if (ImGui::MenuItem("Volume Up"))      action = GUI_MUSIC_VOL_UP;
-            if (ImGui::MenuItem("Volume Down"))    action = GUI_MUSIC_VOL_DOWN;
-        });
-
-        // ── Developer ────────────────────────────────────────────────────
-        menu("Developer", [&]() {
-            ImGui::TextDisabled("CAVER ENGINE HUD & TOOLS");
-            ImGui::Separator();
-            if (ImGui::MenuItem("Touch Foo HUD (FPS/VRAM)", "Ctrl+F3"))   action = GUI_TOGGLE_TOUCHFOO_DEBUG_INFO;
-            if (ImGui::MenuItem("Collision Wireframes",      "Ctrl+Shift+D")) action = GUI_TOGGLE_COLLISION_SHAPES;
-            if (ImGui::MenuItem("Combat Hitboxes",          "Ctrl+Shift+W")) action = GUI_TOGGLE_COMBAT_WIREFRAME;
-        });
-
-        // ── Help ─────────────────────────────────────────────────────────
-        menu("Help", [&]() {
-            if (ImGui::MenuItem("Help / Hotkeys")) m_show_help = true;
-            if (ImGui::MenuItem("About Mod"))      m_show_about = true;
-        });
-
-        // ── Right-aligned status + branding ──────────────────────────────
-        {
-            const char* st_lbl  = g_game_paused ? "PAUSED" : mod_speed_label();
-            ImVec4      st_col  = g_game_paused ? xpera::palette.danger : xpera::palette.success;
-            const char* sep     = "   \xC2\xB7   ";
-            const char* brand   = "SWORDFARE";
-            const float total   = ImGui::CalcTextSize(st_lbl).x
-                                + ImGui::CalcTextSize(sep).x
-                                + ImGui::CalcTextSize(brand).x;
-            const float brand_x = win_w - total - 14.0f * scale;
-            if (brand_x > 0.0f) {
-                ImGui::SameLine(brand_x);
-                ImGui::TextColored(st_col, "%s", st_lbl);
-                ImGui::SameLine(0.0f, 0.0f);
-                ImGui::TextColored(xpera::palette.text_lo, "%s", sep);
-                ImGui::SameLine(0.0f, 0.0f);
-                ImGui::TextColored(kCyan, "%s", brand);
-            }
+    if (m_show_physics) {
+        extern GuiRenderer g_gui;
+        ImGui::SetNextWindowPos(ImVec2(40.0f, 40.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Physics Editor", &m_show_physics,
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                         ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::SliderFloat("Walk Speed",  &g_gui.mod_walk_speed,  0.5f, 10.0f, "%.1f");
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::SliderFloat("Run Speed",   &g_gui.mod_run_speed,   0.5f, 10.0f, "%.1f");
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::SliderFloat("Jump Height", &g_gui.mod_jump_height, 0.5f, 10.0f, "%.1f");
+            if (ImGui::Button("Reset"))
+                g_gui.mod_walk_speed = g_gui.mod_run_speed = g_gui.mod_jump_height = 1.0f;
         }
-
-        // Cyan\u2192purple accent under the whole bar.
-        {
-            const float bar_bottom = ImGui::GetWindowHeight() - 1.0f;
-            DrawAccentUnderline(ImVec2(0.0f, bar_bottom), ImVec2(win_w, bar_bottom));
-        }
-
-        ImGui::EndMainMenuBar();
+        ImGui::End();
     }
-
-    if (bar_font) ImGui::PopFont();
-    ImGui::PopStyleColor(7);
-    ImGui::PopStyleVar(3);
-
-    // Draw the About/Help panels (self-contained, opened via the buttons above)
-    if (m_show_about) draw_about_panel(&m_show_about, bar_h);
-    if (m_show_help)  draw_help_panel(&m_show_help, bar_h);
-
-    return action;
 }
 
 
@@ -3805,21 +3461,20 @@ void SwordfareGUI::draw_help_panel(bool* p_open, float top_offset) {
     ImGui::PushStyleColor(ImGuiCol_TitleBgActive, kBg);
 
     static const struct { const char* key; const char* desc; } kHotkeys[] = {
-        {"F1",  "Toggle this header / command overlay"},
+        {"F1",  "Show / hide the menu bar"},
         {"F2",  "Controls Editor (drag to reposition buttons)"},
         {"F3",  "Debug overlay (FPS, draw calls, player stats)"},
         {"F4",  "Toggle the SRE mod hub"},
         {"F5",  "Camera override toggle"},
-        {"F6",  "Cycle PostFX presets"},
+        {"F6",  "Toggle graphical options"},
         {"F7",  "Toggle video background playback"},
         {"F8",  "Pause / Resume"},
         {"F10", "Toggle native on-screen controls"},
         {"F11", "Scene Shifter and display toolbox"},
         {"F12",          "Fullscreen toggle"},
         {"\\",           "Toggle keyboard typing mode"},
-        {"Ctrl+F3",      "Touch Foo Developer HUD (FPS/VRAM)"},
-        {"Ctrl+Shift+D", "Toggle 3D collision wireframes"},
-        {"Ctrl+Shift+W", "Toggle combat & attack hitboxes"},
+        {"Ctrl+Shift+D", "Collision & hitboxes (off / shapes / shapes + depth)"},
+        {"Ctrl+Shift+W", "Hide HUD & overlays"},
     };
 
     if (ImGui::Begin("Hotkeys", p_open, ImGuiWindowFlags_NoCollapse)) {
@@ -3916,7 +3571,7 @@ GuiAction SwordfareGUI::draw_control_panel(bool* p_open) {
 
     // ── Cheats ────────────────────────────────────────────────────
     bar_menu("Cheats", [&]() {
-        ImGui::MenuItem(g_gui.mod_god_mode      ? "[ON]  God Mode"      : "[OFF] God Mode",      nullptr, &g_gui.mod_god_mode);
+        ImGui::MenuItem(g_gui.mod_god_mode      ? "[ON]  Infinite Health" : "[OFF] Infinite Health", nullptr, &g_gui.mod_god_mode);
         ImGui::MenuItem(g_gui.mod_infinite_mana ? "[ON]  Infinite Mana" : "[OFF] Infinite Mana", nullptr, &g_gui.mod_infinite_mana);
         ImGui::MenuItem(g_gui.mod_infinite_jump ? "[ON]  Infinite Jump" : "[OFF] Infinite Jump", nullptr, &g_gui.mod_infinite_jump);
         // Fly Mode and Coin Break were never implemented; show them as unavailable.
@@ -4027,7 +3682,7 @@ GuiAction SwordfareGUI::draw_settings_panel(bool* p_open) {
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::Checkbox("God Mode (Invincible)", &g_gui.mod_god_mode);
+        ImGui::Checkbox("Infinite Health", &g_gui.mod_god_mode);
         ImGui::Checkbox("Infinite Mana", &g_gui.mod_infinite_mana);
         ImGui::Checkbox("Infinite Jump", &g_gui.mod_infinite_jump);
         // Fly Mode and Coin Break were never implemented; show them as unavailable.
@@ -5065,4 +4720,143 @@ void SwordfareGUI::tcp_server_loop() {
             m_tcp_client_fd.store(-1);
         }
     }
+}
+
+// F2 controls editor window (bindings table, tap points)
+void SwordfareGUI::draw_controls_editor(InputConfig& cfg) {
+    if (!m_initialized || !cfg.is_editing()) return;
+    ImGui::SetCurrentContext(static_cast<ImGuiContext*>(m_imgui_ctx));
+
+    // Sized in font units so the table fits at any UI scale
+    const float em = ImGui::GetFontSize();
+    ImGui::SetNextWindowPos(ImVec2(em, em * 4.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(em * 46.0f, em * 28.0f), ImGuiCond_FirstUseEver);
+    bool open = true;
+    if (ImGui::Begin("Controls", &open, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextWrapped("Click a binding, then press a key or controller button. X clears it. Drag the circles on screen to move a control.");
+
+        if (cfg.is_capturing()) {
+            int cap_idx = cfg.capture_button_index();
+            std::string cap_name = cfg.display_name_of(cap_idx);
+            if (cfg.get_capture_slot() == 2) {
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+                                   "Press a controller button for %s ...", cap_name.c_str());
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+                                   "Press a key for %s ...", cap_name.c_str());
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) cfg.cancel_capture();
+        }
+
+        if (cfg.is_placing_tap()) {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+                               "Click on the game screen to place the tap point.");
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) cfg.cancel_place_tap();
+        } else {
+            if (ImGui::Button("Add tap point")) cfg.begin_place_tap();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset to defaults")) ImGui::OpenPopup("Reset controls?");
+        if (ImGui::BeginPopupModal("Reset controls?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("All bindings and tap points return to the defaults.");
+            if (ImGui::Button("Reset", ImVec2(120, 0))) {
+                cfg.reset_to_defaults();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        if (ImGui::BeginTable("##bindings", 6,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                ImGuiTableFlags_ScrollY,
+                ImVec2(0, -1))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Key 1", ImGuiTableColumnFlags_WidthFixed, em * 7.5f);
+            ImGui::TableSetupColumn("Key 2", ImGuiTableColumnFlags_WidthFixed, em * 7.5f);
+            ImGui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthFixed, em * 8.5f);
+            ImGui::TableSetupColumn("Position", ImGuiTableColumnFlags_WidthFixed, em * 4.5f);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em * 3.5f);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < cfg.button_count(); i++) {
+                TouchButton* b = cfg.get_button(i);
+                if (!b) continue;
+                ImGui::PushID(i);
+                ImGui::TableNextRow();
+
+                // Action column: custom buttons get an editable name
+                ImGui::TableNextColumn();
+                if (b->is_custom) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "%s", cfg.display_name_of(i).c_str());
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::InputText("##name", buf, sizeof(buf))) b->display_name = buf;
+                    if (ImGui::IsItemDeactivatedAfterEdit()) cfg.commit_edit();
+                } else {
+                    ImGui::TextUnformatted(cfg.display_name_of(i).c_str());
+                }
+                if (b->is_macro) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled(" (macro)");
+                }
+
+                // Binding cell: click to capture, X to clear
+                auto slot_cell = [&](int slot, std::string label) {
+                    ImGui::TableNextColumn();
+                    bool capturing = cfg.is_capturing() && cfg.capture_button_index() == i &&
+                                     cfg.get_capture_slot() == slot;
+                    if (capturing) label = "...";
+                    std::string id_s = "##s" + std::to_string(slot);
+                    std::string id_c = "X##c" + std::to_string(slot);
+                    const float x_w = ImGui::CalcTextSize("X").x + ImGui::GetStyle().FramePadding.x * 2.0f +
+                                      ImGui::GetStyle().ItemSpacing.x;
+                    if (ImGui::Button((label + id_s).c_str(), ImVec2(-x_w, 0))) cfg.begin_capture(i, slot);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(id_c.c_str())) cfg.clear_binding(i, slot);
+                };
+
+                slot_cell(0, InputConfig::scancode_name(b->sdl_scancode));
+                slot_cell(1, InputConfig::scancode_name(b->sdl_scancode_alt));
+
+                std::string pad_label = "-";
+                if (b->gamepad_button >= 0) {
+                    // Xbox-style names; SDL's own strings are terse ("dpleft", "a")
+                    static const char* const kPadNames[] = {
+                        "A", "B", "X", "Y", "Back", "Guide", "Start", "L Stick", "R Stick",
+                        "LB", "RB", "D-Pad Up", "D-Pad Down", "D-Pad Left", "D-Pad Right"};
+                    if (b->gamepad_button < (int)(sizeof(kPadNames) / sizeof(kPadNames[0])))
+                        pad_label = kPadNames[b->gamepad_button];
+                    else if (const char* s = SDL_GetGamepadStringForButton((SDL_GamepadButton)b->gamepad_button))
+                        pad_label = s;
+                    else pad_label = "Button " + std::to_string(b->gamepad_button);
+                } else if (b->gamepad_axis >= 0) {
+                    const char* s = SDL_GetGamepadStringForAxis((SDL_GamepadAxis)b->gamepad_axis);
+                    if (s) pad_label = s;
+                    else pad_label = "Axis " + std::to_string(b->gamepad_axis);
+                }
+                slot_cell(2, pad_label);
+
+                // Position column
+                ImGui::TableNextColumn();
+                ImGui::Text("%.0f, %.0f", b->game_x, b->game_y);
+
+                // Delete column: custom buttons only
+                ImGui::TableNextColumn();
+                if (b->is_custom && ImGui::SmallButton("Delete")) {
+                    cfg.remove_button(i);
+                    ImGui::PopID();
+                    break;  // indices shift after removal
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+    if (!open) cfg.set_editing(false);
 }

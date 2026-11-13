@@ -73,6 +73,7 @@ extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp �
 #include "platform/srt_overlay.h"
 #include "platform/save_editor.h"
 #include "platform/swordfare_gui.h"  /* Swordfare: ImGui-based in-game overlay */
+#include "platform/win32_menu.h"
 #include "platform/loading_screen.h" /* Boot loading screen (hiro POD + progress) */
 #include "platform/crash_dialog.h"   /* Sleek fatal-crash reporting window */
 #include "platform/launcher_config.h"
@@ -472,6 +473,36 @@ uint64_t g_setApplicationViewSize_addr = 0;
 uint64_t g_apply_viewsize_env_ptr = 0;
 int      g_render_preset = 0; // 0=1080p, 1=720p, 2=540p, 3=Window
 
+// Rebuilds the FBO at w x h and tells the engine the new view size.
+// preset is the index from apply_render_preset(), or -1 for a custom size.
+static void apply_render_size(int w, int h, int preset, const char* label) {
+    w &= ~1;  // even dimensions (required by some FBO formats)
+    h &= ~1;
+
+    extern void fbo_destroy();
+    extern bool fbo_init(int game_w, int game_h);
+    extern IEmulatorArm64* g_emulator_64;
+
+    GAME_W = w;
+    GAME_H = h;
+    TOUCH_SCALE_X = (float)GAME_W / 960.0f;
+    TOUCH_SCALE_Y = (float)GAME_H / 544.0f;
+    g_render_preset = preset;
+
+    // Rebuild FBO at new resolution
+    fbo_destroy();
+    fbo_init(GAME_W, GAME_H);
+
+    // Notify game engine of new viewport
+    if (g_setApplicationViewSize_addr && g_apply_viewsize_env_ptr && g_emulator_64) {
+        g_emulator_64->call(g_setApplicationViewSize_addr,
+                            {g_apply_viewsize_env_ptr, 0,
+                             (uint64_t)GAME_W, (uint64_t)GAME_H, 1});
+    }
+    std::cout << "[RenderPreset] Changed to " << label
+              << " (" << GAME_W << "x" << GAME_H << ")" << std::endl;
+}
+
 // Call after changing g_render_preset to rebuild the FBO and notify the engine.
 // Safe to call from the frame loop (between drawApp calls).
 void apply_render_preset(int preset) {
@@ -515,37 +546,21 @@ void apply_render_preset(int preset) {
     }
 
     extern int g_win_w, g_win_h;
-    extern void fbo_destroy();
-    extern bool fbo_init(int game_w, int game_h);
-    extern IEmulatorArm64* g_emulator_64;
 
     int new_w = presets[preset].w;
     int new_h = presets[preset].h;
     if (preset == 3) { new_w = g_win_w; new_h = g_win_h; }   // "Window" = match output
     if (new_w < 320) new_w = 320;
     if (new_h < 180) new_h = 180;
-    // Align to even dimensions (required by some FBO formats)
-    new_w &= ~1;
-    new_h &= ~1;
 
-    GAME_W = new_w;
-    GAME_H = new_h;
-    TOUCH_SCALE_X = (float)GAME_W / 960.0f;
-    TOUCH_SCALE_Y = (float)GAME_H / 544.0f;
-    g_render_preset = preset;
+    apply_render_size(new_w, new_h, preset, presets[preset].label);
+}
 
-    // Rebuild FBO at new resolution
-    fbo_destroy();
-    fbo_init(GAME_W, GAME_H);
-
-    // Notify game engine of new viewport
-    if (g_setApplicationViewSize_addr && g_apply_viewsize_env_ptr && g_emulator_64) {
-        g_emulator_64->call(g_setApplicationViewSize_addr,
-                            {g_apply_viewsize_env_ptr, 0,
-                             (uint64_t)GAME_W, (uint64_t)GAME_H, 1});
-    }
-    std::cout << "[RenderPreset] Changed to " << presets[preset].label
-              << " (" << GAME_W << "x" << GAME_H << ")" << std::endl;
+// Custom render resolution (View > Render Resolution > Custom...).
+void apply_custom_render_resolution(int w, int h) {
+    w = std::max(160, std::min(w, 7680));
+    h = std::max(120, std::min(h, 4320));
+    apply_render_size(w, h, -1, "Custom");
 }
 
 // Add a specific area for guest-side global variables (libc stuff)
@@ -1002,24 +1017,13 @@ static uint64_t sre_hero_health_comp_addr = 0;
 static uint64_t sre_hero_mana_comp_addr = 0;
 
 // SRE Developer Overlays & Tools
-static uint64_t g_sre_toggle_debug_info_addr = 0;
 static uint64_t g_sre_toggle_collision_shapes_addr = 0;
 static uint64_t g_sre_toggle_combat_wireframe_addr = 0;
-
-void trigger_toggle_debug_info() {
-    if (g_sre_toggle_debug_info_addr && g_guest_memory) {
-        *(volatile int*)(g_guest_memory + g_sre_toggle_debug_info_addr) = 1;
-        mod_toast("Touch Foo Debug HUD toggled", 1.5f);
-        std::cout << "[Developer] Requested Touch Foo Debug Info HUD toggle" << std::endl;
-    } else {
-        std::cout << "[Developer] SRE debug info toggle symbol not available" << std::endl;
-    }
-}
 
 void trigger_toggle_collision_shapes() {
     if (g_sre_toggle_collision_shapes_addr && g_guest_memory) {
         *(volatile int*)(g_guest_memory + g_sre_toggle_collision_shapes_addr) = 1;
-        mod_toast("Collision Shapes toggled", 1.5f);
+        mod_toast("Collision view: next mode (off / shapes / shapes + depth)", 2.0f);
         std::cout << "[Developer] Requested Collision Shapes toggle" << std::endl;
     } else {
         std::cout << "[Developer] SRE collision shapes toggle symbol not available" << std::endl;
@@ -1029,12 +1033,24 @@ void trigger_toggle_collision_shapes() {
 void trigger_toggle_combat_wireframe() {
     if (g_sre_toggle_combat_wireframe_addr && g_guest_memory) {
         *(volatile int*)(g_guest_memory + g_sre_toggle_combat_wireframe_addr) = 1;
-        mod_toast("Combat Wireframe toggled", 1.5f);
-        std::cout << "[Developer] Requested Combat Wireframe toggle" << std::endl;
+        mod_toast("HUD & overlays toggled", 1.5f);
+        std::cout << "[Developer] Requested HUD & overlays toggle" << std::endl;
     } else {
         std::cout << "[Developer] SRE combat wireframe toggle symbol not available" << std::endl;
     }
 }
+
+// A developer overlay toggle only works when the loaded SRE runtime exports its
+// request flag; the menu hides toggles whose flag was not found.
+bool dev_overlay_available(GuiAction a) {
+    switch (a) {
+        case GUI_TOGGLE_COLLISION_SHAPES:    return g_sre_toggle_collision_shapes_addr != 0;
+        case GUI_TOGGLE_COMBAT_WIREFRAME:    return g_sre_toggle_combat_wireframe_addr != 0;
+        default:                             return false;
+    }
+}
+
+bool debug_overlay_visible() { return g_swordfare_gui.is_visible(); }
 
 // SRE ButtonController — guest addresses and layout struct
 #define SRE_BTN_MAX       128
@@ -1168,6 +1184,18 @@ static bool g_text_input_was_active = false;  // Previous frame state for edge d
 extern std::string g_save_dir;  // Defined in jni_bridge.cpp
 extern bool g_gl_hide_hud;      // Defined in jni_bridge.cpp — hides HUD draw calls
 extern int g_death_detected_countdown;  // Defined in jni_bridge.cpp
+
+// Check state for toggle items in the native menu bar.
+bool menu_check_state(GuiAction a) {
+    switch (a) {
+        case GUI_TOGGLE_MOD_HUB:             return g_swordfare_gui.is_mod_overlay_visible();
+        case GUI_TOGGLE_GRAPHICS_OPTIONS:    return g_swordfare_gui.is_graphics_options_visible();
+        case GUI_TOGGLE_VIDEO_BG:            return g_video_background_enabled;
+        case GUI_TOGGLE_TOUCH_CONTROLS:      return !g_gl_hide_hud;
+        case GUI_TOGGLE_SCENE_TOOLBOX:       return g_swordfare_gui.is_scene_toolbox_visible();
+        default:                             return false;
+    }
+}
 std::string g_cache_dir;
 
 #include "platform/data_path.h"  // get_data_path() — implemented in data_path.cpp
@@ -1535,6 +1563,32 @@ uint64_t setup_jni_env_arm64(uint8_t* memory) {
 
 static bool arm64_mod_quick_action(GuiAction a);  // defined next to the ARM64 hero roots
 
+// Switches between windowed mode and borderless fullscreen. SDL remembers the
+// windowed size and position and restores both when fullscreen ends; the native
+// menu bar is hidden while fullscreen.
+void toggle_fullscreen() {
+    extern Display* g_display_ptr;
+    if (!g_display_ptr || !g_display_ptr->get_window()) return;
+    SDL_Window* win = g_display_ptr->get_window();
+    const bool to_fullscreen = (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN) == 0;
+    // Detach the menu bar in both directions: SDL saves the windowed rectangle
+    // without the bar, so it must be detached when SDL restores that rectangle too.
+    win32_menu::before_fullscreen();
+    SDL_SetWindowFullscreen(win, to_fullscreen);
+    SDL_SyncWindow(win);
+    if (!to_fullscreen) {
+        win32_menu::after_windowed();
+        SDL_SyncWindow(win);
+    }
+    int w = 0, h = 0;
+    SDL_GetWindowSize(win, &w, &h);
+    g_win_w = w;
+    g_win_h = h;
+    SDL_GetWindowSizeInPixels(win, &g_draw_w, &g_draw_h);
+    std::cout << "[Display] " << (to_fullscreen ? "Fullscreen " : "Windowed ") << w << "x" << h
+              << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+}
+
 void process_gui_action(GuiAction gui_action, bool& running) {
     if (gui_action == GUI_NONE) return;
     if (arm64_mod_quick_action(gui_action)) return;
@@ -1739,8 +1793,9 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             }
             break;
         }
-        case GUI_TOGGLE_TOUCHFOO_DEBUG_INFO: {
-            trigger_toggle_debug_info();
+        case GUI_TOGGLE_DEBUG_OVERLAY: {
+            g_swordfare_gui.toggle_visible();
+            std::cout << "[Debug] " << (g_swordfare_gui.is_visible() ? "ON" : "OFF") << std::endl;
             break;
         }
         case GUI_TOGGLE_COLLISION_SHAPES: {
@@ -1751,6 +1806,49 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             trigger_toggle_combat_wireframe();
             break;
         }
+        case GUI_TOGGLE_FULLSCREEN:
+            toggle_fullscreen();
+            break;
+        case GUI_MOD_GOD_MODE:
+            g_gui.mod_god_mode = !g_gui.mod_god_mode;
+            break;
+        case GUI_MOD_INFINITE_MANA:
+            g_gui.mod_infinite_mana = !g_gui.mod_infinite_mana;
+            break;
+        case GUI_MOD_INFINITE_JUMP:
+            g_gui.mod_infinite_jump = !g_gui.mod_infinite_jump;
+            break;
+        case GUI_OPEN_PHYSICS_EDITOR:
+            g_swordfare_gui.open_physics_editor();
+            break;
+        case GUI_TOGGLE_MENU_BAR:
+            win32_menu::set_visible(!win32_menu::visible());
+            break;
+        case GUI_STEP_FRAME:
+            mod_step_frame();
+            break;
+        case GUI_TOGGLE_MOD_HUB:
+            g_swordfare_gui.toggle_mod_overlay();
+            break;
+        case GUI_TOGGLE_GRAPHICS_OPTIONS:
+            g_swordfare_gui.toggle_graphics_options();
+            break;
+        case GUI_TOGGLE_VIDEO_BG:
+            g_video_background_enabled = !g_video_background_enabled;
+            std::cout << "[VideoBackground] Video playback: " << (g_video_background_enabled ? "ENABLED" : "DISABLED") << std::endl;
+            break;
+        case GUI_TOGGLE_TOUCH_CONTROLS:
+            g_gl_hide_hud = !g_gl_hide_hud;
+            break;
+        case GUI_TOGGLE_SCENE_TOOLBOX:
+            g_swordfare_gui.toggle_scene_toolbox();
+            break;
+        case GUI_KEYBINDS:
+            g_swordfare_gui.open_help();
+            break;
+        case GUI_ABOUT:
+            g_swordfare_gui.open_about();
+            break;
         default: break;
     }
 }
@@ -2035,15 +2133,15 @@ void load_and_boot() {
     // but that function opens the game menu AND hides controls. The game then shows
     // controls again on any touch input, making it useless. Instead, we use g_gl_hide_hud
     // in the JNI bridge to make HUD draw calls fully transparent.
-    bool g_hide_touch_hud = true;  // Hide touch controls by default (desktop uses keyboard)
-    g_gl_hide_hud = g_hide_touch_hud;
+    g_gl_hide_hud = true;  // touch controls hidden by default (desktop uses keyboard)
 
     if (updateApp && drawApp) {
         // Real delta time
         Uint64 last_ticks = SDL_GetTicks();
         double accumulated_time = 0.0;
         bool gui_visible = false;  // GUI hidden by default
-        bool debug_visible = false;  // F3 debug overlay
+        extern Display* g_display_ptr;
+        if (g_display_ptr) win32_menu::install(g_display_ptr->get_window());
         bool hint_shown = false;  // One-time "Press F1" hint
         Uint64 hint_start_time = SDL_GetTicks();  // Show hint for first 5 seconds
         float fps = 0.0f;
@@ -2324,7 +2422,7 @@ void load_and_boot() {
             }
             
             // Render F3 debug overlay
-            if (g_display_active && debug_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+            if (g_display_active && g_swordfare_gui.is_visible() && g_graphics_api != GraphicsAPI::OPENGL) {
                 glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION);
@@ -2525,12 +2623,8 @@ void load_and_boot() {
                     }
                     g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr, overlays_ptr, globally_hidden);
                 }
-                if (gui_visible) {
-                    GuiAction act = g_swordfare_gui.draw_control_panel(&gui_visible);
-                    if (act != GUI_NONE) {
-                        process_gui_action(act, running);
-                    }
-                }
+                process_gui_action(win32_menu::take_action(), running);
+                g_swordfare_gui.draw_menu_windows();
                 g_swordfare_gui.draw_lua_console();
                 g_swordfare_gui.draw_lua_script_editor();
                 g_swordfare_gui.draw_lua_script_manager();
@@ -2591,6 +2685,7 @@ void load_and_boot() {
                             SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
                             std::cout << "[Display] Window resized to " << g_win_w << "x" << g_win_h
                                       << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                            if (g_render_preset == 3) apply_render_preset(3);  // "Match Window" follows the window
                             break;
                         case SDL_EVENT_MOUSE_BUTTON_DOWN:
                             if (event.button.button == SDL_BUTTON_LEFT) {
@@ -2685,8 +2780,9 @@ void load_and_boot() {
                                 if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
                             }
                             if (event.key.key == SDLK_F1 && !event.key.repeat) {
-                                gui_visible = !gui_visible;
-                                std::cout << "[GUI] " << (gui_visible ? "ON" : "OFF") << std::endl;
+                                // F1 shows or hides the native menu bar; the legacy overlay is Vulkan-only.
+                                if (g_graphics_api == GraphicsAPI::OPENGL) win32_menu::set_visible(!win32_menu::visible());
+                                else gui_visible = !gui_visible;
                                 break;
                             }
                             if (event.key.key == SDLK_F4 && !event.key.repeat) {
@@ -2704,13 +2800,8 @@ void load_and_boot() {
                                 break;
                             }
                             if (event.key.key == SDLK_F3 && !event.key.repeat) {
-                                if (event.key.mod & SDL_KMOD_CTRL) {
-                                    trigger_toggle_debug_info();
-                                    break;
-                                }
-                                debug_visible = !debug_visible;
                                 g_swordfare_gui.toggle_visible();
-                                std::cout << "[Debug] " << (debug_visible ? "ON" : "OFF") << std::endl;
+                                std::cout << "[Debug] " << (g_swordfare_gui.is_visible() ? "ON" : "OFF") << std::endl;
                                 break;
                             }
                             if (event.key.key == SDLK_D && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
@@ -2722,26 +2813,7 @@ void load_and_boot() {
                                 break;
                             }
                             if (event.key.key == SDLK_F12 && !event.key.repeat) {
-                                SDL_WindowFlags flags = SDL_GetWindowFlags(g_display_ptr->get_window());
-                                if (flags & SDL_WINDOW_FULLSCREEN) {
-                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), false);
-                                    // Query actual window size — preserves native aspect ratio (16:10, etc.)
-                                    int ww, wh;
-                                    SDL_GetWindowSize(g_display_ptr->get_window(), &ww, &wh);
-                                    g_win_w = ww;
-                                    g_win_h = wh;
-                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
-                                    std::cout << "[Display] Windowed " << ww << "x" << wh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
-                                } else {
-                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), true);
-                                    // Get actual fullscreen resolution (logical + physical)
-                                    int fw, fh;
-                                    SDL_GetWindowSize(g_display_ptr->get_window(), &fw, &fh);
-                                    g_win_w = fw;
-                                    g_win_h = fh;
-                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
-                                    std::cout << "[Display] Fullscreen " << fw << "x" << fh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
-                                }
+                                toggle_fullscreen();
                                 break;
                             }
                             if (event.key.key == SDLK_F5 && !event.key.repeat) {
@@ -2799,9 +2871,8 @@ void load_and_boot() {
                                 // Toggle host-side touch HUD visibility
                                 // (paints over button areas instead of calling handleMenuButtonPress
                                 //  which would open the game's settings menu)
-                                g_hide_touch_hud = !g_hide_touch_hud;
-                                g_gl_hide_hud = g_hide_touch_hud;
-                                std::cout << "[Keyboard] Touch HUD: " << (g_hide_touch_hud ? "HIDDEN" : "VISIBLE") << std::endl;
+                                g_gl_hide_hud = !g_gl_hide_hud;
+                                std::cout << "[Keyboard] Touch HUD: " << (g_gl_hide_hud ? "HIDDEN" : "VISIBLE") << std::endl;
                                 break;
                             }
                             if (event.key.key == SDLK_F8 && !event.key.repeat) {
@@ -3535,6 +3606,10 @@ static void run_arm64_xp_action(GuiAction a) {
     mod_toast(msg, 1.5f);
 }
 
+// Cheat toggles and movement sliders only act where a per-frame applier runs:
+// mod_apply_frame() on the ARM32 path, apply_arm64_mods() for ABI 13 and later.
+bool mod_cheats_available() { return !g_is_arm64 || swordi_abi >= 13; }
+
 // Per-frame cheats for the ARM64 path (mod_apply_frame() is the ARM32 version).
 static void apply_arm64_mods() {
     static uint32_t s_cc_seen = 0;
@@ -4150,7 +4225,11 @@ void load_and_boot_arm64() {
 
         std::string sre_path;
         const char* lib_name = (swordi_abi == 13) ? "libsre13.so" : "libsre12.so";
+        // The runtime built with this executable (libs/ next to it) wins over
+        // one in the data directory, so a dev build never pairs with an old runtime.
+        const std::string own_sre = os_external::exe_dir() + "/libs/" + lib_name;
         const char* candidate_paths[] = {
+            own_sre.c_str(),
             (swordi_abi == 13) ? "bin/libs/libsre13.so" : "bin/libs/libsre12.so",
             (swordi_abi == 13) ? "libs/libsre13.so" : "libs/libsre12.so",
             lib_name,
@@ -5628,13 +5707,11 @@ void load_and_boot_arm64() {
                 }
 
                 // Resolve developer overlay request symbols
-                g_sre_toggle_debug_info_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_request_toggle_debug_info");
                 g_sre_toggle_collision_shapes_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_request_toggle_collision_shapes");
                 g_sre_toggle_combat_wireframe_addr = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_request_toggle_combat_wireframe");
-                if (g_sre_toggle_debug_info_addr) {
-                    std::cout << "[SRE] Developer debug overlays active (HUD=0x" << std::hex 
-                              << g_sre_toggle_debug_info_addr << " Shapes=0x" 
-                              << g_sre_toggle_collision_shapes_addr << " Combat=0x" 
+                if (g_sre_toggle_collision_shapes_addr) {
+                    std::cout << "[SRE] Developer debug overlays active (Shapes=0x" << std::hex
+                              << g_sre_toggle_collision_shapes_addr << " HideHUD=0x"
                               << g_sre_toggle_combat_wireframe_addr << std::dec << ")" << std::endl;
                 }
 
@@ -6656,8 +6733,7 @@ void load_and_boot_arm64() {
         std::cout.flush();
     }
 
-    bool g_hide_touch_hud = true;
-    g_gl_hide_hud = g_hide_touch_hud;
+    g_gl_hide_hud = true;  // touch controls hidden by default (desktop uses keyboard)
 
     std::cout << "[Diag64] Entering game loop. updateApp=0x" << std::hex << updateApp
               << " drawApp=0x" << drawApp << std::dec << std::endl;
@@ -6667,7 +6743,8 @@ void load_and_boot_arm64() {
         Uint64 last_ticks = SDL_GetTicks();
         double accumulated_time = 0.0;
         bool gui_visible = false;
-        bool debug_visible = false;
+        extern Display* g_display_ptr;
+        if (g_display_ptr) win32_menu::install(g_display_ptr->get_window());
         bool hint_shown = false;
         Uint64 hint_start_time = SDL_GetTicks();
         float fps = 0.0f;
@@ -6720,7 +6797,9 @@ void load_and_boot_arm64() {
         bool cam_key_pgdn  = false;
 
         bool running = true;
-        while (running) {
+        // One iteration of the game loop (a lambda, so it can also run from
+        // inside a Windows modal loop; see win32_menu::set_modal_frame).
+        auto run_frame = [&]() {
             g_frame_stats.reset();
             
             Uint64 now_ticks = SDL_GetTicks();
@@ -6738,10 +6817,10 @@ void load_and_boot_arm64() {
                 if (g_pod_ring && g_pod_ring->state() == pod::kStateBooting)
                     g_pod_ring->set_state(pod::kStateRunning);
                 pod_process_commands(running);
-                if (!running) break;
+                if (!running) return;
                 if (g_pod_paused) {
                     SDL_Delay(12);
-                    continue;
+                    return;  // next frame
                 }
             }
             
@@ -8022,9 +8101,7 @@ void load_and_boot_arm64() {
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 // Controls editor header text
                 {
-                    std::string mode_str = "POSITION";
-                    if (g_input_config.get_editor_mode() == EDITOR_REBIND) mode_str = "REBIND (click button, press key)";
-                    g_gui.draw_string("CONTROLS EDITOR [" + mode_str + "]  |  F2=Save & Close  R=Toggle Rebind", 10, g_win_h - 20, 1.3f, 100, 200, 255, 255);
+                    g_gui.draw_string("CONTROLS EDITOR  |  Drag circles to move  |  F2 = close", 10, g_win_h - 20, 1.3f, 100, 200, 255, 255);
                     g_gui.draw_string("Blue=Move  Green=Action  Orange=Menu  Purple=Magic Macro  Yellow=Custom", 10, g_win_h - 38, 1.1f, 180, 180, 200, 200);
                 }
                 // Draw readable button labels on each circle
@@ -8063,7 +8140,7 @@ void load_and_boot_arm64() {
             }
             
             // Render F3 debug overlay
-            if (g_display_active && debug_visible && g_graphics_api != GraphicsAPI::OPENGL) {
+            if (g_display_active && g_swordfare_gui.is_visible() && g_graphics_api != GraphicsAPI::OPENGL) {
                 glPushAttrib(GL_ALL_ATTRIB_BITS);
                 glViewport(0, 0, g_draw_w, g_draw_h);
                 glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
@@ -8323,17 +8400,14 @@ void load_and_boot_arm64() {
                     }
                     g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr, overlays_ptr, globally_hidden);
                 }
-                if (gui_visible) {
-                    GuiAction act = g_swordfare_gui.draw_control_panel(&gui_visible);
-                    if (act != GUI_NONE) {
-                        process_gui_action(act, running);
-                    }
-                }
+                process_gui_action(win32_menu::take_action(), running);
+                g_swordfare_gui.draw_menu_windows();
                 g_swordfare_gui.draw_lua_console();
                 g_swordfare_gui.draw_lua_script_editor();
                 g_swordfare_gui.draw_lua_script_manager();
                 g_swordfare_gui.draw_mod_overlay(g_save_dir);
                 g_swordfare_gui.draw_graphics_options_modal(g_postfx);
+                g_swordfare_gui.draw_controls_editor(g_input_config);
                 g_swordfare_gui.end_frame();
             }
             
@@ -8458,6 +8532,7 @@ void load_and_boot_arm64() {
                             SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
                             std::cout << "[Display] Window resized to " << g_win_w << "x" << g_win_h
                                       << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
+                            if (g_render_preset == 3) apply_render_preset(3);  // "Match Window" follows the window
                             break;
                         case SDL_EVENT_KEY_DOWN:
                             if (g_text_input_active) {
@@ -8497,11 +8572,22 @@ void load_and_boot_arm64() {
                                     cam_write_to_guest();
                                 }
                             }
+                            // Controls editor: a pending capture takes the next key (F-keys stay hotkeys)
+                            if (g_input_config.is_capturing()) {
+                                if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+                                    g_input_config.editor_handle_key(event.key.scancode)) break;
+                                if (!(event.key.scancode >= SDL_SCANCODE_F1 && event.key.scancode <= SDL_SCANCODE_F12)) break;
+                            }
                             if (should_block_keyboard()) {
                                 bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
                                 if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
                             }
-                            if (event.key.key == SDLK_F1 && !event.key.repeat) { gui_visible = !gui_visible; break; }
+                            if (event.key.key == SDLK_F1 && !event.key.repeat) {
+                                // F1 shows or hides the native menu bar; the legacy overlay is Vulkan-only.
+                                if (g_graphics_api == GraphicsAPI::OPENGL) win32_menu::set_visible(!win32_menu::visible());
+                                else gui_visible = !gui_visible;
+                                break;
+                            }
                             if (event.key.key == SDLK_F4 && !event.key.repeat) {
                                 g_swordfare_gui.toggle_mod_overlay();
                                 std::cout << "[ModOverlay] " << (g_swordfare_gui.is_mod_overlay_visible() ? "ON" : "OFF") << std::endl;
@@ -8512,24 +8598,7 @@ void load_and_boot_arm64() {
                                 if (!g_input_config.is_editing()) g_input_config.save(g_save_dir + "/controls_arm64.ini");
                                 break;
                             }
-                            // Controls editor: R toggles rebind mode, Delete removes custom button
-                            if (g_input_config.is_editing() && !event.key.repeat) {
-                                if (event.key.key == SDLK_R) {
-                                    auto mode = g_input_config.get_editor_mode();
-                                    g_input_config.set_editor_mode(mode == EDITOR_REBIND ? EDITOR_POSITION : EDITOR_REBIND);
-                                    std::cout << "[Controls] Editor mode: " 
-                                              << (g_input_config.get_editor_mode() == EDITOR_REBIND ? "REBIND" : "POSITION") << std::endl;
-                                    break;
-                                }
-                                // Capture key for rebinding
-                                if (g_input_config.editor_handle_key(event.key.scancode)) break;
-                            }
                             if (event.key.key == SDLK_F3 && !event.key.repeat) {
-                                if (event.key.mod & SDL_KMOD_CTRL) {
-                                    trigger_toggle_debug_info();
-                                    break;
-                                }
-                                debug_visible = !debug_visible;
                                 g_swordfare_gui.toggle_visible();
                                 break;
                             }
@@ -8559,13 +8628,13 @@ void load_and_boot_arm64() {
                                 }
                                 break;
                             }
-                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
+                            if (event.key.key == SDLK_F7 && !event.key.repeat && g_cam_active) {  // FOV only with camera override (F5); otherwise F7 keeps its own function
                                 extern void cam_set_fov(float fov_rad);
                                 float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
                                 cam_set_fov(std::max(0.35f, cur - 0.05f));
                                 break;
                             }
-                            if (event.key.key == SDLK_F8 && !event.key.repeat) {
+                            if (event.key.key == SDLK_F8 && !event.key.repeat && g_cam_active) {  // FOV only with camera override (F5); otherwise F8 keeps its own function
                                 extern void cam_set_fov(float fov_rad);
                                 float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
                                 cam_set_fov(std::min(1.4f, cur + 0.05f));
@@ -8605,28 +8674,11 @@ void load_and_boot_arm64() {
                             if (event.key.key == SDLK_F8 && !event.key.repeat) { mod_toggle_pause(); break; }
                             if (event.key.key == SDLK_F9 && !event.key.repeat) { mod_step_frame(); break; }
                             if (event.key.key == SDLK_F10 && !event.key.repeat) {
-                                g_hide_touch_hud = !g_hide_touch_hud;
-                                g_gl_hide_hud = g_hide_touch_hud;
+                                g_gl_hide_hud = !g_gl_hide_hud;
                                 break;
                             }
                             if (event.key.key == SDLK_F12 && !event.key.repeat) {
-                                SDL_WindowFlags flags = SDL_GetWindowFlags(g_display_ptr->get_window());
-                                if (flags & SDL_WINDOW_FULLSCREEN) {
-                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), false);
-                                    // Query actual window size — preserves native aspect ratio (16:10, etc.)
-                                    int ww, wh;
-                                    SDL_GetWindowSize(g_display_ptr->get_window(), &ww, &wh);
-                                    g_win_w = ww; g_win_h = wh;
-                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
-                                    std::cout << "[Display] Windowed " << ww << "x" << wh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
-                                } else {
-                                    SDL_SetWindowFullscreen(g_display_ptr->get_window(), true);
-                                    int fw, fh;
-                                    SDL_GetWindowSize(g_display_ptr->get_window(), &fw, &fh);
-                                    g_win_w = fw; g_win_h = fh;
-                                    SDL_GetWindowSizeInPixels(g_display_ptr->get_window(), &g_draw_w, &g_draw_h);
-                                    std::cout << "[Display] Fullscreen " << fw << "x" << fh << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
-                                }
+                                toggle_fullscreen();
                                 break;
                             }
                             // N — Time of Day cycle: Day → Afternoon → Night → Day
@@ -8857,6 +8909,9 @@ void load_and_boot_arm64() {
                             }
                             break;
                         }
+                        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                            if (g_input_config.is_editing()) g_input_config.editor_handle_gamepad_button(event.gbutton.button);
+                            break;
                         case SDL_EVENT_MOUSE_WHEEL:
                             if (g_cam_active) cam_scroll_zoom((float)event.wheel.y);
                             break;
@@ -8869,7 +8924,7 @@ void load_and_boot_arm64() {
                                 if (g_input_config.is_editing()) {
                                     float gx = event.button.x * 960.0f / (float)g_win_w;
                                     float gy = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
-                                    g_input_config.editor_mouse_down(gx, gy);
+                                    if (!ImGui::GetIO().WantCaptureMouse) g_input_config.editor_mouse_down(gx, gy);
                                     click_swallowed_by_gui = true;
                                     break;
                                 }
@@ -8913,7 +8968,7 @@ void load_and_boot_arm64() {
                             if (g_input_config.is_editing() && mouse_pressed) {
                                 float gx = event.motion.x * 960.0f / (float)g_win_w;
                                 float gy = 544.0f - (event.motion.y * 544.0f / (float)g_win_h);
-                                g_input_config.editor_mouse_move(gx, gy);
+                                if (!ImGui::GetIO().WantCaptureMouse) g_input_config.editor_mouse_move(gx, gy);
                             } else if (g_cam_active && g_cam_pov_mode && mouse_pressed
                                        && !click_swallowed_by_gui && !g_srt_overlay.is_visible()) {
                                 // POV free-look: dragging rotates yaw/pitch instead
@@ -9214,7 +9269,12 @@ void load_and_boot_arm64() {
             }
             
             if (TARGET_FRAMES > 0 && completed_frames >= TARGET_FRAMES) running = false;
-        }
+        };
+        // Windows runs its own message loop while the window is dragged or a
+        // menu is open; the menu code drives frames from there so the game keeps going.
+        win32_menu::set_modal_frame([&]() { if (running) run_frame(); });
+        while (running) run_frame();
+        win32_menu::set_modal_frame(nullptr);
 
         g_input_config.save(g_save_dir + "/controls_arm64.ini");
         if (g_gamepad) {
@@ -9588,6 +9648,9 @@ int main(int argc, char* argv[]) {
                 g_display_active = true;
                 g_display_ptr = &display;
                 display_initialized = true;
+                // Start at the windowed size already, so the loading screen and
+                // the game use the same window instead of jumping from full size.
+                if (!g_pod_enabled) win32_menu::fit_window(display.get_window());
                 // The boot loading screen is created AFTER g_swordfare_gui.init()
                 // below, because it reuses that GUI's ImGui context + shared
                 // SDL3/GL3 backend (creating a second backend and later shutting

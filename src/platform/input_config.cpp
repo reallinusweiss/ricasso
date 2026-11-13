@@ -430,6 +430,7 @@ bool InputConfig::remove_button(int index) {
         return false;
     }
     std::cout << "[InputConfig] Removed custom button '" << buttons[index].display_name << "'\n";
+    cancel_capture();  // a pending capture index would point at a shifted button
     buttons.erase(buttons.begin() + index);
     save_after_edit();
     return true;
@@ -439,30 +440,68 @@ bool InputConfig::remove_button(int index) {
 // Key rebinding
 // ---------------------------------------------------------------------------
 
+void InputConfig::begin_capture(int index, int slot) {
+    if (index < 0 || index >= (int)buttons.size() || slot < 0 || slot > 2) return;
+    capture_index = index;
+    capture_slot = slot;
+    placing_tap = false;
+}
+
+void InputConfig::clear_binding(int index, int slot) {
+    if (index < 0 || index >= (int)buttons.size() || slot < 0 || slot > 2) return;
+    TouchButton& btn = buttons[index];
+    if (slot == 0) btn.sdl_scancode = 0;
+    else if (slot == 1) btn.sdl_scancode_alt = 0;
+    else { btn.gamepad_button = -1; btn.gamepad_axis = -1; }
+    save_after_edit();
+}
+
+void InputConfig::reset_to_defaults() {
+    cancel_capture();
+    placing_tap = false;
+    load_defaults();
+    save_after_edit();
+}
+
+std::string InputConfig::display_name_of(int index) const {
+    if (index < 0 || index >= (int)buttons.size()) return "";
+    return get_display(buttons[index]);
+}
+
 bool InputConfig::editor_handle_key(int scancode) {
-    if (editor_mode != EDITOR_REBIND || rebind_target < 0) return false;
-    
-    // Don't allow system keys (F1-F12, Escape used for exit)
-    if (scancode >= SDL_SCANCODE_F1 && scancode <= SDL_SCANCODE_F12) return true;
-    
-    TouchButton& btn = buttons[rebind_target];
-    
-    // If primary is already this key, set it as alt instead
-    if (btn.sdl_scancode == scancode) {
-        std::cout << "[InputConfig] Key " << scancode_name(scancode) << " already primary for " << get_display(btn) << "\n";
-    } else if (btn.sdl_scancode_alt == 0 || btn.sdl_scancode_alt == scancode) {
-        // Set as alt if no alt or same alt
-        btn.sdl_scancode_alt = scancode;
-        std::cout << "[InputConfig] Rebound " << get_display(btn) << " alt → " << scancode_name(scancode) << "\n";
-    } else {
-        // Replace primary, shift old primary to alt
-        btn.sdl_scancode_alt = btn.sdl_scancode;
+    if (!is_capturing() || capture_slot > 1) return false;
+
+    // F1-F12 stay hotkeys and are not captured
+    if (scancode >= SDL_SCANCODE_F1 && scancode <= SDL_SCANCODE_F12) return false;
+
+    if (capture_index >= (int)buttons.size()) { cancel_capture(); return false; }
+
+    TouchButton& btn = buttons[capture_index];
+    if (capture_slot == 0) {
+        if (btn.sdl_scancode_alt == scancode) btn.sdl_scancode_alt = 0;
         btn.sdl_scancode = scancode;
-        std::cout << "[InputConfig] Rebound " << get_display(btn) << " → " << scancode_name(scancode) << "\n";
+    } else {
+        if (btn.sdl_scancode == scancode) btn.sdl_scancode = 0;
+        btn.sdl_scancode_alt = scancode;
     }
-    
-    rebind_target = -1;
-    editor_mode = EDITOR_POSITION;
+    std::cout << "[InputConfig] " << get_display(btn) << " key " << (capture_slot + 1)
+              << " -> " << scancode_name(scancode) << "\n";
+
+    cancel_capture();
+    save_after_edit();
+    return true;
+}
+
+bool InputConfig::editor_handle_gamepad_button(int button) {
+    if (!is_capturing() || capture_slot != 2) return false;
+    if (capture_index >= (int)buttons.size()) { cancel_capture(); return false; }
+
+    TouchButton& btn = buttons[capture_index];
+    btn.gamepad_button = button;
+    btn.gamepad_axis = -1;
+    std::cout << "[InputConfig] " << get_display(btn) << " controller -> button " << button << "\n";
+
+    cancel_capture();
     save_after_edit();
     return true;
 }
@@ -674,8 +713,8 @@ void InputConfig::render_editor(int win_w, int win_h,
             fill_a = 100;
             line_a = 255;
         }
-        if (editor_mode == EDITOR_REBIND && i == rebind_target) {
-            // Blinking highlight for rebind target
+        if (i == capture_index) {
+            // Highlight for the binding being captured
             fill_a = 150;
             r = 255; g = 255; b = 100;
         }
@@ -690,52 +729,14 @@ void InputConfig::render_editor(int win_w, int win_h,
         glVertex2f(wx - ch, wy); glVertex2f(wx + ch, wy);
         glVertex2f(wx, wy - ch); glVertex2f(wx, wy + ch);
         glEnd();
-
-        // Display name + key binding label
-        std::string display = get_display(btn);
-        std::string key_str = "[" + scancode_name(btn.sdl_scancode);
-        if (btn.sdl_scancode_alt > 0) {
-            key_str += "/" + scancode_name(btn.sdl_scancode_alt);
-        }
-        key_str += "]";
-        std::string label = display + " " + key_str;
-        if (btn.is_macro) label = "⚡" + label;
-
-        float label_x = wx - (label.length() * 3.5f);
-        float label_y = wy - wr - 16.0f;
-        float lw = label.length() * 7.0f + 6.0f;
-        
-        // Label background
-        glColor4ub(0, 0, 0, 200);
-        glBegin(GL_QUADS);
-        glVertex2f(label_x - 3, label_y - 2);
-        glVertex2f(label_x + lw, label_y - 2);
-        glVertex2f(label_x + lw, label_y + 12);
-        glVertex2f(label_x - 3, label_y + 12);
-        glEnd();
-        
-        // Label text (crude pixel blocks — real text via launcher font)
-        glColor4ub(r, g, b, 255);
-        for (size_t c = 0; c < label.size(); c++) {
-            float cx = label_x + c * 7.0f;
-            glBegin(GL_QUADS);
-            glVertex2f(cx, label_y);
-            glVertex2f(cx + 5, label_y);
-            glVertex2f(cx + 5, label_y + 10);
-            glVertex2f(cx, label_y + 10);
-            glEnd();
-        }
     }
 
-    // Instruction bar at top
-    float bar_y = (float)win_h - 30.0f;
-    glColor4ub(0, 0, 0, 200);
-    glBegin(GL_QUADS);
-    glVertex2f(0, bar_y);
-    glVertex2f((float)win_w, bar_y);
-    glVertex2f((float)win_w, (float)win_h);
-    glVertex2f(0, (float)win_h);
-    glEnd();
+    // Tap point preview at the mouse position
+    if (placing_tap) {
+        float pr = 35.0f * std::min(sx, sy) * 0.7f;
+        draw_circle((float)mouse_x, (float)mouse_y, pr, 255, 220, 60, 160, true);
+        draw_circle((float)mouse_x, (float)mouse_y, pr, 255, 220, 60, 255, false);
+    }
 
     // Restore GL state
     glMatrixMode(GL_MODELVIEW);
@@ -750,18 +751,18 @@ void InputConfig::render_editor(int win_w, int win_h,
 // ---------------------------------------------------------------------------
 
 void InputConfig::editor_mouse_down(float game_x, float game_y) {
-    int clicked = find_button_at(game_x, game_y);
-    
-    if (editor_mode == EDITOR_REBIND) {
-        // In rebind mode, clicking a button selects it for rebinding
-        if (clicked >= 0) {
-            rebind_target = clicked;
-            std::cout << "[InputConfig] Rebind mode: press a key for '" 
-                      << get_display(buttons[clicked]) << "'\n";
-        }
+    if (placing_tap) {
+        // Click on the screen creates a tap point, then waits for its key
+        placing_tap = false;
+        int n = 0;
+        for (const auto& b : buttons) if (b.is_custom) n++;
+        int idx = add_custom_button("Tap " + std::to_string(n + 1), game_x, game_y, 0);
+        begin_capture(idx, 0);
         return;
     }
-    
+
+    int clicked = find_button_at(game_x, game_y);
+
     // Position mode — drag as before
     dragging_button = clicked;
     if (dragging_button >= 0) {

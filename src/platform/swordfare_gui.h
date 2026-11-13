@@ -129,6 +129,8 @@ public:
         m_f11_overlay_active = true;
         m_overlay_forced_tab = 2;
     }
+    // True while the F11 toolbox is the open overlay (same condition toggle_scene_toolbox() uses).
+    bool is_scene_toolbox_visible() const { return m_mod_overlay_visible && m_f11_overlay_active; }
 
     // Draw the debug panel — call between begin_frame()/end_frame() when visible
     void draw_debug(const SwordfareDebugStats& stats);
@@ -144,9 +146,14 @@ public:
 
     // Draw the remastered mod manager overlay
     void draw_mod_overlay(const std::string& save_dir);
+    // F2 controls editor window (bindings table, tap points)
+    void draw_controls_editor(class InputConfig& cfg);
 
-    // Draw the F1 modern control panel/overlay
-    GuiAction draw_control_panel(bool* p_open);
+    // Help, About and Physics Editor windows opened from the native menu bar
+    void draw_menu_windows();
+    void open_help()           { m_show_help = true; }
+    void open_about()          { m_show_about = true; }
+    void open_physics_editor() { m_show_physics = true; }
 
     void draw_about_panel(bool* p_open, float top_offset);
     void draw_help_panel(bool* p_open, float top_offset);
@@ -155,6 +162,7 @@ public:
     GuiAction draw_settings_panel(bool* p_open);
     bool m_show_about = false;
     bool m_show_help  = false;
+    bool m_show_physics = false;
 
     // ---- F6 Decoupled Graphical Options Modal ----
     void draw_graphics_options_modal(struct PostFXState& state);

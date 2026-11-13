@@ -36,35 +36,31 @@ volatile int g_sre_request_toggle_combat_wireframe = 0;
 static void sre13_handle_dev_toggles(GameViewController *gvc) {
 	if (!gvc) return;
 
-	if (g_sre_request_toggle_debug_info) {
-		g_sre_request_toggle_debug_info = 0;
-		typedef void (*ToggleDebugInfo_fn)(void*);
-		static ToggleDebugInfo_fn s_toggle_fn = NULL;
-		if (!s_toggle_fn) {
-			s_toggle_fn = (ToggleDebugInfo_fn)swordigo_dlsym("_ZN5Caver13GameSceneView15ToggleDebugInfoEv");
-		}
-		if (s_toggle_fn && gvc->GameSceneView) {
-			s_toggle_fn(gvc->GameSceneView);
-		}
-	}
-
 	if (g_sre_request_toggle_collision_shapes) {
 		g_sre_request_toggle_collision_shapes = 0;
+		/* Same cycle as the game's own debug key D: off -> shapes -> shapes with
+		 * depth -> off. Scene+0x2d0 makes Scene::Draw draw collision shapes. */
 		static uint8_t* s_draw_depth = NULL;
 		if (!s_draw_depth) {
 			s_draw_depth = (uint8_t*)swordigo_dlsym("_ZN5Caver23CollisionShapeComponent9drawDepthE");
 		}
-		if (s_draw_depth) {
-			*s_draw_depth ^= 1;
-		}
 		if (gvc->GameSceneController) {
-			void* scene = *(void**)((char*)gvc->GameSceneController + 0x20);
+			uint8_t* scene = *(uint8_t**)((char*)gvc->GameSceneController + 0x20);
 			if (scene) {
-				*(uint8_t*)((char*)scene + 720) = s_draw_depth ? *s_draw_depth : 1;
+				if (!scene[0x2d0]) {
+					scene[0x2d0] = 1;
+					if (s_draw_depth) *s_draw_depth = 0;
+				} else if (s_draw_depth && !*s_draw_depth) {
+					*s_draw_depth = 1;
+				} else {
+					scene[0x2d0] = 0;
+					if (s_draw_depth) *s_draw_depth = 0;
+				}
 			}
 		}
 	}
 
+	/* Game's own debug key W: GameSceneView+0x1b2 hides the HUD, Scene+0x37c skips drawing OverlayComponents. */
 	if (g_sre_request_toggle_combat_wireframe) {
 		g_sre_request_toggle_combat_wireframe = 0;
 		if (gvc->GameSceneView) {
