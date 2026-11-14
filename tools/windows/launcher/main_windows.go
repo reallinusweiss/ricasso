@@ -23,11 +23,11 @@ import (
 	"ricasso-launcher/importer"
 )
 
-const launcherVersion = "1.3.0"
+const launcherVersion = "1.3.1"
 
 // releaseVersion is the Ricasso package version (GitHub release); the update
 // notice compares it with the newest release. Raise it for every release.
-const releaseVersion = "1.0.0"
+const releaseVersion = "2.0.0"
 
 func init() {
 	// All windows belong to the main thread.

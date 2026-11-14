@@ -16,7 +16,7 @@ Ricasso is a fan project. It is not made, endorsed or supported by Touch Foo, an
 
 | | |
 | --- | --- |
-| Stage | 1.0.0 |
+| Stage | 2.0.0 |
 | Game versions | Swordigo 1.4.13 (recommended) and 1.4.12, 64-bit (arm64-v8a) |
 | Windows | Built and tested on Windows 11 x64. Windows 10 should work but is untested. |
 | Testing | Automated client and package tests pass. Gameplay is tested with Swordigo 1.4.13 (keyboard and controller); 1.4.12 is not yet tested in play. |
