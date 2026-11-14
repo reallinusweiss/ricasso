@@ -610,7 +610,7 @@ ToolDialog* build_hotkeys() {
     table->verticalHeader()->setDefaultSectionSize(table->fontMetrics().height() + 8);
     int n = 0;
     for (const Hotkey& h : hotkey_table()) {
-        if (!h.label) continue;
+        if (!h.label || !hotkey_active(h)) continue;
         table->insertRow(n);
         table->setItem(n, 0, new QTableWidgetItem(QString::fromUtf8(h.label)));
         table->setItem(n, 1, new QTableWidgetItem(QString::fromUtf8(h.description)));
@@ -618,6 +618,9 @@ ToolDialog* build_hotkeys() {
     }
     table->resizeColumnToContents(0);
     root->addWidget(table);
+    if (!hotkeys_tas_mode()) {
+        root->addWidget(text_label(QStringLiteral("Savestate and movie keys (F5-F10, P, N, Tab, Ctrl+S) work in TAS mode: File > Restart in TAS Mode.")));
+    }
     root->addWidget(button_box(d, QString(), nullptr));
     d->resize(440, 520);
     return d;

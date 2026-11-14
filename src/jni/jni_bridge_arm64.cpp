@@ -23,6 +23,7 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include "platform/io_thread.h"
 #include "platform/data_path.h"
 #include "platform/guest_libc64.h"
+#include "tas/tas.h"
 #include "android/asset_manager.h"
 #include "platform/video_background.h"
 #include "platform/pvrtc_decoder.h"
@@ -268,6 +269,7 @@ static std::mutex g_heap_mutex;
 
 // Wall-clock milliseconds (steady clock) — used by the time-based deferred-free drain.
 static uint64_t now_ms() {
+    if (tas::enabled()) return (uint64_t)(tas::time_seconds() * 1000.0);  // frame-driven, deterministic
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
@@ -3206,12 +3208,22 @@ static void bridge_setlocale(void* emu_ptr) {
 
 static void bridge_rand(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    if (tas::enabled()) { emu->set_reg(0, tas::next_rand() & 0x7fffffff); return; }
     emu->set_reg(0, rand());
 }
 
 static void bridge_clock(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    // Android: CLOCKS_PER_SEC is 1000000.
+    if (tas::enabled()) { emu->set_reg(0, (uint64_t)(tas::time_seconds() * 1000000.0)); return; }
     emu->set_reg(0, (uint64_t)clock());
+}
+
+// Wall-clock seconds as the guest should see them: real time, or in TAS mode
+// the virtual clock that only moves with the frame counter.
+static time_t guest_wall_time() {
+    if (tas::enabled()) return (time_t)(tas::realtime_ns() / 1000000000ull);
+    return time(nullptr);
 }
 
 static void bridge_strtold(void* emu_ptr) {
@@ -4884,7 +4896,7 @@ static void bridge_localtime(void* emu_ptr) {
     uint32_t timer_ptr = emu->get_reg(0);
     time_t timer;
     if (timer_ptr) timer = (time_t)*(uint64_t*)(memory + timer_ptr); // ARM64: time_t is 64-bit
-    else timer = time(NULL);
+    else timer = guest_wall_time();
     
     struct tm* t = localtime(&timer);
     // Use a fixed area in guest memory to return the struct tm
@@ -4913,7 +4925,7 @@ static void bridge_localtime_r(void* emu_ptr) {
     
     time_t timer;
     if (timer_ptr) timer = (time_t)*(int64_t*)(memory + timer_ptr);
-    else timer = time(NULL);
+    else timer = guest_wall_time();
     
     struct tm t;
     localtime_r(&timer, &t);
@@ -4946,6 +4958,7 @@ static void bridge_localtime_r(void* emu_ptr) {
 
 static void bridge_lrand48(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    if (tas::enabled()) { emu->set_reg(0, tas::next_rand() & 0x7fffffff); return; }
     long int res = lrand48();
     emu->set_reg(0, (uint32_t)res);
 }
@@ -5152,6 +5165,157 @@ static void bridge_android_log_print(void* emu_ptr) {
 static ALCdevice* g_alc_device = nullptr;
 static ALCcontext* g_alc_context = nullptr;
 
+// ============================================================================
+// TAS: deterministic OpenAL. In TAS mode the guest gets virtual source and
+// buffer names and a playback model that advances with the frame counter, so
+// its state queries (AL_SOURCE_STATE, AL_BUFFERS_PROCESSED, offsets) do not
+// depend on the host mixer. The host objects behind the names are created on
+// demand and survive savestates; the model itself is part of the state.
+// ============================================================================
+namespace {
+struct TasAlBuffer {
+    double seconds = 0.0;
+    uint32_t freq = 44100;
+    uint32_t bytes_per_sample = 2;
+};
+struct TasAlSource {
+    uint32_t state = AL_INITIAL;
+    uint64_t start_frame = 0;   // frame of the last play or resume
+    double offset = 0.0;        // seconds into the sound at start_frame
+    bool looping = false;
+    uint32_t buffer = 0;
+    std::vector<uint32_t> queue;  // streaming: queued virtual buffers, oldest first
+};
+std::unordered_map<uint32_t, TasAlBuffer> g_tas_al_buffers;
+std::unordered_map<uint32_t, TasAlSource> g_tas_al_sources;
+uint32_t g_tas_al_next_name = 1;
+std::unordered_map<uint32_t, ALuint> g_tas_al_host_src;  // virtual -> host, host side only
+std::unordered_map<uint32_t, ALuint> g_tas_al_host_buf;
+const bool g_tas_al_trace = getenv("RICASSO_TAS_TRACE_AL") != nullptr;
+
+ALuint tas_al_src(uint32_t v) {
+    if (!tas::enabled() || v == 0) return v;
+    auto it = g_tas_al_host_src.find(v);
+    if (it != g_tas_al_host_src.end()) return it->second;
+    ALuint h = 0;
+    alGenSources(1, &h);
+    g_tas_al_host_src[v] = h;
+    return h;
+}
+
+ALuint tas_al_buf(uint32_t v) {
+    if (!tas::enabled() || v == 0) return v;
+    auto it = g_tas_al_host_buf.find(v);
+    if (it != g_tas_al_host_buf.end()) return it->second;
+    ALuint h = 0;
+    alGenBuffers(1, &h);
+    g_tas_al_host_buf[v] = h;
+    return h;
+}
+
+double tas_al_length(const TasAlSource& s) {
+    double total = 0.0;
+    if (!s.queue.empty()) {
+        for (uint32_t b : s.queue) total += g_tas_al_buffers[b].seconds;
+    } else {
+        total = g_tas_al_buffers[s.buffer].seconds;
+    }
+    return total;
+}
+
+double tas_al_elapsed(const TasAlSource& s) {
+    if (s.state != AL_PLAYING) return s.offset;
+    return s.offset + (double)(tas::frame() - s.start_frame) / 60.0;
+}
+
+// A playing, non-looping source stops once its sound is over.
+void tas_al_settle(TasAlSource& s) {
+    if (s.state != AL_PLAYING || s.looping) return;
+    const double len = tas_al_length(s);
+    if (len <= 0.0 || tas_al_elapsed(s) >= len) {
+        s.state = AL_STOPPED;
+        s.offset = 0.0;
+    }
+}
+
+uint32_t tas_al_processed(const TasAlSource& s) {
+    double t = tas_al_elapsed(s), acc = 0.0;
+    uint32_t n = 0;
+    for (uint32_t b : s.queue) {
+        acc += g_tas_al_buffers[b].seconds;
+        if (acc <= t) n++;
+        else break;
+    }
+    return n;
+}
+
+void tas_al_log(const char* what, uint32_t v, uint32_t a = 0, uint32_t b = 0) {
+    if (g_tas_al_trace)
+        std::cout << "[TAS/al] frame " << tas::frame() << " " << what << "(" << v << ", " << a << ") -> " << b
+                  << std::endl;
+}
+}  // namespace
+
+// TAS: OpenGL object names handed to the guest come from this counter instead
+// of the driver, so a replay stores the same numbers in guest memory. The
+// compatibility context creates the object on first bind. Host-side code keeps
+// using driver names, which stay far below this range.
+static uint32_t g_tas_gl_next_name = 0x100000;
+
+static void tas_al_state_save(tas::Writer& w) {
+    w.u32(g_tas_gl_next_name);
+    w.u32(g_tas_al_next_name);
+    w.u32((uint32_t)g_tas_al_buffers.size());
+    for (const auto& kv : g_tas_al_buffers) {
+        w.u32(kv.first);
+        w.u64((uint64_t)(kv.second.seconds * 1e9));
+        w.u32(kv.second.freq);
+        w.u32(kv.second.bytes_per_sample);
+    }
+    w.u32((uint32_t)g_tas_al_sources.size());
+    for (const auto& kv : g_tas_al_sources) {
+        const TasAlSource& src = kv.second;
+        w.u32(kv.first);
+        w.u32(src.state);
+        w.u64(src.start_frame);
+        w.u64((uint64_t)(src.offset * 1e9));
+        w.u8(src.looping ? 1 : 0);
+        w.u32(src.buffer);
+        w.u32((uint32_t)src.queue.size());
+        for (uint32_t b : src.queue) w.u32(b);
+    }
+}
+
+static void tas_al_state_load(tas::Reader& r) {
+    g_tas_gl_next_name = r.u32();
+    g_tas_al_next_name = r.u32();
+    uint32_t n = r.u32();
+    g_tas_al_buffers.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) {
+        const uint32_t name = r.u32();
+        TasAlBuffer b;
+        b.seconds = (double)r.u64() / 1e9;
+        b.freq = r.u32();
+        b.bytes_per_sample = r.u32();
+        g_tas_al_buffers[name] = b;
+    }
+    n = r.u32();
+    g_tas_al_sources.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) {
+        const uint32_t name = r.u32();
+        TasAlSource src;
+        src.state = r.u32();
+        src.start_frame = r.u64();
+        src.offset = (double)r.u64() / 1e9;
+        src.looping = r.u8() != 0;
+        src.buffer = r.u32();
+        const uint32_t q = r.u32();
+        for (uint32_t k = 0; k < q && r.ok; k++) src.queue.push_back(r.u32());
+        g_tas_al_sources[name] = src;
+    }
+    // The host mixer keeps playing whatever it played; sounds are not rewound.
+}
+
 static void bridge_alcOpenDevice(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     g_alc_device = alcOpenDevice(nullptr);
@@ -5172,6 +5336,7 @@ static void bridge_alcMakeContextCurrent(void* emu_ptr) {
 
 static void bridge_alGetError(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    if (tas::enabled()) { alGetError(); emu->set_reg(0, AL_NO_ERROR); return; }
     emu->set_reg(0, alGetError());
 }
 
@@ -5219,7 +5384,16 @@ static void bridge_alGenSources(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     uint32_t n = emu->get_reg(0);
     uint32_t sources_ptr = emu->get_reg(1);
-    
+    if (tas::enabled()) {
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t v = g_tas_al_next_name++;
+            g_tas_al_sources[v] = TasAlSource();
+            *(uint32_t*)(memory + sources_ptr + i * 4) = v;
+            tas_al_log("alGenSources", v);
+        }
+        return;
+    }
+
     std::vector<ALuint> host_sources(n);
     alGenSources(n, host_sources.data());
     for (uint32_t i = 0; i < n; i++) {
@@ -5233,7 +5407,15 @@ static void bridge_alGenBuffers(void* emu_ptr) {
     uint8_t* memory = emu->get_memory_base();
     uint32_t n = emu->get_reg(0);
     uint32_t buffers_ptr = emu->get_reg(1);
-    
+    if (tas::enabled()) {
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t v = g_tas_al_next_name++;
+            g_tas_al_buffers[v] = TasAlBuffer();
+            *(uint32_t*)(memory + buffers_ptr + i * 4) = v;
+        }
+        return;
+    }
+
     std::vector<ALuint> host_buffers(n);
     alGenBuffers(n, host_buffers.data());
     for (uint32_t i = 0; i < n; i++) {
@@ -5245,19 +5427,39 @@ static void bridge_alGenBuffers(void* emu_ptr) {
 static void bridge_alSourcePlay(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t source = emu->get_reg(0);
-    alSourcePlay(source);
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        if (s.state != AL_PAUSED) s.offset = 0.0;  // play restarts, resume continues
+        s.state = AL_PLAYING;
+        s.start_frame = tas::frame();
+        tas_al_log("alSourcePlay", source, s.buffer);
+    }
+    alSourcePlay(tas_al_src(source));
 }
 
 static void bridge_alSourceStop(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t source = emu->get_reg(0);
-    alSourceStop(source);
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        s.state = AL_STOPPED;
+        s.offset = 0.0;
+        tas_al_log("alSourceStop", source);
+    }
+    alSourceStop(tas_al_src(source));
 }
 
 static void bridge_alSourcePause(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t source = emu->get_reg(0);
-    alSourcePause(source);
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        if (s.state == AL_PLAYING) {
+            s.offset = tas_al_elapsed(s);
+            s.state = AL_PAUSED;
+        }
+    }
+    alSourcePause(tas_al_src(source));
 }
 
 static void bridge_alSourcei(void* emu_ptr) {
@@ -5265,6 +5467,18 @@ static void bridge_alSourcei(void* emu_ptr) {
     uint32_t source = emu->get_reg(0);
     uint32_t param = emu->get_reg(1);
     uint32_t value = emu->get_reg(2);
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        if (param == AL_BUFFER) {
+            s.buffer = value;
+            s.queue.clear();
+            alSourcei(tas_al_src(source), AL_BUFFER, tas_al_buf(value));
+            return;
+        }
+        if (param == AL_LOOPING) s.looping = value != 0;
+        alSourcei(tas_al_src(source), param, value);
+        return;
+    }
     alSourcei(source, param, value);
 }
 
@@ -5274,7 +5488,7 @@ static void bridge_alSourcef(void* emu_ptr) {
     uint32_t param = (uint32_t)emu->get_reg(1);
     // ARM64 AAPCS64: float arg in S0 (independent of integer regs)
     float val_f = emu->get_sreg(0);
-    alSourcef(source, param, val_f);
+    alSourcef(tas_al_src(source), param, val_f);
 }
 
 static void bridge_alSource3f(void* emu_ptr) {
@@ -5285,7 +5499,7 @@ static void bridge_alSource3f(void* emu_ptr) {
     float v1 = emu->get_sreg(0);
     float v2 = emu->get_sreg(1);
     float v3 = emu->get_sreg(2);
-    alSource3f(source, param, v1, v2, v3);
+    alSource3f(tas_al_src(source), param, v1, v2, v3);
 }
 
 static void bridge_alBufferData(void* emu_ptr) {
@@ -5297,7 +5511,15 @@ static void bridge_alBufferData(void* emu_ptr) {
     uint32_t size = (uint32_t)emu->get_reg(3);
     // ARM64: 5th arg in X4 (8 integer regs available)
     uint32_t freq = (uint32_t)emu->get_reg(4);
-    
+    if (tas::enabled()) {
+        TasAlBuffer& b = g_tas_al_buffers[buffer];
+        b.bytes_per_sample = (format == AL_FORMAT_MONO8) ? 1 : (format == AL_FORMAT_STEREO16) ? 4 : 2;
+        b.freq = freq ? freq : 44100;
+        b.seconds = (double)size / ((double)b.bytes_per_sample * (double)b.freq);
+        alBufferData(tas_al_buf(buffer), format, memory + data_ptr, size, freq);
+        return;
+    }
+
     alBufferData(buffer, format, memory + data_ptr, size, freq);
 }
 
@@ -5310,6 +5532,15 @@ static void bridge_alSourceQueueBuffers(void* emu_ptr) {
     
     std::vector<ALuint> host_buffers(nb);
     std::memcpy(host_buffers.data(), memory + buffers_ptr, nb * sizeof(ALuint));
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        for (ALuint& b : host_buffers) {
+            s.queue.push_back(b);
+            b = tas_al_buf(b);
+        }
+        alSourceQueueBuffers(tas_al_src(source), nb, host_buffers.data());
+        return;
+    }
     alSourceQueueBuffers(source, nb, host_buffers.data());
 }
 
@@ -5321,6 +5552,28 @@ static void bridge_alSourceUnqueueBuffers(void* emu_ptr) {
     uint32_t buffers_ptr = emu->get_reg(2);
     
     std::vector<ALuint> host_buffers(nb);
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        tas_al_settle(s);
+        uint32_t processed = tas_al_processed(s);
+        if (processed > nb) processed = nb;
+        for (uint32_t i = 0; i < processed; i++) {
+            const uint32_t b = s.queue.front();
+            s.queue.erase(s.queue.begin());
+            s.offset -= g_tas_al_buffers[b].seconds;  // elapsed time now counts from the next buffer
+            *(uint32_t*)(memory + buffers_ptr + i * 4) = b;
+        }
+        for (uint32_t i = processed; i < nb; i++) *(uint32_t*)(memory + buffers_ptr + i * 4) = 0;
+        // Keep the host queue short as well; its result does not matter.
+        ALint host_done = 0;
+        const ALuint hs = tas_al_src(source);
+        alGetSourcei(hs, AL_BUFFERS_PROCESSED, &host_done);
+        if (host_done > 0) {
+            std::vector<ALuint> tmp((size_t)host_done);
+            alSourceUnqueueBuffers(hs, host_done, tmp.data());
+        }
+        return;
+    }
     alSourceUnqueueBuffers(source, nb, host_buffers.data());
     std::memcpy(memory + buffers_ptr, host_buffers.data(), nb * sizeof(ALuint));
 }
@@ -5333,6 +5586,22 @@ static void bridge_alGetSourcei(void* emu_ptr) {
     uint32_t value_ptr = emu->get_reg(2);
     
     ALint host_val = 0;
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        tas_al_settle(s);
+        switch (param) {
+            case AL_SOURCE_STATE:      host_val = (ALint)s.state; break;
+            case AL_BUFFERS_QUEUED:    host_val = (ALint)s.queue.size(); break;
+            case AL_BUFFERS_PROCESSED: host_val = (ALint)tas_al_processed(s); break;
+            case AL_LOOPING:           host_val = s.looping ? AL_TRUE : AL_FALSE; break;
+            case AL_BUFFER:            host_val = (ALint)s.buffer; break;
+            case AL_SOURCE_TYPE:       host_val = !s.queue.empty() ? AL_STREAMING : (s.buffer ? AL_STATIC : AL_UNDETERMINED); break;
+            default:                   alGetSourcei(tas_al_src(source), param, &host_val); break;
+        }
+        tas_al_log("alGetSourcei", source, param, (uint32_t)host_val);
+        *(ALint*)(memory + value_ptr) = host_val;
+        return;
+    }
     alGetSourcei(source, param, &host_val);
     *(ALint*)(memory + value_ptr) = host_val;
 }
@@ -5345,6 +5614,17 @@ static void bridge_alDeleteSources(void* emu_ptr) {
     
     std::vector<ALuint> host_sources(n);
     std::memcpy(host_sources.data(), memory + sources_ptr, n * sizeof(ALuint));
+    if (tas::enabled()) {
+        for (ALuint& v : host_sources) {
+            g_tas_al_sources.erase(v);
+            auto it = g_tas_al_host_src.find(v);
+            if (it == g_tas_al_host_src.end()) { v = 0; continue; }
+            v = it->second;
+            g_tas_al_host_src.erase(it);
+        }
+        alDeleteSources(n, host_sources.data());
+        return;
+    }
     for (uint32_t i = 0; i < n; i++) {
         RedstellGC::instance().track_al_delete_source(host_sources[i]);
     }
@@ -5359,6 +5639,17 @@ static void bridge_alDeleteBuffers(void* emu_ptr) {
     
     std::vector<ALuint> host_buffers(n);
     std::memcpy(host_buffers.data(), memory + buffers_ptr, n * sizeof(ALuint));
+    if (tas::enabled()) {
+        for (ALuint& v : host_buffers) {
+            g_tas_al_buffers.erase(v);
+            auto it = g_tas_al_host_buf.find(v);
+            if (it == g_tas_al_host_buf.end()) { v = 0; continue; }
+            v = it->second;
+            g_tas_al_host_buf.erase(it);
+        }
+        alDeleteBuffers(n, host_buffers.data());
+        return;
+    }
     for (uint32_t i = 0; i < n; i++) {
         RedstellGC::instance().track_al_delete_buffer(host_buffers[i]);
     }
@@ -5398,6 +5689,23 @@ static void bridge_alGetSourcef(void* emu_ptr) {
     uint32_t param = emu->get_reg(1);
     uint32_t value_ptr = emu->get_reg(2);
     ALfloat val = 0.0f;
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        tas_al_settle(s);
+        if (param == AL_SEC_OFFSET || param == AL_SAMPLE_OFFSET || param == AL_BYTE_OFFSET) {
+            double t = tas_al_elapsed(s);
+            const double len = tas_al_length(s);
+            if (s.looping && len > 0.0) t = std::fmod(t, len);
+            const TasAlBuffer& b = g_tas_al_buffers[s.queue.empty() ? s.buffer : s.queue.front()];
+            if (param == AL_SEC_OFFSET) val = (float)t;
+            else if (param == AL_SAMPLE_OFFSET) val = (float)(t * b.freq);
+            else val = (float)(t * b.freq * b.bytes_per_sample);
+        } else {
+            alGetSourcef(tas_al_src(source), param, &val);
+        }
+        if (value_ptr) *(float*)(memory + value_ptr) = val;
+        return;
+    }
     alGetSourcef(source, param, &val);
     if (value_ptr) *(float*)(memory + value_ptr) = val;
 }
@@ -5417,7 +5725,12 @@ static void bridge_alListenerfv(void* emu_ptr) {
 static void bridge_alSourceRewind(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t source = emu->get_reg(0);
-    alSourceRewind(source);
+    if (tas::enabled()) {
+        TasAlSource& s = g_tas_al_sources[source];
+        s.state = AL_INITIAL;
+        s.offset = 0.0;
+    }
+    alSourceRewind(tas_al_src(source));
 }
 
 static void bridge_alcGetCurrentContext(void* emu_ptr) {
@@ -7609,6 +7922,241 @@ static void bridge_gl_disable_client_state(void* emu_ptr) {
     ffp_publish_arrays(emu);
 }
 
+// --- TAS: the guest's textures as part of a savestate ---
+//
+// A savestate rewinds guest memory, which holds texture names, so the GL
+// objects behind those names have to go back as well: a texture the game has
+// deleted since must exist again, and a name the game has reused must show its
+// old image. Every upload is therefore kept here, with the pixels shared
+// between states, and loading a state rebuilds the textures that differ.
+namespace {
+struct TasTexOp {
+    enum Kind : uint32_t { kImage, kSubImage, kParamI, kParamF };
+    // kImage:     target, level, internalformat, width, height, format, type, unpack alignment
+    // kSubImage:  target, level, x, y, width, height, format, type, unpack alignment
+    // kParamI/F:  target, pname, value (a float as its bits)
+    uint32_t kind = kImage;
+    uint32_t a[9] = {0};
+    tas::Blob pixels;  // empty: storage without data
+    bool operator==(const TasTexOp& o) const {
+        return kind == o.kind && memcmp(a, o.a, sizeof a) == 0 && pixels == o.pixels;
+    }
+};
+using TasTexture = std::vector<TasTexOp>;  // the calls that rebuild the texture, in order
+
+constexpr uint32_t kTasTexUnits = 8;
+std::map<uint32_t, TasTexture> g_tas_textures;  // by guest texture name
+uint32_t g_tas_tex_bound[kTasTexUnits] = {0};   // GL_TEXTURE_2D binding of each unit, as the guest set it
+uint32_t g_tas_tex_unit = 0;                    // glActiveTexture, as the guest set it
+uint32_t g_tas_unpack_alignment = 4;
+const bool g_tas_gl_trace = getenv("RICASSO_TAS_TRACE_GL") != nullptr;
+
+// Bytes the GL reads from client memory for an image.
+size_t tas_tex_data_size(uint32_t w, uint32_t h, uint32_t format, uint32_t type, uint32_t align) {
+    if (w == 0 || h == 0 || w > 16384 || h > 16384) return 0;
+    size_t bpp = 4;
+    if (type == GL_UNSIGNED_SHORT_5_6_5 || type == GL_UNSIGNED_SHORT_4_4_4_4 || type == GL_UNSIGNED_SHORT_5_5_5_1) {
+        bpp = 2;
+    } else if (format == GL_ALPHA || format == GL_LUMINANCE) {
+        bpp = 1;
+    } else if (format == GL_LUMINANCE_ALPHA) {
+        bpp = 2;
+    } else if (format == GL_RGB) {
+        bpp = 3;
+    }
+    if (align == 0) align = 1;
+    const size_t row = (size_t)w * bpp;
+    const size_t stride = (row + align - 1) / align * align;
+    return stride * (h - 1) + row;
+}
+
+tas::Blob tas_tex_copy(const void* pixels, size_t size) {
+    if (!pixels || size == 0) return nullptr;
+    const uint8_t* p = (const uint8_t*)pixels;
+    return std::make_shared<const std::vector<uint8_t>>(p, p + size);
+}
+
+// The texture the guest's next upload goes to.
+TasTexture* tas_tex_current(uint32_t target) {
+    if (!tas::enabled() || target != GL_TEXTURE_2D) return nullptr;
+    const uint32_t name = g_tas_tex_bound[g_tas_tex_unit];
+    return name ? &g_tas_textures[name] : nullptr;
+}
+
+void tas_tex_note_bind(uint32_t target, uint32_t name) {
+    if (tas::enabled() && target == GL_TEXTURE_2D) g_tas_tex_bound[g_tas_tex_unit] = name;
+}
+
+void tas_tex_note_image(uint32_t target, uint32_t level, uint32_t internalformat, uint32_t w, uint32_t h,
+                        uint32_t format, uint32_t type, const void* pixels) {
+    TasTexture* tex = tas_tex_current(target);
+    if (!tex) return;
+    // A new image replaces whatever that level held.
+    tex->erase(std::remove_if(tex->begin(), tex->end(),
+                              [level](const TasTexOp& op) {
+                                  return (op.kind == TasTexOp::kImage || op.kind == TasTexOp::kSubImage) &&
+                                         op.a[1] == level;
+                              }),
+               tex->end());
+    TasTexOp op;
+    op.kind = TasTexOp::kImage;
+    const uint32_t a[9] = {target, level, internalformat, w, h, format, type, g_tas_unpack_alignment, 0};
+    memcpy(op.a, a, sizeof a);
+    op.pixels = tas_tex_copy(pixels, tas_tex_data_size(w, h, format, type, g_tas_unpack_alignment));
+    tex->push_back(std::move(op));
+    if (g_tas_gl_trace)
+        std::cout << "[TAS/gl] frame " << tas::frame() << " image tex " << g_tas_tex_bound[g_tas_tex_unit] << " level "
+                  << level << " " << w << "x" << h << " fmt 0x" << std::hex << format << " type 0x" << type << std::dec
+                  << (pixels ? "" : " (no data)") << std::endl;
+}
+
+void tas_tex_note_sub_image(uint32_t target, uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                            uint32_t format, uint32_t type, const void* pixels) {
+    TasTexture* tex = tas_tex_current(target);
+    if (!tex || !pixels) return;
+    // Kept as a call of its own until the level gets a new image. Swordigo
+    // 1.4.13 uploads whole images only, so these do not pile up.
+    TasTexOp op;
+    op.kind = TasTexOp::kSubImage;
+    const uint32_t a[9] = {target, level, x, y, w, h, format, type, g_tas_unpack_alignment};
+    memcpy(op.a, a, sizeof a);
+    op.pixels = tas_tex_copy(pixels, tas_tex_data_size(w, h, format, type, g_tas_unpack_alignment));
+    tex->push_back(std::move(op));
+    if (g_tas_gl_trace)
+        std::cout << "[TAS/gl] frame " << tas::frame() << " sub image tex " << g_tas_tex_bound[g_tas_tex_unit]
+                  << " level " << level << " " << w << "x" << h << " at " << x << "," << y << " ("
+                  << tex->size() << " ops)" << std::endl;
+}
+
+void tas_tex_note_param(uint32_t target, uint32_t pname, TasTexOp::Kind kind, uint32_t bits) {
+    TasTexture* tex = tas_tex_current(target);
+    if (!tex) return;
+    tex->erase(std::remove_if(tex->begin(), tex->end(),
+                              [pname](const TasTexOp& op) {
+                                  return (op.kind == TasTexOp::kParamI || op.kind == TasTexOp::kParamF) &&
+                                         op.a[1] == pname;
+                              }),
+               tex->end());
+    TasTexOp op;
+    op.kind = kind;
+    op.a[0] = target;
+    op.a[1] = pname;
+    op.a[2] = bits;
+    tex->push_back(std::move(op));
+}
+
+void tas_tex_note_delete(uint32_t name) {
+    if (!tas::enabled() || name == 0) return;
+    g_tas_textures.erase(name);
+    for (uint32_t& bound : g_tas_tex_bound)
+        if (bound == name) bound = 0;  // what the GL does with a deleted texture
+}
+
+void tas_tex_apply(const TasTexOp& op) {
+    const uint32_t* a = op.a;
+    const void* pixels = op.pixels ? op.pixels->data() : nullptr;
+    switch (op.kind) {
+        case TasTexOp::kImage:
+            glPixelStorei(GL_UNPACK_ALIGNMENT, (GLint)a[7]);
+            glTexImage2D(a[0], (GLint)a[1], (GLint)a[2], (GLsizei)a[3], (GLsizei)a[4], 0, a[5], a[6], pixels);
+            break;
+        case TasTexOp::kSubImage:
+            glPixelStorei(GL_UNPACK_ALIGNMENT, (GLint)a[8]);
+            glTexSubImage2D(a[0], (GLint)a[1], (GLint)a[2], (GLint)a[3], (GLsizei)a[4], (GLsizei)a[5], a[6], a[7],
+                            pixels);
+            break;
+        case TasTexOp::kParamI:
+            glTexParameteri(a[0], a[1], (GLint)a[2]);
+            break;
+        case TasTexOp::kParamF: {
+            float value;
+            memcpy(&value, &a[2], sizeof value);
+            glTexParameterf(a[0], a[1], value);
+            break;
+        }
+    }
+}
+}  // namespace
+
+static void tas_gl_state_save(tas::Writer& w) {
+    w.u32(g_tas_tex_unit);
+    for (uint32_t bound : g_tas_tex_bound) w.u32(bound);
+    w.u32(g_tas_unpack_alignment);
+    w.u32((uint32_t)g_tas_textures.size());
+    for (const auto& kv : g_tas_textures) {
+        w.u32(kv.first);
+        w.u32((uint32_t)kv.second.size());
+        for (const TasTexOp& op : kv.second) {
+            w.u32(op.kind);
+            for (uint32_t v : op.a) w.u32(v);
+            w.blob(op.pixels);
+        }
+    }
+}
+
+static bool tas_gl_state_load(tas::Reader& r) {
+    const uint32_t unit = r.u32();
+    uint32_t bound[kTasTexUnits];
+    for (uint32_t& b : bound) b = r.u32();
+    const uint32_t alignment = r.u32();
+    std::map<uint32_t, TasTexture> want;
+    const uint32_t count = r.u32();
+    for (uint32_t i = 0; i < count && r.ok; i++) {
+        TasTexture& tex = want[r.u32()];
+        const uint32_t ops = r.u32();
+        for (uint32_t k = 0; k < ops && r.ok; k++) {
+            TasTexOp op;
+            op.kind = r.u32();
+            for (uint32_t& v : op.a) v = r.u32();
+            op.pixels = r.blob();
+            tex.push_back(std::move(op));
+        }
+    }
+    if (!r.ok || unit >= kTasTexUnits) return false;
+
+    bool gl = g_display_active;
+#ifdef VULKAN_BACKEND
+    if (g_graphics_api == GraphicsAPI::VULKAN) gl = false;
+#endif
+    if (gl) {
+        size_t deleted = 0, rebuilt = 0;
+        glActiveTexture(GL_TEXTURE0);
+        for (const auto& kv : g_tas_textures) {
+            if (want.count(kv.first)) continue;
+            const GLuint name = kv.first;
+            glDeleteTextures(1, &name);
+            deleted++;
+        }
+        for (const auto& kv : want) {
+            const auto have = g_tas_textures.find(kv.first);
+            if (have != g_tas_textures.end() && have->second == kv.second) continue;
+            const GLuint name = kv.first;
+            if (have != g_tas_textures.end()) glDeleteTextures(1, &name);  // rebuild on a fresh object
+            glBindTexture(GL_TEXTURE_2D, name);
+            for (const TasTexOp& op : kv.second) tas_tex_apply(op);
+            rebuilt++;
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, (GLint)alignment);
+        for (uint32_t i = 0; i < kTasTexUnits; i++) {
+            if (i != 0 && bound[i] == 0 && g_tas_tex_bound[i] == 0) continue;  // a unit the game does not use
+            glActiveTexture(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, bound[i]);
+        }
+        glActiveTexture(GL_TEXTURE0 + unit);
+        if (deleted || rebuilt)
+            std::cout << "[TAS] textures: " << rebuilt << " rebuilt, " << deleted << " deleted, " << want.size()
+                      << " in the state" << std::endl;
+    }
+    g_tas_textures = std::move(want);
+    memcpy(g_tas_tex_bound, bound, sizeof bound);
+    g_tas_tex_unit = unit;
+    g_tas_unpack_alignment = alignment;
+    ffp::note_active_texture(GL_TEXTURE0 + unit);
+    g_frame_stats.last_bound_texture = bound[unit];
+    g_current_batch_state.texture_id = bound[unit];
+    return true;
+}
+
 // --- Phase 4: Textures ---
 
 static std::unordered_map<uint32_t, bool> g_seen_textures;
@@ -7619,6 +8167,7 @@ static void bridge_gl_bind_texture(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint32_t target = emu->get_reg(0);
     uint32_t tex_id = emu->get_reg(1);
+    tas_tex_note_bind(target, tex_id);
     tex_id = RedstellGC::instance().get_redirected_texture(tex_id);
     g_frame_stats.texture_binds++;
     g_frame_stats.last_bound_texture = tex_id;
@@ -7811,6 +8360,7 @@ static void bridge_gl_tex_image_2d(void* emu_ptr) {
     if (g_display_active) {
         const void* pixels = pixels_ptr ? (const void*)(memory + pixels_ptr) : nullptr;
         glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+        tas_tex_note_image(target, level, internalformat, width, height, format, type, pixels);
         
         size_t bpp = (format == GL_RGB) ? 3 : ((format == GL_ALPHA) ? 1 : 4);
         RedstellGC::instance().track_gl_tex_image(
@@ -7886,6 +8436,7 @@ static void bridge_gl_tex_sub_image_2d(void* emu_ptr) {
     if (g_display_active) {
         const void* pixels = pixels_ptr ? (const void*)(memory + pixels_ptr) : nullptr;
         glTexSubImage2D(target, level, xoff, yoff, width, height, format, type, pixels);
+        tas_tex_note_sub_image(target, level, xoff, yoff, width, height, format, type, pixels);
     }
 }
 
@@ -8013,6 +8564,7 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
 #endif
         if (g_display_active) {
             glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            tas_tex_note_image(target, level, GL_RGBA, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         }
         
         RedstellGC::instance().track_gl_tex_image(
@@ -8053,6 +8605,7 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
 #endif
         if (g_display_active) {
             glTexImage2D(target, level, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            tas_tex_note_image(target, level, GL_RGBA, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         }
         
         RedstellGC::instance().track_gl_tex_image(
@@ -8301,6 +8854,8 @@ static void bridge_gl_tex_parameteri(void* emu_ptr) {
 #endif
     if (g_display_active) {
         glTexParameteri(emu->get_reg(0), emu->get_reg(1), emu->get_reg(2));
+        tas_tex_note_param((uint32_t)emu->get_reg(0), (uint32_t)emu->get_reg(1), TasTexOp::kParamI,
+                           (uint32_t)emu->get_reg(2));
     }
 }
 
@@ -8317,6 +8872,9 @@ static void bridge_gl_tex_parameterf(void* emu_ptr) {
 #endif
     if (g_display_active) {
         glTexParameterf(emu->get_reg(0), emu->get_reg(1), val);
+        uint32_t bits;
+        memcpy(&bits, &val, sizeof bits);
+        tas_tex_note_param((uint32_t)emu->get_reg(0), (uint32_t)emu->get_reg(1), TasTexOp::kParamF, bits);
     }
 }
 
@@ -8517,6 +9075,7 @@ static void bridge_gl_pixel_storei(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glPixelStorei(emu->get_reg(0), emu->get_reg(1));
+    if (emu->get_reg(0) == GL_UNPACK_ALIGNMENT) g_tas_unpack_alignment = (uint32_t)emu->get_reg(1);
 }
 
 // Player position guest addresses for GLES2 lighting (defined in main.cpp)
@@ -9092,6 +9651,7 @@ static void bridge_gl_active_texture(void* emu_ptr) {
 #endif
     if (g_display_active) glActiveTexture(emu->get_reg(0));
     ffp::note_active_texture((GLenum)emu->get_reg(0));
+    if (emu->get_reg(0) - GL_TEXTURE0 < kTasTexUnits) g_tas_tex_unit = (uint32_t)(emu->get_reg(0) - GL_TEXTURE0);
 }
 
 static void bridge_gl_client_active_texture(void* emu_ptr) {
@@ -9167,7 +9727,11 @@ static void bridge_glGenTextures(void* emu_ptr) {
         // Generate real GL texture IDs
         GLuint textures[64];
         if (n > 64) n = 64;
-        glGenTextures(n, textures);
+        if (tas::enabled()) {
+            for (uint32_t i = 0; i < n; i++) textures[i] = g_tas_gl_next_name++;
+        } else {
+            glGenTextures(n, textures);
+        }
         for (uint32_t i = 0; i < n; i++) {
             *(uint32_t*)(memory + textures_ptr + i * 4) = textures[i];
             GL_DIAG("  -> id[%d] = %d", i, textures[i]);
@@ -9193,7 +9757,12 @@ static void bridge_glGenBuffers(void* emu_ptr) {
     if (g_display_active) {
         GLuint buffers[64];
         if (n > 64) n = 64;
-        glGenBuffers(n, buffers);
+        if (tas::enabled()) {
+            for (uint32_t i = 0; i < n; i++) buffers[i] = g_tas_gl_next_name++;
+            if (g_tas_gl_trace) std::cout << "[TAS/gl] frame " << tas::frame() << " glGenBuffers(" << n << ")" << std::endl;
+        } else {
+            glGenBuffers(n, buffers);
+        }
         for (uint32_t i = 0; i < n; i++) {
             *(uint32_t*)(memory + buffers_ptr + i * 4) = buffers[i];
         }
@@ -9272,6 +9841,7 @@ static void bridge_gl_delete_textures(void* emu_ptr) {
     for (uint32_t i = 0; i < n; i++) {
         uint32_t tid = *(uint32_t*)(memory + textures_ptr + i * 4);
         RedstellGC::instance().track_gl_delete_texture(tid);
+        tas_tex_note_delete(tid);
     }
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
@@ -9351,7 +9921,11 @@ static void bridge_gl_gen_framebuffers(void* emu_ptr) {
     if (!g_display_active || n <= 0 || n > 16) return;
     
     GLuint host_ids[16];
-    glGenFramebuffers(n, host_ids);
+    if (tas::enabled()) {
+        for (int i = 0; i < n; i++) host_ids[i] = g_tas_gl_next_name++;
+    } else {
+        glGenFramebuffers(n, host_ids);
+    }
     
     // Write IDs back to guest memory
     uint32_t* guest_ids = (uint32_t*)(memory + ids_ptr);
@@ -9421,7 +9995,11 @@ static void bridge_gl_gen_renderbuffers(void* emu_ptr) {
     uint32_t ids_ptr = (uint32_t)emu->get_reg(1);
     if (!g_display_active || n <= 0 || n > 16) return;
     GLuint host_ids[16];
-    glGenRenderbuffers(n, host_ids);
+    if (tas::enabled()) {
+        for (int i = 0; i < n; i++) host_ids[i] = g_tas_gl_next_name++;
+    } else {
+        glGenRenderbuffers(n, host_ids);
+    }
     uint32_t* guest_ids = (uint32_t*)(memory + ids_ptr);
     for (int i = 0; i < n; i++) guest_ids[i] = host_ids[i];
 }
@@ -9769,7 +10347,7 @@ static void bridge_time(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     uint8_t* memory = emu->get_memory_base();
     uint32_t t_ptr = emu->get_reg(0);
-    time_t t = time(nullptr);
+    time_t t = guest_wall_time();
     if (t_ptr) {
         *(uint64_t*)(memory + t_ptr) = (uint64_t)t; // ARM64: time_t is 64-bit
     }
@@ -9780,6 +10358,7 @@ static uint64_t g_guest_virtual_time_ns = 0;
 
 static void init_virtual_clock() {
     if (g_guest_virtual_time_ns == 0) {
+        if (tas::enabled()) { g_guest_virtual_time_ns = 1000000000ull; return; }  // fixed start, part of the savestate
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         g_guest_virtual_time_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
@@ -9798,7 +10377,9 @@ static void bridge_clock_gettime(void* emu_ptr) {
     uint32_t tp_ptr = emu->get_reg(1);
     
     uint64_t ns;
-    if (clock_id == 0 || clock_id == 5) { // CLOCK_REALTIME or CLOCK_REALTIME_COARSE
+    if (tas::enabled() && (clock_id == 0 || clock_id == 5)) {
+        ns = tas::realtime_ns();
+    } else if (clock_id == 0 || clock_id == 5) { // CLOCK_REALTIME or CLOCK_REALTIME_COARSE
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
@@ -9823,7 +10404,13 @@ static void bridge_gettimeofday(void* emu_ptr) {
     
     if (tv_ptr) {
         struct timeval tv;
-        gettimeofday(&tv, nullptr);
+        if (tas::enabled()) {
+            const uint64_t ns = tas::realtime_ns();
+            tv.tv_sec = (long)(ns / 1000000000ull);
+            tv.tv_usec = (long)((ns % 1000000000ull) / 1000ull);
+        } else {
+            gettimeofday(&tv, nullptr);
+        }
         // ARM64 struct timeval: { int64_t tv_sec; int64_t tv_usec; }
         *(int64_t*)(memory + tv_ptr)     = (int64_t)tv.tv_sec;
         *(int64_t*)(memory + tv_ptr + 8) = (int64_t)tv.tv_usec;
@@ -10259,7 +10846,113 @@ static void bridge_dlerror(void* emu_ptr) {
     emu->set_reg(0, 0);
 }
 
+// ============================================================================
+// TAS savestates: the host-side tables that describe guest memory. Everything
+// keyed by a guest address or handle goes in; caches keyed by guest addresses
+// are dropped on load.
+// ============================================================================
+static void tas_bridge_state_save(tas::Writer& w) {
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    w.u32(g_guest_heap_ptr);
+    w.u64(g_alloc_counter);
+    w.u32((uint32_t)g_guest_allocs.size());
+    for (const auto& kv : g_guest_allocs) { w.u32(kv.first); w.u32(kv.second); }
+    w.u32((uint32_t)g_tracked_allocs.size());
+    for (uint32_t a : g_tracked_allocs) w.u32(a);
+    w.u32((uint32_t)g_deferred_free_list.size());
+    for (const DeferredBlock& b : g_deferred_free_list) { w.u32(b.addr); w.u32(b.size); w.u64(b.alloc_index); w.u64(b.free_ms); }
+    for (uint32_t b : g_fastbins) w.u32(b);
+    w.u32((uint32_t)g_free_by_addr.size());
+    for (const auto& kv : g_free_by_addr) { w.u32(kv.first); w.u32(kv.second); }
+    w.u32((uint32_t)g_free_by_size.size());
+    for (const auto& kv : g_free_by_size) { w.u32(kv.first); w.u32(kv.second); }
+    w.u32((uint32_t)g_jstrings.size());
+    for (const auto& kv : g_jstrings) { w.u32(kv.first); w.str(kv.second); }
+    w.u32(g_next_jstring);
+    w.u32((uint32_t)g_tls_values.size());
+    for (const auto& kv : g_tls_values) { w.u32(kv.first); w.u64(kv.second); }
+    w.u32(g_next_tls_key);
+    w.u32(g_next_file_handle);
+    w.u64(g_byte_array_alloc_ptr_64);
+    w.u64(g_dirent_alloc_ptr_64);
+    w.u64(g_guest_virtual_time_ns);
+    w.u8(g_prefs_loaded ? 1 : 0);
+    w.u32((uint32_t)g_prefs.size());
+    for (const auto& kv : g_prefs) { w.str(kv.first); w.str(kv.second); }
+    tas_al_state_save(w);
+}
+
+static bool tas_bridge_state_load(tas::Reader& r) {
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    g_guest_heap_ptr = r.u32();
+    g_alloc_counter = r.u64();
+    uint32_t n = r.u32();
+    g_guest_allocs.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) { uint32_t a = r.u32(); g_guest_allocs[a] = r.u32(); }
+    n = r.u32();
+    g_tracked_allocs.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) g_tracked_allocs.insert(r.u32());
+    n = r.u32();
+    g_deferred_free_list.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) {
+        DeferredBlock b;
+        b.addr = r.u32(); b.size = r.u32(); b.alloc_index = r.u64(); b.free_ms = r.u64();
+        g_deferred_free_list.push_back(b);
+    }
+    for (uint32_t& b : g_fastbins) b = r.u32();
+    n = r.u32();
+    g_free_by_addr.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) { uint32_t a = r.u32(); g_free_by_addr[a] = r.u32(); }
+    n = r.u32();
+    g_free_by_size.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) { uint32_t sz = r.u32(); g_free_by_size.emplace(sz, r.u32()); }
+    n = r.u32();
+    g_jstrings.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) { uint32_t h = r.u32(); g_jstrings[h] = r.str(); }
+    g_next_jstring = r.u32();
+    n = r.u32();
+    g_tls_values.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) { uint32_t k = r.u32(); g_tls_values[k] = r.u64(); }
+    g_next_tls_key = r.u32();
+    g_next_file_handle = r.u32();
+    g_byte_array_alloc_ptr_64 = r.u64();
+    g_dirent_alloc_ptr_64 = r.u64();
+    g_guest_virtual_time_ns = r.u64();
+    g_prefs_loaded = r.u8() != 0;
+    n = r.u32();
+    g_prefs.clear();
+    for (uint32_t i = 0; i < n && r.ok; i++) { std::string k = r.str(); g_prefs[k] = r.str(); }
+    tas_al_state_load(r);
+    // Caches keyed by guest addresses would serve stale data after the rewind.
+    {
+        std::lock_guard<std::mutex> cl(g_pvr_decomp_cache_mutex);
+        g_pvr_decomp_cache.clear();
+    }
+    {
+        std::lock_guard<std::mutex> bl(g_buffer_to_path_mutex);
+        g_buffer_to_path.clear();
+    }
+    return r.ok;
+}
+
+// Self-test diagnostics: which guest heap block holds an address.
+std::string tas_bridge_describe_addr(uint64_t addr) {
+    std::lock_guard<std::mutex> lock(g_heap_mutex);
+    for (const auto& kv : g_guest_allocs) {
+        if (addr >= kv.first && addr < (uint64_t)kv.first + kv.second) {
+            char buf[96];
+            snprintf(buf, sizeof buf, "heap block 0x%x (%u bytes, +0x%llx)", kv.first, kv.second,
+                     (unsigned long long)(addr - kv.first));
+            return buf;
+        }
+    }
+    if (addr >= 0x20000000ull && addr < g_guest_heap_ptr) return "freed heap";
+    return "outside the heap";
+}
+
 void JniBridge64::init_standard_bridges() {
+    tas::register_state("bridge", tas_bridge_state_save, tas_bridge_state_load);
+    tas::register_state("gl", tas_gl_state_save, tas_gl_state_load);
     register_handler("sre_resolve_address", bridge_sre_resolve_address);
     register_handler("sre_resolve_symbol", bridge_sre_resolve_symbol);
 

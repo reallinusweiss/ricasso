@@ -29,6 +29,8 @@ Keyboard:   A / D or arrow keys: move      Space or W: jump      Attack/magic: s
 Controller: left stick or D-pad: move      A: jump      X: attack      Y: magic      B: item
             Start: game menu      In menus: right stick moves the pointer, RT clicks
 F1: menu bar      F2: controls      F6: graphics      F12: fullscreen      All hotkeys: Help > Hotkeys
+TAS mode (savestates, input recording, fixed timing): start "Ricasso.exe --tas" or use the Tools > TAS menu;
+the TAS keys are listed in Help > Hotkeys.
 
 
 PROBLEMS?

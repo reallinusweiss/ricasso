@@ -142,8 +142,14 @@ void restart_process(const std::vector<std::string>& args) {
 #endif
 }
 
+bool g_reserve_write_watch = false;
+
 void* reserve_large_region(uint64_t size) {
 #ifdef _WIN32
+    // MEM_WRITE_WATCH lets the TAS savestates copy only the pages that were
+    // ever written (GetWriteWatch) instead of the whole 4 GB window.
+    if (g_reserve_write_watch)
+        return VirtualAlloc(nullptr, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     // Match Linux mmap semantics: the guest writes across the whole 4GB window
     // (bridge at 0xFF000000, ELF load, heap/stack). MEM_RESERVE alone leaves
     // pages unavtoridably inaccessible and the first touch faults (0xC0000005).

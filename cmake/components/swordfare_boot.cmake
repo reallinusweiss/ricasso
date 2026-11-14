@@ -5,6 +5,7 @@
 
 add_executable(swordfare_boot
     ${SRC_DIR}/main.cpp
+    ${SRC_DIR}/tas/tas.cpp
     ${SRC_DIR}/platform/client_host_smoke.cpp
     ${SRC_DIR}/platform/arm64_reloc.cpp
     ${SRC_DIR}/platform/display.cpp

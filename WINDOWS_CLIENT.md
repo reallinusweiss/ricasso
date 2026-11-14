@@ -52,7 +52,7 @@ Every function is reached through the menu bar (File, Emulation, View, Config, T
 - **F3:** performance/debug overlay. The validated live XYZ reader is an extras feature.
 - **F4:** Cheats, **F6:** Graphics, **F11:** Scene Select, **`:** Lua Console, **F12:** fullscreen.
 
-Game Over accepts the original on-screen action and the supported keyboard inputs. Original game saves are separate from practice save/load-state features: **Save State and Load State are not implemented**.
+Game Over accepts the original on-screen action and the supported keyboard inputs. Original game saves are separate from the savestates of the TAS mode (`--tas`, see the README): without TAS mode, Save State, Load State and the Movie menu are grayed out, and *File → Restart in TAS Mode* restarts the client with `--tas`.
 
 **In-app purchases and ads.** The desktop client has no Google Play Billing and no ad SDK. Every in-app product (including "Remove Ads", the compass and the coin doubler) counts as not purchased; nothing paid is unlocked. Ad requests are answered as "no ad available": no ad is shown, and the death screen continues through the game's own continue path.
 

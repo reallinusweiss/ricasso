@@ -697,7 +697,9 @@ void RedstellGC::gc_thread_func() {
 // Background Optimization Thread function
 void RedstellGC::opt_thread_func() {
     while (m_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        // 10 s between passes, in short steps so that shutdown() does not wait for it.
+        for (int i = 0; i < 100 && m_running; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (!m_running) break;
 
         // 1. Merge Duplicate Textures (DISABLED)

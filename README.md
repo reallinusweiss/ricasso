@@ -49,6 +49,27 @@ Every function is in the menu bar at the top of the window; F1 shows or hides it
 - When a newer Ricasso release is on GitHub, `Ricasso.exe` shows a button that opens the download page. It asks GitHub at most once a day; set the environment variable `RICASSO_NO_UPDATE_CHECK=1` to turn this off. To update, extract the new ZIP, start `Ricasso.exe` and choose *Reuse previous installation*.
 - *Uninstall…* in `Ricasso.exe` removes the shortcuts, the game files Ricasso set up and the Ricasso folder. Your saves in `%APPDATA%\ricasso` stay.
 
+### TAS mode
+
+TAS mode turns the game into a tool-assisted speedrun setup, similar to BizHawk: a fixed 60 fps timestep, a virtual clock and a seeded random generator (`--tas-seed=N`, default 0), so the same inputs always give the same result. Start it with `Ricasso.exe --tas`, or choose *File → Restart in TAS Mode*. Savestates are under *File* (*Save State*, *Load State*, *Savestate Slot*), the input recording under *File → Movie*, and Pause, Frame Advance and Fast-Forward under *Emulation*. *Help → Hotkeys* lists the keys; in TAS mode these replace the normal use of the same keys:
+
+| Key | Action |
+| --- | --- |
+| F5 / F8 | Save / load the current savestate slot (ten slots, also written to `%APPDATA%\ricasso\tas\`) |
+| F6 / F7 | Previous / next slot |
+| F9 | Start or stop recording inputs. The start of the recording is kept as the movie's own savestate; loading a state while recording rerecords from that frame |
+| F10 | Play the movie from its start (restores the movie's savestate), or stop playing |
+| P | Pause |
+| N | Advance one frame (hold to repeat) |
+| Tab (hold) | Fast-forward |
+| Ctrl+S | Write the movie to `%APPDATA%\ricasso\tas\movie.rtas` (a text file: a start frame, then one line per frame) |
+
+The other windows stay reachable through the menu bar (Graphics, for example, which is F6 outside TAS mode). Game speed is fixed in TAS mode.
+
+`--tas-movie=FILE` records into that file from the first frame, or plays it back when it exists (its start state `FILE.start.rsav` is restored first); `--tas-load=SLOT` restores a slot at start. The frame counter, the slot and the held inputs are shown at the top left.
+
+Limits: savestates hold the whole game memory and the game's textures (about 60 MB per file), but not the sound mixer, so sounds are not rewound. States saved by a build from before the textures were included still load, but can show wrong textures when loaded in another area. The game's own save files are not rolled back. Typing mode input is not recorded. Savestates need Windows.
+
 ### Where do I get the file?
 
 From your own phone: install Swordigo from Google Play, export it with an app that saves all parts of an app as one file, such as XAPK Extractor (`.xapk`) or [SAI](https://github.com/Aefyr/SAI) (`.apks`), and copy the result to your PC. Apps such as APK Extractor save only the main part (`base.apk`), which does not contain the game itself. Ricasso explains the steps under *How do I get the file?*

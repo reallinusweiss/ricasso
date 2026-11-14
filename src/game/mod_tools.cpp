@@ -6,6 +6,7 @@
 #include <iostream>
 #include <algorithm>
 #include "platform/gl_inc.h"
+#include "tas/tas.h"
 // ============================================================
 //  SwordigoDesktop — Mod Tools Implementation
 //  Game speed, pause/step, toast notifications.
@@ -128,7 +129,8 @@ void mod_render_overlay(GuiRenderer& gui, int win_w, int win_h, float dt) {
     // --- Pause indicator (always visible when paused) ---
     if (g_game_paused) {
         gui.draw_string("|| PAUSED", win_w / 2 - 50, win_h / 2 + 20, 2.0f, 255, 80, 80, 255);
-        gui.draw_string("F9 = Step Frame    F8 = Resume", win_w / 2 - 130, win_h / 2 - 10, 1.0f, 200, 200, 200, 255);
+        gui.draw_string(tas::enabled() ? "N = Step Frame    P = Resume" : "F9 = Step Frame    F8 = Resume",
+                        win_w / 2 - 130, win_h / 2 - 10, 1.0f, 200, 200, 200, 255);
     }
 
     // --- Toast messages (center of screen, stack upward) ---

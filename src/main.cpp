@@ -6,6 +6,7 @@
 #else
 #include <process.h>
 #include <windows.h>
+#include <shellapi.h>
 #endif
 #include <iostream>
 #include <iomanip>
@@ -46,6 +47,7 @@ extern "C" void asset_manager_init_arm32(const char* base_path);
 extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp — drains guest deferred-free list (leak guard)
 #include "game/camera_override.h"
 #include "game/mod_tools.h"
+#include "tas/tas.h"
 #include "platform/rgc.h"
 #include "game/sky_renderer.h"
 #include "platform/input_config.h"
@@ -1189,12 +1191,41 @@ extern int g_death_detected_countdown;  // Defined in jni_bridge.cpp
 
 // Check state for toggle items in the native menu bar.
 bool menu_check_state(GuiAction a) {
+    if (a >= GUI_TAS_SLOT_0 && a <= GUI_TAS_SLOT_9) return tas::slot() == (int)(a - GUI_TAS_SLOT_0);
     switch (a) {
         case GUI_TOGGLE_VIDEO_BG:            return g_video_background_enabled;
         case GUI_TOGGLE_TOUCH_CONTROLS:      return !g_gl_hide_hud;
         case GUI_TOGGLE_TYPING_MODE:         return g_typing_mode;
         case GUI_TOGGLE_CAM_POV:             return g_cam_pov_mode;
+        case GUI_TAS_RECORD:                 return tas::mode() == tas::Mode::Record;
+        case GUI_TAS_PLAY:                   return tas::mode() == tas::Mode::Play;
+        case GUI_TAS_FAST_FORWARD:           return tas::fast_forward_latched();
         default:                             return false;
+    }
+}
+
+// Whether a menu item can be used now; disabled items are grayed out.
+bool menu_item_enabled(GuiAction a) {
+    switch (a) {
+        case GUI_SAVE_STATE:
+        case GUI_LOAD_STATE:
+        case GUI_TAS_PREV_SLOT:
+        case GUI_TAS_NEXT_SLOT:
+        case GUI_TAS_RECORD:
+        case GUI_TAS_PLAY:
+        case GUI_TAS_STOP_MOVIE:
+        case GUI_TAS_SAVE_MOVIE:
+        case GUI_TAS_FAST_FORWARD:
+        case GUI_TAS_OPEN_FOLDER:
+            return tas::enabled();
+        case GUI_TAS_RESTART:
+        case GUI_GAME_SPEED_UP:
+        case GUI_GAME_SPEED_DOWN:
+        case GUI_GAME_SPEED_RESET:
+            return !tas::enabled();
+        default:
+            if (a >= GUI_TAS_SLOT_0 && a <= GUI_TAS_SLOT_9) return tas::enabled();
+            return true;
     }
 }
 std::string g_cache_dir;
@@ -1679,14 +1710,73 @@ void toggle_fullscreen() {
               << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
 }
 
+// Set by File > Restart in TAS Mode; main() starts a new process with --tas.
+static bool g_restart_in_tas = false;
+
+static void tas_needed_toast() { mod_toast("Savestates need TAS mode: File > Restart in TAS Mode", 2.5f); }
+
+// Creates the TAS folder (states and movies) and opens it in Explorer.
+static void open_tas_folder() {
+    const std::string dir = tas::directory();
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+#ifdef _WIN32
+    std::wstring wdir;
+    const int len = MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), (int)dir.size(), nullptr, 0);
+    wdir.resize(len > 0 ? (size_t)len : 0);
+    if (len > 0) MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), (int)dir.size(), wdir.data(), len);
+    ShellExecuteW(nullptr, L"open", wdir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
+}
+
+// Starts this exe again with --tas; the current process exits right after.
+static void relaunch_with_tas() {
+#ifdef _WIN32
+    std::cout << "[TAS] Restarting in TAS mode" << std::endl;
+    std::cout.flush();
+    std::cerr.flush();
+    wchar_t exe[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0) {
+        std::cerr << "[TAS] Restart failed: GetModuleFileNameW error " << GetLastError() << std::endl;
+        return;
+    }
+    std::wstring cmd = GetCommandLineW();
+    cmd += L" --tas";
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe, buf.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        std::cerr << "[TAS] Restart failed: CreateProcessW error " << GetLastError() << std::endl;
+        return;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+#endif
+}
+
 void process_gui_action(GuiAction gui_action, bool& running) {
     if (gui_action == GUI_NONE) return;
     if (arm64_mod_quick_action(gui_action)) return;
+    if (gui_action >= GUI_TAS_SLOT_0 && gui_action <= GUI_TAS_SLOT_9) {
+        if (tas::enabled()) tas::select_slot(gui_action - GUI_TAS_SLOT_0);
+        else tas_needed_toast();
+        return;
+    }
     switch (gui_action) {
         case GUI_EXIT:
             running = false;
             break;
         case GUI_PAUSE:
+            if (tas::enabled()) {
+                tas::toggle_pause();
+                break;
+            }
             mod_toggle_pause();
             std::cout << "[GUI] Emulation " << (g_game_paused ? "PAUSED" : "RESUMED") << std::endl;
             break;
@@ -1694,24 +1784,79 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             tool_windows::toggle(tool_windows::CONTROLS);
             break;
         case GUI_SAVE_STATE:
-            std::cout << "[GUI] Save State requested" << std::endl;
+            if (tas::enabled()) tas::request_save();
+            else tas_needed_toast();
             break;
         case GUI_LOAD_STATE:
-            std::cout << "[GUI] Load State requested" << std::endl;
+            if (tas::enabled()) tas::request_load();
+            else tas_needed_toast();
             break;
         case GUI_GAME_SPEED_UP:
+            if (tas::enabled()) {
+                mod_toast("Game speed is fixed in TAS mode; hold Tab to fast-forward", 2.5f);
+                break;
+            }
             mod_speed_up();
             break;
         case GUI_GAME_SPEED_DOWN:
+            if (tas::enabled()) {
+                mod_toast("Game speed is fixed in TAS mode; hold Tab to fast-forward", 2.5f);
+                break;
+            }
             mod_speed_down();
             break;
         case GUI_GAME_SPEED_RESET:
+            if (tas::enabled()) {
+                mod_toast("Game speed is fixed in TAS mode; hold Tab to fast-forward", 2.5f);
+                break;
+            }
             mod_speed_reset();
+            break;
+        case GUI_TAS_PREV_SLOT:
+            if (tas::enabled()) tas::prev_slot();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_NEXT_SLOT:
+            if (tas::enabled()) tas::next_slot();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_RECORD:
+            if (tas::enabled()) tas::toggle_record();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_PLAY:
+            if (tas::enabled()) tas::toggle_play();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_STOP_MOVIE:
+            if (tas::enabled()) tas::stop_movie();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_SAVE_MOVIE:
+            if (tas::enabled()) tas::save_movie();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_FAST_FORWARD:
+            if (tas::enabled()) tas::toggle_fast_forward();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_OPEN_FOLDER:
+            open_tas_folder();
+            break;
+        case GUI_TAS_RESTART:
+            if (!tas::enabled()) {
+                g_restart_in_tas = true;
+                running = false;
+            }
             break;
         case GUI_TOGGLE_CAM:
             cam_toggle();
             break;
         case GUI_TOGGLE_PAUSE:
+            if (tas::enabled()) {
+                tas::toggle_pause();
+                break;
+            }
             mod_toggle_pause();
             break;
         case GUI_TOGGLE_SMOOTH_CAM:
@@ -1914,7 +2059,8 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             win32_menu::set_visible(!win32_menu::visible());
             break;
         case GUI_STEP_FRAME:
-            mod_step_frame();
+            if (tas::enabled()) tas::step_frame();
+            else mod_step_frame();
             break;
         case GUI_TOGGLE_CHEATS:
             tool_windows::toggle(tool_windows::CHEATS);
@@ -2017,11 +2163,12 @@ static void run_posted_gui_actions(bool& running) {
 // Keyboard shortcuts: one table (hotkeys.cpp), one dispatcher. While typing mode
 // sends the keyboard to the game, only F1-F12 and the typing-mode key stay shortcuts.
 static bool run_hotkey(const SDL_KeyboardEvent& key, bool& running) {
-    if (key.repeat) return false;
     if (key.mod & SDL_KMOD_ALT) return false;  // Alt+F4, Alt+Enter and menu accelerators are not hotkeys
     const bool fkey = key.scancode >= SDL_SCANCODE_F1 && key.scancode <= SDL_SCANCODE_F12;
     if (g_typing_mode && !fkey && key.key != SDLK_BACKSLASH) return false;
     const GuiAction a = hotkey_lookup(key.key, (key.mod & SDL_KMOD_CTRL) != 0, (key.mod & SDL_KMOD_SHIFT) != 0, g_cam_active);
+    // Holding N repeats frame advance in TAS mode; other keys do not repeat.
+    if (key.repeat && !(a == GUI_STEP_FRAME && hotkeys_tas_mode())) return false;
     if (a == GUI_NONE) return false;
     process_gui_action(a, running);
     return true;
@@ -3445,7 +3592,12 @@ static void update_arm64_hero_roots() {
     if (s_gsc_get_fn != 0) {
         static int retry_in = 0;
         if (retry_in > 0) --retry_in;
-        if (g_game_scene_controller == 0 || retry_in <= 0) {
+        // TAS mode polls on fixed frame numbers so that a replay makes the
+        // same guest calls as the original run.
+        const bool poll = tas::enabled()
+            ? (tas::frame() % (g_game_scene_controller == 0 ? 60 : 300) == 0)
+            : (g_game_scene_controller == 0 || retry_in <= 0);
+        if (poll) {
             retry_in = (g_game_scene_controller == 0) ? 60 : 300;
             const bool first = (g_game_scene_controller == 0);
             const uint64_t gsc = g_emulator_64->call(s_gsc_get_fn, {});
@@ -3842,6 +3994,53 @@ static void gamepad_pointer_update() {
         ev.button.y = my;
         SDL_PushEvent(&ev);
     }
+}
+
+// --- TAS: host state of the game loop that belongs in a savestate -------------
+static void tas_loop_state_save(tas::Writer& w) {
+    w.u32((uint32_t)g_input_config.button_count());
+    for (int i = 0; i < g_input_config.button_count(); i++) {
+        const TouchButton* b = g_input_config.get_button(i);
+        w.u8(b && b->is_pressed ? 1 : 0);
+        w.u8(b && b->macro_pending ? 1 : 0);
+        w.u32(b ? (uint32_t)b->macro_stage : 0);
+        w.u64(b ? b->macro_fire_time : 0);
+    }
+    w.u8(g_text_input_active ? 1 : 0);
+    w.str(g_text_input_buffer);
+    w.u32(g_game_scene_controller);
+    w.u32(g_hero_obj);
+    w.u32(g_hero_char_ctrl_comp);
+    w.u32(g_hero_health_comp);
+    w.u32(g_hero_mana_comp);
+}
+
+static bool tas_loop_state_load(tas::Reader& r) {
+    const uint32_t n = r.u32();
+    for (uint32_t i = 0; i < n && r.ok; i++) {
+        const bool pressed = r.u8() != 0;
+        const bool pending = r.u8() != 0;
+        const uint32_t stage = r.u32();
+        const uint64_t fire = r.u64();
+        TouchButton* b = (int)i < g_input_config.button_count() ? g_input_config.get_button((int)i) : nullptr;
+        if (!b) continue;
+        b->is_pressed = pressed;
+        b->macro_pending = pending;
+        b->macro_stage = (int)stage;
+        b->macro_fire_time = fire;
+    }
+    g_text_input_active = r.u8() != 0;
+    g_text_input_buffer = r.str();
+    g_game_scene_controller = r.u32();
+    g_hero_obj = r.u32();
+    g_hero_char_ctrl_comp = r.u32();
+    g_hero_health_comp = r.u32();
+    g_hero_mana_comp = r.u32();
+    return r.ok;
+}
+
+static void tas_loop_reset() {
+    s_pending_xp_action = GUI_NONE;
 }
 
 void load_and_boot_arm64() {
@@ -6835,6 +7034,8 @@ void load_and_boot_arm64() {
         bool click_swallowed_by_gui = false;
         float last_mouse_x = -1.0f;
         float last_mouse_y = -1.0f;
+        bool tas_mouse_down = false;      // device mouse as the TAS layer samples it per frame
+        float tas_mouse_x = 0.0f, tas_mouse_y = 0.0f;
 
         bool key_left = false;
         bool key_right = false;
@@ -6867,6 +7068,13 @@ void load_and_boot_arm64() {
             if (dt_seconds < 0.001f) dt_seconds = 0.016666668f;
             last_ticks = now_ticks;
             accumulated_time += dt_seconds;
+            if (tas::enabled()) {
+                // Savestates are taken and restored here, between two frames.
+                tas::begin_frame();
+                if (tas::wants_exit()) { running = false; return; }
+                dt_seconds = tas::kFrameDt;
+                accumulated_time = tas::time_seconds();
+            }
 
             // ── Engine-pod control (Ruby GG dock) ──────────────────────
             // Drain stdin commands, then freeze the whole guest while the
@@ -6989,6 +7197,25 @@ void load_and_boot_arm64() {
             };
 
 
+            // Enter as the game sees it (dialogues, portals). TAS mode sends it
+            // per frame from the recorded input instead of from key events.
+            auto dispatch_enter_key = [&](bool is_down) {
+                if (!g_vaddr_sre_gamesceneview_ptr || !g_guest_memory) return;
+                const uint64_t gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
+                if (!is_valid_guest_ptr(gamesceneview)) return;
+                const uint64_t overlay = *(uint64_t*)(g_guest_memory + gamesceneview + 0x100);
+                if (!is_valid_guest_ptr(overlay)) return;
+                const uint64_t listener = *(uint64_t*)(g_guest_memory + overlay + 0xf0);
+                if (!is_valid_guest_ptr(listener)) return;
+                const uint32_t guest_event_addr = 0x3F800;
+                std::memset(g_guest_memory + guest_event_addr, 0, 128);
+                *(int*)(g_guest_memory + guest_event_addr + 0xc) = is_down ? 1 : 2;  // 1 = down, 2 = up
+                *(int*)(g_guest_memory + guest_event_addr + 0x10) = 0xd;             // VK_RETURN
+                const uint64_t vtable = *(uint64_t*)(g_guest_memory + overlay);
+                const uint64_t handle_keyboard_event = *(uint64_t*)(g_guest_memory + vtable + 0x28);
+                g_emulator_64->call(handle_keyboard_event, {overlay, (uint64_t)guest_event_addr});
+            };
+
             // Per-frame camera movement
             if (g_cam_active) {
                 bool any_cam_key = arrow_left || arrow_right || arrow_up || arrow_down || cam_key_pgup || cam_key_pgdn;
@@ -7008,7 +7235,7 @@ void load_and_boot_arm64() {
                 cam_write_to_guest();
             }
 
-            float game_dt = dt_seconds * g_game_speed;
+            float game_dt = tas::enabled() ? tas::kFrameDt : dt_seconds * g_game_speed;
             /* Frame dt for the guest z-walk poll (Mini.HostDt) — lets the
              * Z stepping run in units/sec instead of units/frame. */
             if (g_sre_host_dt_addr && g_guest_memory) {
@@ -8364,6 +8591,7 @@ void load_and_boot_arm64() {
                 glDisable(GL_TEXTURE_2D); glDisable(GL_LIGHTING); glDisable(GL_DEPTH_TEST);
                 glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 mod_render_overlay(g_gui, g_win_w, g_win_h, dt_seconds);
+                tas::render_overlay(g_gui, g_win_w, g_win_h);
                 mod_achievement_poll(g_guest_memory, 1);  // offsets are absolute guest VA
                 mod_achievement_render(g_gui, g_win_w, g_win_h, dt_seconds);
 
@@ -8493,7 +8721,7 @@ void load_and_boot_arm64() {
                     if (sre_hardmode_addr) {
                         hardmode = *(volatile int*)(g_emulator_64->get_memory_base() + sre_hardmode_addr) != 0;
                     }
-                    if (!hardmode) {
+                    if (!hardmode && !tas::fast_forward()) {
                         Uint64 frequency = SDL_GetPerformanceFrequency();
                         double target_seconds = 1.0 / 60.0;
                         Uint64 target_ticks = (Uint64)(target_seconds * frequency);
@@ -8638,12 +8866,14 @@ void load_and_boot_arm64() {
                                 bool is_toggle = (event.key.scancode >= SDL_SCANCODE_F1 && event.key.scancode <= SDL_SCANCODE_F12) || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE;
                                 if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
                             }
+                            if (tas::consume_key(event.key)) break;
                             if (run_hotkey(event.key, running)) break;
                             // fall through
                         case SDL_EVENT_KEY_UP: {
                             if (g_text_input_active) {
                                 break;
                             }
+                            if (tas::consume_key(event.key)) break;
                             if (should_block_keyboard()) {
                                 bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
                                 if (!is_toggle) break;
@@ -8686,7 +8916,7 @@ void load_and_boot_arm64() {
                             }
 
                             // ---- NATIVE KEYBOARD DISPATCH (portals/dialogues via Enter key) ----
-                            if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+                            if (!tas::enabled() && (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER)) {
                                 uint64_t gamesceneview = 0;
                                 if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
                                     gamesceneview = *(uint64_t*)(g_guest_memory + g_vaddr_sre_gamesceneview_ptr);
@@ -8816,7 +9046,11 @@ void load_and_boot_arm64() {
                                         float x = event.button.x * 960.0f / (float)g_win_w;
                                         float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
                                         last_mouse_x = x; last_mouse_y = y;
-                                        call_touch_64(1, 1, accumulated_time, x, y, x, y, 1);
+                                        if (tas::enabled()) {
+                                            tas_mouse_down = true; tas_mouse_x = x; tas_mouse_y = y;
+                                        } else {
+                                            call_touch_64(1, 1, accumulated_time, x, y, x, y, 1);
+                                        }
                                     }
                                 }
                             }
@@ -8837,7 +9071,11 @@ void load_and_boot_arm64() {
                             } else if (mouse_pressed && !click_swallowed_by_gui && !g_srt_overlay.is_visible()) {
                                 float x = event.motion.x * 960.0f / (float)g_win_w;
                                 float y = 544.0f - (event.motion.y * 544.0f / (float)g_win_h);
-                                call_touch_64(4, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 0);
+                                if (tas::enabled()) {
+                                    tas_mouse_x = x; tas_mouse_y = y;
+                                } else {
+                                    call_touch_64(4, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 0);
+                                }
                                 last_mouse_x = x; last_mouse_y = y;
                             }
                             break;
@@ -8846,12 +9084,17 @@ void load_and_boot_arm64() {
                                 mouse_pressed = false;
                                 mouse_x = event.button.x;
                                 mouse_y = g_win_h - event.button.y;
+                                if (tas::enabled()) tas_mouse_down = false;
                                 if (g_input_config.is_editing()) {
                                     g_input_config.editor_mouse_up();
                                 } else if (!click_swallowed_by_gui && !g_srt_overlay.is_visible()) {
                                     float x = event.button.x * 960.0f / (float)g_win_w;
                                     float y = 544.0f - (event.button.y * 544.0f / (float)g_win_h);
-                                    call_touch_64(2, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 1);
+                                    if (tas::enabled()) {
+                                        tas_mouse_down = false; tas_mouse_x = x; tas_mouse_y = y;
+                                    } else {
+                                        call_touch_64(2, 1, accumulated_time, x, y, last_mouse_x, last_mouse_y, 1);
+                                    }
                                     last_mouse_x = -1.0f; last_mouse_y = -1.0f;
                                 }
                                 click_swallowed_by_gui = false;
@@ -8921,9 +9164,12 @@ void load_and_boot_arm64() {
                     // Controller: each control button carries a gamepad button
                     // in controls_arm64.ini (D-pad, A/X/Y/B, Start, Back), and the
                     // left stick also moves left and right.
+                    // TAS: while paused nothing reaches the game; a stepped frame
+                    // gets exactly one frame of input.
+                    const bool tas_skip = tas::enabled() && !tas::frame_runs();
                     const bool pad = keys && g_gamepad;
                     const float pad_lx = pad ? SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f : 0.0f;
-                    for (int bi = 0; bi < g_input_config.button_count(); bi++) {
+                    for (int bi = 0; !tas_skip && bi < g_input_config.button_count(); bi++) {
                         TouchButton* btn = g_input_config.get_button(bi);
                         if (!btn) continue;
                         
@@ -8961,6 +9207,7 @@ void load_and_boot_arm64() {
                                 if (btn->name == "right") is_down = pad_lx > 0.35f;
                             }
                         }
+                        if (tas::enabled()) is_down = tas::apply_button(bi, is_down);
 
                         // Resolve player's GameSceneController / listener safely
                         uint64_t gamesceneview = 0;
@@ -9041,11 +9288,31 @@ void load_and_boot_arm64() {
                     }
                     
                     // Process pending macro step 2 (delayed spell slot tap)
-                    g_input_config.process_macros(accumulated_time,
-                        [&](int action, int id, double time, float x, float y, float ox, float oy, int tap) {
-                            call_touch_64(action, id, time, x, y, ox, oy, tap);
-                        });
+                    if (!tas_skip) {
+                        g_input_config.process_macros(accumulated_time,
+                            [&](int action, int id, double time, float x, float y, float ox, float oy, int tap) {
+                                call_touch_64(action, id, time, x, y, ox, oy, tap);
+                            });
+                    }
                     gamepad_pointer_update();
+                    if (tas::enabled() && !tas_skip) {
+                        // Enter and the pointer, per frame from the device or the movie.
+                        const bool* ks = input_blocked ? nullptr : SDL_GetKeyboardState(nullptr);
+                        const bool enter_dev = ks && (ks[SDL_SCANCODE_RETURN] || ks[SDL_SCANCODE_KP_ENTER]);
+                        const bool enter_now = tas::apply_enter(enter_dev);
+                        const bool enter_was = ((tas::previous_input().buttons >> tas::kButtonEnter) & 1) != 0;
+                        if (enter_now != enter_was) dispatch_enter_key(enter_now);
+                        tas::apply_mouse(tas_mouse_down, tas_mouse_x, tas_mouse_y);
+                        const tas::Input& in = tas::input();
+                        const tas::Input& pv = tas::previous_input();
+                        const float x = in.mouse_x, y = in.mouse_y, px = pv.mouse_x, py = pv.mouse_y;
+                        if (in.mouse_down && !pv.mouse_down)
+                            call_touch_64(1, 1, accumulated_time, x, y, x, y, 1);
+                        else if (in.mouse_down && pv.mouse_down && (x != px || y != py))
+                            call_touch_64(4, 1, accumulated_time, x, y, px, py, 0);
+                        else if (!in.mouse_down && pv.mouse_down)
+                            call_touch_64(2, 1, accumulated_time, x, y, px, py, 1);
+                    }
                 }
             }
             
@@ -9059,6 +9326,7 @@ void load_and_boot_arm64() {
             }
             
             completed_frames++;
+            tas::end_frame();
             total_draw_calls += g_frame_stats.draw_calls;
             total_tex_binds += g_frame_stats.texture_binds;
             total_tex_uploads += g_frame_stats.tex_uploads;
@@ -9167,6 +9435,9 @@ char** g_saved_argv = nullptr;
 int g_saved_argc = 0;
 
 int main(int argc, char* argv[]) {
+    tas::parse_args(argc, argv);
+    hotkeys_set_tas_mode(tas::enabled());
+    os_external::g_reserve_write_watch = tas::write_watch_wanted();
     g_saved_argc = argc;
     g_saved_argv = argv;
     // Engine-pod preview (Ruby GG dock) must never pop its own crash UI —
@@ -9640,10 +9911,18 @@ int main(int argc, char* argv[]) {
     }
 
     init_all();
+    tas::set_guest_memory(g_guest_memory, 0x100000000ULL);
+    tas::register_state("loop", tas_loop_state_save, tas_loop_state_load);
+    tas::register_reset(tas_loop_reset);
 
     // Detect architecture from binary ELF header
     {
         std::string so_path = get_data_path(g_lib_name);
+        {
+            std::error_code ec;
+            const auto lib_size = std::filesystem::file_size(so_path, ec);
+            tas::set_library_id(g_lib_name + " " + std::to_string(ec ? 0 : (unsigned long long)lib_size));
+        }
         g_is_arm64 = is_arm64_binary(so_path);
         std::cout << "[Boot] Architecture: " << (g_is_arm64 ? "ARM64" : "ARM32") << std::endl;
     }
@@ -9681,6 +9960,7 @@ int main(int argc, char* argv[]) {
     }
     
     std::cout << "[Main] Swordigo — session complete." << std::endl;
+    if (g_restart_in_tas) relaunch_with_tas();
 
     /*
      * The guest loader owns a large amount of state whose lifetime extends

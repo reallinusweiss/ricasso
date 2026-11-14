@@ -2,6 +2,7 @@
 // GuiActions and run by the main loop through process_gui_action().
 #include "win32_menu.h"
 #include "hotkeys.h"
+#include "tas/tas.h"
 
 #include <SDL3/SDL.h>
 #include <cstdlib>
@@ -22,6 +23,7 @@ void apply_custom_render_resolution(int w, int h);
 bool dev_overlay_available(GuiAction a);
 bool debug_overlay_visible();
 bool menu_check_state(GuiAction a);
+bool menu_item_enabled(GuiAction a);
 
 namespace win32_menu {
 namespace {
@@ -57,6 +59,9 @@ const WindowSize kWindowSizes[] = {
 SDL_Window* s_window = nullptr;
 HWND s_hwnd = nullptr;
 HMENU s_menu = nullptr;
+HMENU s_file_menu = nullptr;   // File popup; parent of the savestate and movie submenus
+HMENU s_slot_menu = nullptr;
+HMENU s_movie_menu = nullptr;
 WNDPROC s_sdl_proc = nullptr;
 bool s_visible = true;
 bool s_fs_visible = false;  // F1 state while fullscreen (the bar starts hidden there)
@@ -86,17 +91,59 @@ void add_radio(HMENU m, UINT id, const wchar_t* text) {
     mi.fType = MFT_STRING | MFT_RADIOCHECK;
     SetMenuItemInfoW(m, id, FALSE, &mi);
 }
+// Savestate slot label; "(empty)" is added only in TAS mode.
+std::wstring slot_text(int slot, bool empty) {
+    std::wstring t = L"Slot ";
+    t += static_cast<wchar_t>(L'0' + slot);
+    if (empty) t += L" (empty)";
+    return t;
+}
+// Grays or enables a popup inside its parent menu.
+void gray_submenu(HMENU parent, HMENU sub, bool on) {
+    const int n = GetMenuItemCount(parent);
+    for (int i = 0; i < n; i++) {
+        if (GetSubMenu(parent, i) == sub) {
+            EnableMenuItem(parent, i, MF_BYPOSITION | (on ? MF_ENABLED : MF_GRAYED));
+            return;
+        }
+    }
+}
 
 HMENU build() {
     HMENU bar = CreateMenu();
 
     HMENU file = CreatePopupMenu();
+    s_file_menu = file;
+    add(file, GUI_SAVE_STATE, L"&Save State");
+    add(file, GUI_LOAD_STATE, L"&Load State");
+    separator(file);
+    HMENU slots = CreatePopupMenu();
+    s_slot_menu = slots;
+    add(slots, GUI_TAS_PREV_SLOT, L"&Previous Slot");
+    add(slots, GUI_TAS_NEXT_SLOT, L"&Next Slot");
+    separator(slots);
+    for (int i = 0; i < 10; i++)
+        add_radio(slots, kIdBase + GUI_TAS_SLOT_0 + i, slot_text(i, false).c_str());
+    popup(file, slots, L"Savestate Sl&ot");
+    HMENU movie = CreatePopupMenu();
+    s_movie_menu = movie;
+    add(movie, GUI_TAS_RECORD, L"&Record");
+    add(movie, GUI_TAS_PLAY, L"&Play from Start");
+    add(movie, GUI_TAS_STOP_MOVIE, L"&Stop");
+    separator(movie);
+    add(movie, GUI_TAS_SAVE_MOVIE, L"&Write Movie File");
+    add(movie, GUI_TAS_OPEN_FOLDER, L"&Open TAS Folder");
+    popup(file, movie, L"&Movie");
+    separator(file);
+    add(file, GUI_TAS_RESTART, L"Restart in &TAS Mode");
+    separator(file);
     add(file, GUI_EXIT, L"E&xit");
     popup(bar, file, L"&File");
 
     HMENU emu = CreatePopupMenu();
     add(emu, GUI_PAUSE, L"&Pause");
     add(emu, GUI_STEP_FRAME, L"&Frame Advance");
+    add(emu, GUI_TAS_FAST_FORWARD, L"Fast-&Forward");
     separator(emu);
     add(emu, GUI_GAME_SPEED_UP, L"Speed &Up");
     add(emu, GUI_GAME_SPEED_DOWN, L"Speed &Down");
@@ -207,6 +254,26 @@ void refresh_checks() {
     // These three only work while the free camera is on.
     for (GuiAction a : {GUI_TOGGLE_CAM_POV, GUI_CAM_FOV_DOWN, GUI_CAM_FOV_UP})
         EnableMenuItem(s_menu, kIdBase + a, MF_BYCOMMAND | (g_cam_active ? MF_ENABLED : MF_GRAYED));
+    // Savestate and movie items work in TAS mode only; the rest follow menu_item_enabled().
+    check(GUI_TAS_RECORD, menu_check_state(GUI_TAS_RECORD));
+    check(GUI_TAS_PLAY, menu_check_state(GUI_TAS_PLAY));
+    check(GUI_TAS_FAST_FORWARD, menu_check_state(GUI_TAS_FAST_FORWARD));
+    for (int i = 0; i < 10; i++) {
+        const std::wstring text = slot_text(i, tas::enabled() && !tas::slot_filled(i));
+        MENUITEMINFOW mi{};
+        mi.cbSize = sizeof(mi);
+        mi.fMask = MIIM_FTYPE | MIIM_STRING;
+        mi.fType = MFT_STRING | MFT_RADIOCHECK;
+        mi.dwTypeData = const_cast<wchar_t*>(text.c_str());
+        SetMenuItemInfoW(s_slot_menu, kIdBase + GUI_TAS_SLOT_0 + i, FALSE, &mi);
+        check_id(kIdBase + GUI_TAS_SLOT_0 + i, tas::slot() == i);
+    }
+    gray_submenu(s_file_menu, s_slot_menu, tas::enabled());
+    gray_submenu(s_file_menu, s_movie_menu, tas::enabled());
+    for (GuiAction a : {GUI_SAVE_STATE, GUI_LOAD_STATE, GUI_TAS_PREV_SLOT, GUI_TAS_NEXT_SLOT, GUI_TAS_RECORD, GUI_TAS_PLAY, GUI_TAS_STOP_MOVIE,
+                        GUI_TAS_SAVE_MOVIE, GUI_TAS_FAST_FORWARD, GUI_TAS_OPEN_FOLDER, GUI_TAS_RESTART,
+                        GUI_GAME_SPEED_UP, GUI_GAME_SPEED_DOWN, GUI_GAME_SPEED_RESET})
+        EnableMenuItem(s_menu, kIdBase + a, MF_BYCOMMAND | (menu_item_enabled(a) ? MF_ENABLED : MF_GRAYED));
     for (const RenderItem& r : kRenderItems) check_id(kIdRender + r.preset, g_render_preset == r.preset);
     check_id(kIdRender + 3, g_render_preset == 3);
     check_id(kIdRenderCustom, g_render_preset == -1);
