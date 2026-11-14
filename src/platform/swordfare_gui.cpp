@@ -1502,7 +1502,7 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
 
     // Bottom-center quick keybind reminder
     {
-        const char* hint = "F1:GUI  F2:Controls  F3:Debug  F4:Scale  F5:Cam  F6:PostFX  F7:Video  \\:Type  F10:HUD";
+        const char* hint = "F1:GUI  F2:Controls  F3:Debug  F4:Scale  F5:Cam  F6:PostFX  \\:Type  F10:HUD";
         ImVec2 hsz = ImGui::CalcTextSize(hint);
         float hx = (screen_w - hsz.x) * 0.5f;
         float hy = screen_h - hsz.y - 8.0f;
@@ -3467,7 +3467,6 @@ void SwordfareGUI::draw_help_panel(bool* p_open, float top_offset) {
         {"F4",  "Toggle the SRE mod hub"},
         {"F5",  "Camera override toggle"},
         {"F6",  "Toggle graphical options"},
-        {"F7",  "Toggle video background playback"},
         {"F8",  "Pause / Resume"},
         {"F10", "Toggle native on-screen controls"},
         {"F11", "Scene Shifter and display toolbox"},

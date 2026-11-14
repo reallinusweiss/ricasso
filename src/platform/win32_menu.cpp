@@ -98,7 +98,6 @@ HMENU build() {
     HMENU view = CreatePopupMenu();
     add(view, GUI_TOGGLE_MENU_BAR, L"&Menu Bar\tF1");
     add(view, GUI_TOGGLE_TOUCH_CONTROLS, L"&On-screen Controls\tF10");
-    add(view, GUI_TOGGLE_VIDEO_BG, L"&Video Background\tF7");
     add(view, GUI_TOGGLE_GRAPHICS_OPTIONS, L"&Graphics Options...\tF6");
     separator(view);
     HMENU winsize = CreatePopupMenu();
@@ -210,7 +209,6 @@ void refresh_checks() {
     check(GUI_TOGGLE_MENU_BAR, visible());
     check(GUI_TOGGLE_MOD_HUB, menu_check_state(GUI_TOGGLE_MOD_HUB));
     check(GUI_TOGGLE_GRAPHICS_OPTIONS, menu_check_state(GUI_TOGGLE_GRAPHICS_OPTIONS));
-    check(GUI_TOGGLE_VIDEO_BG, menu_check_state(GUI_TOGGLE_VIDEO_BG));
     check(GUI_TOGGLE_TOUCH_CONTROLS, menu_check_state(GUI_TOGGLE_TOUCH_CONTROLS));
     check(GUI_TOGGLE_SCENE_TOOLBOX, menu_check_state(GUI_TOGGLE_SCENE_TOOLBOX));
     check(GUI_MOD_GOD_MODE, g_gui.mod_god_mode);

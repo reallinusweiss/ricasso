@@ -6799,6 +6799,7 @@ void load_and_boot_arm64() {
         bool running = true;
         // One iteration of the game loop (a lambda, so it can also run from
         // inside a Windows modal loop; see win32_menu::set_modal_frame).
+        bool in_modal_frame = false;  // true while run_frame() runs from inside a Windows modal loop
         auto run_frame = [&]() {
             g_frame_stats.reset();
             
@@ -8282,7 +8283,7 @@ void load_and_boot_arm64() {
                 // ── Hotkey legend ──
                 y -= 2;
                 g_gui.draw_string("F1:GUI F2:Ctrl F3:Debug F4:Scale F5:Cam F6:Graphics", x, y, 1.0f, 80, 80, 100, 180); y -= 14;
-                g_gui.draw_string("F7:Video \\\\:Type F8:Pause F10:HUD F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
+                g_gui.draw_string("\\\\:Type F8:Pause F10:HUD F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
 
                 if (g_typing_mode) {
                     g_gui.draw_string("TYPING MODE", 350, g_win_h - 30, 1.2f, 255, 80, 80, 255);
@@ -8511,7 +8512,10 @@ void load_and_boot_arm64() {
                 };
 
                 SDL_Event event;
-                while (SDL_PollEvent(&event)) {
+                // Frames run from the modal-loop timer must not pump messages: Windows'
+                // menu loop reads its own clicks from the queue, and taking them here
+                // made menu items fail to trigger.
+                while (!in_modal_frame && SDL_PollEvent(&event)) {
                     if (g_swordfare_gui.process_event(event)) {
                         // ImGui consumed the event
                         continue;
@@ -8579,7 +8583,8 @@ void load_and_boot_arm64() {
                                 if (!(event.key.scancode >= SDL_SCANCODE_F1 && event.key.scancode <= SDL_SCANCODE_F12)) break;
                             }
                             if (should_block_keyboard()) {
-                                bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
+                                // F-keys stay hotkeys while an ImGui window has focus (F6 must close Graphics Options)
+                                bool is_toggle = (event.key.scancode >= SDL_SCANCODE_F1 && event.key.scancode <= SDL_SCANCODE_F12) || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE;
                                 if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
                             }
                             if (event.key.key == SDLK_F1 && !event.key.repeat) {
@@ -8664,11 +8669,6 @@ void load_and_boot_arm64() {
                                     SDL_StopTextInput(g_display_ptr->get_window());
                                     std::cout << "[Keyboard] Typing mode OFF" << std::endl;
                                 }
-                                break;
-                            }
-                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
-                                g_video_background_enabled = !g_video_background_enabled;
-                                std::cout << "[VideoBackground] Video playback: " << (g_video_background_enabled ? "ENABLED" : "DISABLED") << std::endl;
                                 break;
                             }
                             if (event.key.key == SDLK_F8 && !event.key.repeat) { mod_toggle_pause(); break; }
@@ -9272,7 +9272,12 @@ void load_and_boot_arm64() {
         };
         // Windows runs its own message loop while the window is dragged or a
         // menu is open; the menu code drives frames from there so the game keeps going.
-        win32_menu::set_modal_frame([&]() { if (running) run_frame(); });
+        win32_menu::set_modal_frame([&]() {
+            if (!running) return;
+            in_modal_frame = true;
+            run_frame();
+            in_modal_frame = false;
+        });
         while (running) run_frame();
         win32_menu::set_modal_frame(nullptr);
 
