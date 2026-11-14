@@ -43,11 +43,14 @@ From a source checkout, first build/package the client, then run the same comman
 
 ## Controls and branch scope
 
-Default movement is A/D or arrow keys; jump is Space/W; attack and magic bindings are shown in the F2 editor. Existing personal bindings override defaults.
+Default movement is A/D or arrow keys; jump is Space/W; attack and magic bindings are shown in the Controls window (F2). Existing personal bindings override defaults.
 
-- **F1:** existing upstream client menu.
-- **F2:** control editor; F2 saves/closes, R toggles key rebinding. Bindings persist after restarting.
-- **F3:** existing upstream performance/debug display. The validated live XYZ reader is an extras feature.
+Every function is reached through the menu bar (File, Emulation, View, Config, Tools, Help). The tool windows behind it are ordinary Windows dialogs that stay open beside the game. Hotkeys, menu texts and the *Help → Hotkeys* window all come from one table in `src/platform/hotkeys.cpp`.
+
+- **F1:** shows or hides the menu bar.
+- **F2:** Controls window. Double-click a binding, then press a key or controller button; changes are saved at once and persist after restarting.
+- **F3:** performance/debug overlay. The validated live XYZ reader is an extras feature.
+- **F4:** Cheats, **F6:** Graphics, **F11:** Scene Select, **`:** Lua Console, **F12:** fullscreen.
 
 Game Over accepts the original on-screen action and the supported keyboard inputs. Original game saves are separate from practice save/load-state features: **Save State and Load State are not implemented**.
 

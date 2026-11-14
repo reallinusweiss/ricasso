@@ -396,7 +396,12 @@ TouchButton* InputConfig::get_button(int index) {
 
 std::string InputConfig::scancode_name(int scancode) {
     if (scancode <= 0) return "-";
-    const char* name = SDL_GetScancodeName((SDL_Scancode)scancode);
+    // Bindings are physical keys (scancodes); show what the current keyboard
+    // layout prints on that key (the US "Z" key is "Y" on a German keyboard).
+    const SDL_Keycode key = SDL_GetKeyFromScancode((SDL_Scancode)scancode, SDL_KMOD_NONE, false);
+    const char* name = (key != SDLK_UNKNOWN) ? SDL_GetKeyName(key) : nullptr;
+    if (name && name[0] != '\0') return name;
+    name = SDL_GetScancodeName((SDL_Scancode)scancode);
     if (name && name[0] != '\0') return name;
     return "Key" + std::to_string(scancode);
 }

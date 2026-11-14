@@ -1,23 +1,17 @@
 // =============================================================================
-// Swordfare GUI — Modern ImGui-Based In-Game Overlay  (v7.3)
+// Swordfare GUI — ImGui layer drawn on top of the running game
 //
-// A sleek, modern overlay rendered on top of the running game using Dear ImGui
-// (SDL3 + OpenGL3 backends). Replaces the old bitmap-drawn F3 debug panel with
-// a proper dockable, styled ImGui window.
-//
-// Design goals:
-//   • Non-bitmap: uses ImGui vector rendering — crisp at all resolutions.
-//   • Dark + glassmorphism-inspired theme consistent with the launcher UI.
-//   • Minimal overhead — only renders when visible.
-//   • Easily extensible: future panels (controls editor, camera, mods) can be
-//     added as new SwardfarePanel subclasses without touching main.cpp.
+// Draws what stays inside the game picture: the F3 debug overlay and the
+// buttons and overlays that Lua mods register. Windows with controls are tool
+// windows (tool_windows.h); this class keeps the backends they use (Lua console
+// bridge, TCP console server, scene shifter).
 //
 // Usage:
 //   SwordfareGUI gui;
 //   gui.init(sdl_window, gl_context);        // call once after GL context ready
 //   // per-frame (after game draw, before swap):
 //   gui.begin_frame();
-//   if (gui.is_visible()) gui.draw_debug(fps, dt, ...);
+//   if (gui.is_visible()) gui.draw_debug(stats);
 //   gui.end_frame();
 //   gui.shutdown();                          // call on exit
 // =============================================================================
@@ -36,7 +30,6 @@ typedef struct VkDescriptorPool_T* VkDescriptorPool;
 #define VK_NULL_HANDLE nullptr
 #endif
 
-#include "platform/srt_overlay.h"
 #include "platform/gui.h"
 #include <vector>
 #include <string>
@@ -78,8 +71,6 @@ struct SwordfareDebugStats {
     const char* graphics_api   = "OpenGL";
 };
 
-struct ImGuiInputTextCallbackData;
-
 // ---------------------------------------------------------------------------
 // SwordfareGUI — main class
 // ---------------------------------------------------------------------------
@@ -111,72 +102,15 @@ public:
     void toggle_visible() { m_visible = !m_visible; }
     bool is_visible()     const { return m_visible; }
 
-    // Mod Overlay (Kiwi-compatible custom menu) visibility
-    void toggle_mod_overlay() {
-        m_mod_overlay_visible = !m_mod_overlay_visible;
-        m_f11_overlay_active = false;
-    }
-    bool is_mod_overlay_visible() const { return m_mod_overlay_visible; }
-    void set_mod_overlay_visible(bool visible) { m_mod_overlay_visible = visible; }
-    // F11 owns the scene/display toolbox and behaves as a real toggle.
-    void toggle_scene_toolbox() {
-        if (m_mod_overlay_visible && m_f11_overlay_active) {
-            m_mod_overlay_visible = false;
-            m_f11_overlay_active = false;
-            return;
-        }
-        m_mod_overlay_visible = true;
-        m_f11_overlay_active = true;
-        m_overlay_forced_tab = 2;
-    }
-    // True while the F11 toolbox is the open overlay (same condition toggle_scene_toolbox() uses).
-    bool is_scene_toolbox_visible() const { return m_mod_overlay_visible && m_f11_overlay_active; }
-
     // Draw the debug panel — call between begin_frame()/end_frame() when visible
     void draw_debug(const SwordfareDebugStats& stats);
 
     // Draw the custom LUA-registered buttons and overlays using ImGui vector elements
     void draw_buttons(void* guest_buttons_ptr, void* guest_overlays_ptr, bool globally_hidden = false);
 
-    // Draw the Lua script editor
-    void draw_lua_script_editor();
-
-    // Draw the Lua script manager
-    void draw_lua_script_manager();
-
-    // Draw the remastered mod manager overlay
-    void draw_mod_overlay(const std::string& save_dir);
-    // F2 controls editor window (bindings table, tap points)
-    void draw_controls_editor(class InputConfig& cfg);
-
-    // Help, About and Physics Editor windows opened from the native menu bar
-    void draw_menu_windows();
-    void open_help()           { m_show_help = true; }
-    void open_about()          { m_show_about = true; }
-    void open_physics_editor() { m_show_physics = true; }
-
-    void draw_about_panel(bool* p_open, float top_offset);
-    void draw_help_panel(bool* p_open, float top_offset);
-
-    // Draw the settings panel
-    GuiAction draw_settings_panel(bool* p_open);
-    bool m_show_about = false;
-    bool m_show_help  = false;
-    bool m_show_physics = false;
-
-    // ---- F6 Decoupled Graphical Options Modal ----
-    void draw_graphics_options_modal(struct PostFXState& state);
-    void toggle_graphics_options() { m_graphics_options_visible = !m_graphics_options_visible; }
-    bool is_graphics_options_visible() const { return m_graphics_options_visible; }
-    void set_graphics_options_visible(bool v) { m_graphics_options_visible = v; }
-    bool m_graphics_options_visible = false;
-
-    // ---- Lua Console (ImGui-native, replaces old bitmap console) ----
-    //
-    // Call init_lua_console() once when SRE console addrs are resolved.
-    // draw_lua_console() is called every frame from main loop.
-    // submit_lua_console() can be called externally (e.g. from keyboard handler).
-    //
+    // ---- Lua console backend ----
+    // init_lua_console() is called once when the SRE console addresses are resolved,
+    // update_console_backend() every frame. The window is in tool_windows_extra.cpp.
     struct ConsoleEntry { std::string text; bool is_error; bool is_input; };
 
     void init_lua_console(
@@ -204,34 +138,36 @@ public:
         uint64_t current_scene_va,       // char g_sre_current_scene_name[128]
         const std::string& assets_dir);  // path for host-side scan fallback
 
-    // Returns true if a command was consumed (caller should not re-process key).
-    bool lua_console_key(SDL_Keycode key, const std::string& text_input);
-    // Append text from SDL_EVENT_TEXT_INPUT
-    void lua_console_text(const char* text);
+    // Scene list and scene change for the Scene Select tool window.
+    struct SceneShifterState {
+        int count = 0;                        // entries in names
+        const char (*names)[128] = nullptr;
+        const char* current = "";             // current scene, may be empty
+        bool busy = false;                    // a scene change is pending or running
+        const char* error = "";               // last error, empty when none
+    };
+    SceneShifterState scene_shifter_state();
+    void scene_shifter_rescan();
+    bool scene_shifter_go(const char* scene, const char* spawn, bool forced);  // false while busy
 
-    // Draw the full ImGui terminal window. Call between begin_frame()/end_frame().
-    void draw_lua_console();
+    // Lua console backend for the Lua Console tool window.
+    const std::vector<ConsoleEntry>& console_history() const { return m_console_history; }
+    void console_run(const std::string& code) { console_submit(code); }
+    void console_clear() { m_console_history.clear(); }
 
-    bool is_lua_console_open() const { return m_console_open; }
     bool is_lua_console_ready() const { return m_console_ready; }
-    void toggle_lua_console();
     void update_console_backend();
 
     // Public entry point used by the SWORDFARE_TCP_PORT debug env var
     void auto_start_tcp_server(int port) { start_tcp_server(port); }
 
-    // Returns true if coordinates fall inside any active overlay, button, or console
+    // Returns true if coordinates fall inside an active Lua mod overlay or button
     bool is_input_blocked(float mx, float my);
 
 private:
     // Internal helpers
     void apply_swordfare_theme();
-    void scan_saves(const std::string& save_dir);
-    bool load_save(const std::string& path);
-    bool write_save(const std::string& path);
     void console_submit(const std::string& cmd); // write to guest + set pending
-    static int console_input_callback(ImGuiInputTextCallbackData* data);
-    int on_console_input_callback(ImGuiInputTextCallbackData* data);
 
     SDL_Window*   m_window   = nullptr;
     SDL_GLContext m_gl_ctx   = nullptr;
@@ -258,36 +194,10 @@ private:
 
     bool          m_initialized = false;
     bool          m_visible     = false;
-    bool          m_mod_overlay_visible = false;
-    bool          m_f11_overlay_active = false;
     bool          m_buttons_globally_hidden = false;
-
-    int m_overlay_forced_tab = -1;   // -1 = none; 0=Home 1=Display 2=Scene 3=Diagnostics
-    int m_overlay_tab        = 0;    // active nav-rail item in the toolbox
-
-    // ── Remaster textures (OpenGL path only; Vulkan falls back to vector UI) ──
-    GLuint m_tex_overlay_bg     = 0;   // launcher_bg.png / ui_panel.png backdrop
-    GLuint m_tex_swordigo_icon  = 0;   // swordigo_default.png / icon_app.png
-    int    m_tex_overlay_bg_w   = 0, m_tex_overlay_bg_h   = 0;
-    int    m_tex_swordigo_icon_w = 0, m_tex_swordigo_icon_h = 0;
-    GLuint m_tex_btn_wide       = 0;   // ui_button_wide.png (game button art)
-    int    m_tex_btn_wide_w     = 0, m_tex_btn_wide_h     = 0;
-    GLuint m_tex_panel          = 0;   // ui_panel.png (game panel art)
-    int    m_tex_panel_w        = 0, m_tex_panel_h       = 0;
-    GLuint m_tex_items[4]       = {0}; // item icons (sword, trinkets, potion)
-    int    m_tex_items_w[4]     = {0}, m_tex_items_h[4]   = {0};
 
     void*         m_last_buttons_ptr = nullptr;
     void*         m_last_overlays_ptr = nullptr;
-
-    // Save editor state
-    std::string              m_save_dir;
-    std::vector<std::string> m_save_files;
-    int                      m_selected_save = -1;
-    InventoryState           m_inventory;
-    bool                     m_inventory_dirty = false;
-    std::string              m_status_msg;
-    float                    m_status_timer = 0.0f;
 
     // Smooth FPS graph data
     static constexpr int FPS_HISTORY = 90;
@@ -296,8 +206,6 @@ private:
 
     // ---- Lua Console state ----
     bool          m_console_ready  = false;
-    bool          m_console_open   = false;
-    bool          m_console_focus  = false; // request ImGui focus next frame
 
     uint8_t*      m_guest_memory   = nullptr;
     uint64_t      m_console_buf_addr     = 0;
@@ -323,25 +231,6 @@ private:
     static constexpr int CONSOLE_MAX_HISTORY = 4096;
 
     std::vector<ConsoleEntry>  m_console_history;
-    char                       m_console_input[16384] = {};
-    std::vector<std::string>   m_console_cmd_history; // up-arrow recall
-    int                        m_console_hist_idx = -1;
-    bool                       m_console_scroll_bottom = false;
-
-    // ---- Lua Script Editor ----
-    bool                       m_script_editor_open = false;
-    char                       m_script_editor_name[128] = "mod_script.lua";
-    char                       m_script_editor_buf[32768] = "";
-    std::string                m_script_editor_status = "Ready";
-    float                      m_script_editor_status_color[4] = {0.5f, 0.5f, 0.5f, 1.0f};
-
-    // ---- Lua Script Manager ----
-    struct LuaScriptMeta {
-        std::string filename;
-        bool valid;
-    };
-    bool                       m_script_manager_open = false;
-    std::vector<LuaScriptMeta> m_script_list;
 
     // ---- TCP Console Server (openport command) ----
     void start_tcp_server(int port);

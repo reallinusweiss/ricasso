@@ -21,6 +21,9 @@ GuiAction take_action();           // menu command chosen since the last call, o
 // One game frame, run from a timer while Windows keeps the thread in a modal
 // loop (window drag or open menu), so the game does not freeze. nullptr clears it.
 void set_modal_frame(std::function<void()> frame);
+// Keep game frames running while another window of this app runs a modal loop
+void modal_begin();
+void modal_end();
 
 }  // namespace win32_menu
 

@@ -42,7 +42,8 @@ def main():
         return dst
     exe = copy(ROOT / 'binw/swordfare.exe', 'swordfare.exe')
     subprocess.run([str(prefix/'bin/strip.exe'), '--strip-unneeded', str(exe)], check=True)
-    queue = [exe, copy(prefix/'share/qt6/plugins/platforms/qwindows.dll', 'platforms/qwindows.dll')]
+    queue = [exe, copy(prefix/'share/qt6/plugins/platforms/qwindows.dll', 'platforms/qwindows.dll'),
+             copy(prefix/'share/qt6/plugins/styles/qmodernwindowsstyle.dll', 'styles/qmodernwindowsstyle.dll')]
     available = {p.name.lower():p for p in (prefix/'bin').glob('*.dll')}
     system = Path(os.environ['SystemRoot'])/'System32'
     imports = {}

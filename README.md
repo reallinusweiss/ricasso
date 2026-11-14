@@ -42,7 +42,7 @@ The file can be an `.apkm`, `.apks`, `.xapk`, `.apk`, several split APKs or a fo
 | Game menu | Escape | Start |
 | Menus and dialogs | Mouse | Right stick moves the pointer, RT clicks |
 
-F2 opens the key editor (R = rebind, F2 = save), F1 the Ricasso menu and F3 the performance overlay.
+Every function is in the menu bar at the top of the window; F1 shows or hides it. The tool windows are ordinary Windows dialogs that stay open beside the game: F2 Controls (double-click a binding, then press a key or controller button), F4 Cheats, F6 Graphics, F11 Scene Select. F3 shows the performance overlay and F12 switches fullscreen. *Help → Hotkeys* lists all of them.
 
 ### Updating and uninstalling
 

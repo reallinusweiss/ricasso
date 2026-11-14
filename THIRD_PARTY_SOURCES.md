@@ -28,7 +28,7 @@ Each link is the exact source package of the shipped version. Their license text
 | mpg123 | 1.33.7-1 | LGPL-2.1-or-later | libmpg123-0.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-mpg123-1.33.7-1.src.tar.zst) |
 | openal | 1.25.2-1 | GPL-2.0-or-later | libopenal-1.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-openal-1.25.2-1.src.tar.zst) |
 | pcre2 | 10.49-1 | BSD-3-Clause | libpcre2-16-0.dll, libpcre2-8-0.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-pcre2-10.49-1.src.tar.zst) |
-| qt6-base | 6.11.2-2 | LGPL-3.0-only WITH Qt-GPL-exception-1.0 AND AFL-2.1 AND Apache-2.0 AND BSL-1.0 AND CC0-1.0 AND BSD-3-Clause AND CC-BY-4.0 AND GFDL-1.3-no-invariants-only AND GPL-2.0-only AND GPL-2.0-or-later AND GPL-3.0-only AND custom | Qt6Core.dll, Qt6Gui.dll, Qt6Network.dll, Qt6Widgets.dll, qwindows.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-qt6-base-6.11.2-2.src.tar.zst) |
+| qt6-base | 6.11.2-2 | LGPL-3.0-only WITH Qt-GPL-exception-1.0 AND AFL-2.1 AND Apache-2.0 AND BSL-1.0 AND CC0-1.0 AND BSD-3-Clause AND CC-BY-4.0 AND GFDL-1.3-no-invariants-only AND GPL-2.0-only AND GPL-2.0-or-later AND GPL-3.0-only AND custom | Qt6Core.dll, Qt6Gui.dll, Qt6Network.dll, Qt6Widgets.dll, qwindows.dll, qmodernwindowsstyle.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-qt6-base-6.11.2-2.src.tar.zst) |
 | sdl3 | 3.4.18-1 | Zlib | SDL3.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-sdl3-3.4.18-1.src.tar.zst) |
 | sdl3-image | 3.4.8-1 | Zlib | SDL3_image.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-sdl3-image-3.4.8-1.src.tar.zst) |
 | zlib | 1.3.2-2 | Zlib | zlib1.dll | [source](https://repo.msys2.org/mingw/sources/mingw-w64-zlib-1.3.2-2.src.tar.zst) |

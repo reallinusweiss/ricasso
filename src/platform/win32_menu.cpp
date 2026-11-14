@@ -1,10 +1,12 @@
 // Native Win32 menu bar for the game window. Menu commands are queued as
 // GuiActions and run by the main loop through process_gui_action().
 #include "win32_menu.h"
+#include "hotkeys.h"
 
 #include <SDL3/SDL.h>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #ifdef _WIN32
@@ -13,12 +15,10 @@
 extern bool g_game_paused;
 extern bool g_cam_active;
 extern bool g_cam_smooth;
-extern GuiRenderer g_gui;
 extern int GAME_W, GAME_H;
 extern int g_render_preset;
 void apply_render_preset(int preset);
 void apply_custom_render_resolution(int w, int h);
-bool mod_cheats_available();
 bool dev_overlay_available(GuiAction a);
 bool debug_overlay_visible();
 bool menu_check_state(GuiAction a);
@@ -32,7 +32,7 @@ constexpr UINT kIdRenderCustom = 2100;
 constexpr UINT kIdWindowSize = 2200;    // + index into kWindowSizes
 
 struct RenderItem { int preset; const wchar_t* label; };
-// Order and preset indices as in the old F11 panel; see apply_render_preset() in main.cpp.
+// Order and preset indices of the render resolution list; see apply_render_preset() in main.cpp.
 const RenderItem kRenderItems[] = {
     {10, L"4K (3840 x 2160)"}, {9, L"1440p (2560 x 1440)"}, {0, L"1080p (1920 x 1080)"},
     {11, L"900p (1600 x 900)"}, {12, L"768p (1366 x 768)"}, {1, L"720p (1280 x 720)"},
@@ -66,7 +66,15 @@ WPARAM s_last_syskey = 0;
 std::function<void()> s_modal_frame;   // runs one game frame (set by the main loop)
 constexpr UINT_PTR kModalTimer = 0x5246;  // timer id while a modal loop runs
 
-void add(HMENU m, GuiAction a, const wchar_t* text) { AppendMenuW(m, MF_STRING, kIdBase + a, text); }
+// Menu item; the shortcut shown after the tab comes from the shared hotkey table.
+void add(HMENU m, GuiAction a, const wchar_t* text) {
+    std::wstring item = text;
+    if (const char* key = hotkey_label(a)) {
+        item += L'\t';
+        for (const char* c = key; *c; ++c) item += static_cast<wchar_t>(*c);
+    }
+    AppendMenuW(m, MF_STRING, kIdBase + a, item.c_str());
+}
 void separator(HMENU m) { AppendMenuW(m, MF_SEPARATOR, 0, nullptr); }
 void popup(HMENU bar, HMENU sub, const wchar_t* text) { AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), text); }
 // Radio-style item: CheckMenuItem then shows a bullet instead of a tick.
@@ -83,23 +91,20 @@ HMENU build() {
     HMENU bar = CreateMenu();
 
     HMENU file = CreatePopupMenu();
-    add(file, GUI_EXIT, L"E&xit\tAlt+F4");
+    add(file, GUI_EXIT, L"E&xit");
     popup(bar, file, L"&File");
 
     HMENU emu = CreatePopupMenu();
-    add(emu, GUI_PAUSE, L"&Pause\tF8");
-    add(emu, GUI_STEP_FRAME, L"&Frame Advance\tF9");
+    add(emu, GUI_PAUSE, L"&Pause");
+    add(emu, GUI_STEP_FRAME, L"&Frame Advance");
     separator(emu);
-    add(emu, GUI_GAME_SPEED_UP, L"Speed &Up\t+");
-    add(emu, GUI_GAME_SPEED_DOWN, L"Speed &Down\t-");
-    add(emu, GUI_GAME_SPEED_RESET, L"Speed &Reset\t0");
+    add(emu, GUI_GAME_SPEED_UP, L"Speed &Up");
+    add(emu, GUI_GAME_SPEED_DOWN, L"Speed &Down");
+    add(emu, GUI_GAME_SPEED_RESET, L"&Reset Speed");
     popup(bar, emu, L"&Emulation");
 
     HMENU view = CreatePopupMenu();
-    add(view, GUI_TOGGLE_MENU_BAR, L"&Menu Bar\tF1");
-    add(view, GUI_TOGGLE_TOUCH_CONTROLS, L"&On-screen Controls\tF10");
-    add(view, GUI_TOGGLE_GRAPHICS_OPTIONS, L"&Graphics Options...\tF6");
-    separator(view);
+    add(view, GUI_TOGGLE_FULLSCREEN, L"&Fullscreen");
     HMENU winsize = CreatePopupMenu();
     for (UINT i = 0; i < sizeof(kWindowSizes) / sizeof(kWindowSizes[0]); i++)
         add_radio(winsize, kIdWindowSize + i, kWindowSizes[i].label);
@@ -111,59 +116,48 @@ HMENU build() {
     separator(render);
     add_radio(render, kIdRenderCustom, L"&Custom...");
     popup(view, render, L"&Render Resolution");
+    separator(view);
+    add(view, GUI_TOGGLE_MENU_BAR, L"&Menu Bar");
+    add(view, GUI_TOGGLE_TOUCH_CONTROLS, L"&On-screen Controls");
+    add(view, GUI_TOGGLE_DEBUG_OVERLAY, L"&Debug Overlay");
+    // The SRE overlays exist only when the runtime exports their request flags.
+    if (dev_overlay_available(GUI_TOGGLE_COLLISION_SHAPES))
+        add(view, GUI_TOGGLE_COLLISION_SHAPES, L"&Collision && Hitboxes");
+    if (dev_overlay_available(GUI_TOGGLE_COMBAT_WIREFRAME))
+        add(view, GUI_TOGGLE_COMBAT_WIREFRAME, L"&Hide HUD && Overlays");
     popup(bar, view, L"&View");
 
     HMENU config = CreatePopupMenu();
-    add(config, GUI_CUSTOMIZE_CONTROLS, L"&Customize Controls\tF2");
+    add(config, GUI_CUSTOMIZE_CONTROLS, L"&Controls...");
+    add(config, GUI_TOGGLE_GRAPHICS_OPTIONS, L"&Graphics...");
+    separator(config);
+    add(config, GUI_TOGGLE_TYPING_MODE, L"Keyboard &Typing Mode");
+    separator(config);
+    add(config, GUI_MUSIC_MUTE, L"&Mute Music");
+    add(config, GUI_MUSIC_VOL_UP, L"Music Volume &Up");
+    add(config, GUI_MUSIC_VOL_DOWN, L"Music Volume &Down");
     popup(bar, config, L"&Config");
 
-    // Cheat toggles and the Physics Editor only work where a per-frame applier runs.
-    const bool cheats = mod_cheats_available();
-    HMENU mods = CreatePopupMenu();
-    if (cheats) {
-        add(mods, GUI_MOD_GOD_MODE, L"Infinite &Health");
-        add(mods, GUI_MOD_INFINITE_MANA, L"Infinite &Mana");
-        add(mods, GUI_MOD_INFINITE_JUMP, L"Infinite &Jump");
-        separator(mods);
-    }
-    HMENU stats = CreatePopupMenu();
-    add(stats, GUI_MOD_HEAL_FULL, L"&Heal Full HP");
-    add(stats, GUI_MOD_REFILL_MANA, L"Refill &Mana");
-    add(stats, GUI_MOD_ADD_COINS, L"+100 &Coins");
-    separator(stats);
-    add(stats, GUI_MOD_LEVEL_UP, L"&Level Up (+1)");
-    add(stats, GUI_MOD_LEVEL_DOWN, L"Level &Down (-1)");
-    add(stats, GUI_MOD_EXP_UP, L"&XP +500");
-    add(stats, GUI_MOD_EXP_DOWN, L"XP &-500");
-    popup(mods, stats, L"&Stats Editor");
-    if (cheats) add(mods, GUI_OPEN_PHYSICS_EDITOR, L"&Physics Editor...");
-    add(mods, GUI_TOGGLE_MOD_HUB, L"Mod Hu&b\tF4");
-    popup(bar, mods, L"&Mods");
-
-    HMENU settings = CreatePopupMenu();
-    add(settings, GUI_TOGGLE_FULLSCREEN, L"&Fullscreen\tF12");
-    separator(settings);
-    add(settings, GUI_TOGGLE_CAM, L"Camera &Override\tF5");
-    add(settings, GUI_TOGGLE_SMOOTH_CAM, L"&Smooth Camera");
-    separator(settings);
-    add(settings, GUI_MUSIC_MUTE, L"&Mute / Unmute Music");
-    add(settings, GUI_MUSIC_VOL_UP, L"Volume &Up");
-    add(settings, GUI_MUSIC_VOL_DOWN, L"Volume &Down");
-    popup(bar, settings, L"&Settings");
-
-    // Developer toggles; the SRE ones exist only when the runtime exports their request flags.
-    HMENU dev = CreatePopupMenu();
-    add(dev, GUI_TOGGLE_DEBUG_OVERLAY, L"&Debug Overlay\tF3");
-    add(dev, GUI_TOGGLE_SCENE_TOOLBOX, L"&Scene Toolbox\tF11");
-    if (dev_overlay_available(GUI_TOGGLE_COLLISION_SHAPES))
-        add(dev, GUI_TOGGLE_COLLISION_SHAPES, L"&Collision && Hitboxes\tCtrl+Shift+D");
-    if (dev_overlay_available(GUI_TOGGLE_COMBAT_WIREFRAME))
-        add(dev, GUI_TOGGLE_COMBAT_WIREFRAME, L"&Hide HUD && Overlays\tCtrl+Shift+W");
-    popup(bar, dev, L"&Developer");
+    HMENU tools = CreatePopupMenu();
+    add(tools, GUI_TOGGLE_CHEATS, L"&Cheats...");
+    add(tools, GUI_TOGGLE_SCENE_SELECT, L"&Scene Select...");
+    separator(tools);
+    add(tools, GUI_TOGGLE_CAM, L"&Free Camera");
+    add(tools, GUI_TOGGLE_SMOOTH_CAM, L"S&mooth Camera");
+    add(tools, GUI_TOGGLE_CAM_POV, L"First-&Person View");
+    add(tools, GUI_CAM_FOV_DOWN, L"&Narrower Field of View");
+    add(tools, GUI_CAM_FOV_UP, L"&Wider Field of View");
+    separator(tools);
+    add(tools, GUI_CYCLE_TIME_OF_DAY, L"Cycle &Time of Day");
+    separator(tools);
+    add(tools, GUI_TOGGLE_LUA_CONSOLE, L"&Lua Console...");
+    add(tools, GUI_TOGGLE_LUA_SCRIPTS, L"Lua Scr&ipts...");
+    add(tools, GUI_TOGGLE_ERROR_LOG, L"Lua &Error Log...");
+    popup(bar, tools, L"&Tools");
 
     HMENU help = CreatePopupMenu();
-    add(help, GUI_KEYBINDS, L"&Hotkeys");
-    add(help, GUI_ABOUT, L"&About");
+    add(help, GUI_KEYBINDS, L"&Hotkeys...");
+    add(help, GUI_ABOUT, L"&About Ricasso...");
     popup(bar, help, L"&Help");
     return bar;
 }
@@ -203,17 +197,16 @@ void check(GuiAction a, bool on) {
 void refresh_checks() {
     check(GUI_PAUSE, g_game_paused);
     check(GUI_TOGGLE_FULLSCREEN, is_fullscreen());
+    check(GUI_TOGGLE_MENU_BAR, visible());
+    check(GUI_TOGGLE_TOUCH_CONTROLS, menu_check_state(GUI_TOGGLE_TOUCH_CONTROLS));
+    check(GUI_TOGGLE_DEBUG_OVERLAY, debug_overlay_visible());
+    check(GUI_TOGGLE_TYPING_MODE, menu_check_state(GUI_TOGGLE_TYPING_MODE));
     check(GUI_TOGGLE_CAM, g_cam_active);
     check(GUI_TOGGLE_SMOOTH_CAM, g_cam_smooth);
-    check(GUI_TOGGLE_DEBUG_OVERLAY, debug_overlay_visible());
-    check(GUI_TOGGLE_MENU_BAR, visible());
-    check(GUI_TOGGLE_MOD_HUB, menu_check_state(GUI_TOGGLE_MOD_HUB));
-    check(GUI_TOGGLE_GRAPHICS_OPTIONS, menu_check_state(GUI_TOGGLE_GRAPHICS_OPTIONS));
-    check(GUI_TOGGLE_TOUCH_CONTROLS, menu_check_state(GUI_TOGGLE_TOUCH_CONTROLS));
-    check(GUI_TOGGLE_SCENE_TOOLBOX, menu_check_state(GUI_TOGGLE_SCENE_TOOLBOX));
-    check(GUI_MOD_GOD_MODE, g_gui.mod_god_mode);
-    check(GUI_MOD_INFINITE_MANA, g_gui.mod_infinite_mana);
-    check(GUI_MOD_INFINITE_JUMP, g_gui.mod_infinite_jump);
+    check(GUI_TOGGLE_CAM_POV, menu_check_state(GUI_TOGGLE_CAM_POV));
+    // These three only work while the free camera is on.
+    for (GuiAction a : {GUI_TOGGLE_CAM_POV, GUI_CAM_FOV_DOWN, GUI_CAM_FOV_UP})
+        EnableMenuItem(s_menu, kIdBase + a, MF_BYCOMMAND | (g_cam_active ? MF_ENABLED : MF_GRAYED));
     for (const RenderItem& r : kRenderItems) check_id(kIdRender + r.preset, g_render_preset == r.preset);
     check_id(kIdRender + 3, g_render_preset == 3);
     check_id(kIdRenderCustom, g_render_preset == -1);
@@ -248,6 +241,12 @@ INT_PTR CALLBACK custom_res_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         size = reinterpret_cast<int*>(lp);
         SetDlgItemInt(dlg, kIdEditW, size[0], FALSE);
         SetDlgItemInt(dlg, kIdEditH, size[1], FALSE);
+        PostMessageW(dlg, WM_APP, 0, 0);
+        return TRUE;
+    case WM_APP:
+        // A client started with "hide window" (the Ricasso starter) has its first
+        // ShowWindow call ignored by Windows; without this the dialog could stay invisible.
+        if (!IsWindowVisible(dlg)) ShowWindow(dlg, SW_SHOWNORMAL);
         return TRUE;
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK) {
@@ -451,6 +450,9 @@ void set_modal_frame(std::function<void()> frame) {
     if (!s_modal_frame && s_hwnd) KillTimer(s_hwnd, kModalTimer);
 }
 
+void modal_begin() { if (s_modal_frame && s_hwnd) SetTimer(s_hwnd, kModalTimer, USER_TIMER_MINIMUM, nullptr); }
+void modal_end()   { if (s_hwnd) KillTimer(s_hwnd, kModalTimer); }
+
 GuiAction take_action() {
     // A fullscreen switch that bypassed toggle_fullscreen() must not keep the bar.
     if (is_fullscreen() && !s_fs_visible) attach(false);
@@ -476,6 +478,8 @@ void before_fullscreen() {}
 void after_windowed() {}
 void fit_window(SDL_Window*) {}
 void set_modal_frame(std::function<void()>) {}
+void modal_begin() {}
+void modal_end() {}
 GuiAction take_action() { return GUI_NONE; }
 }  // namespace win32_menu
 

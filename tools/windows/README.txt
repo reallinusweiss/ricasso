@@ -28,7 +28,7 @@ CONTROLS
 Keyboard:   A / D or arrow keys: move      Space or W: jump      Attack/magic: see F2
 Controller: left stick or D-pad: move      A: jump      X: attack      Y: magic      B: item
             Start: game menu      In menus: right stick moves the pointer, RT clicks
-F1: menu      F2: change keys (R = rebind, F2 = save)      F3: performance overlay
+F1: menu bar      F2: controls      F6: graphics      F12: fullscreen      All hotkeys: Help > Hotkeys
 
 
 PROBLEMS?

@@ -74,6 +74,8 @@ extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp �
 #include "platform/save_editor.h"
 #include "platform/swordfare_gui.h"  /* Swordfare: ImGui-based in-game overlay */
 #include "platform/win32_menu.h"
+#include "platform/tool_windows.h"
+#include "platform/hotkeys.h"
 #include "platform/loading_screen.h" /* Boot loading screen (hiro POD + progress) */
 #include "platform/crash_dialog.h"   /* Sleek fatal-crash reporting window */
 #include "platform/launcher_config.h"
@@ -863,6 +865,9 @@ PostFXState g_postfx;
 PostFXPreset g_postfx_preset = PostFXPreset::SW_PLUS_MEDIUM;
 SkyRenderer g_sky;
 SwordfareGUI g_swordfare_gui;  /* Swordfare: ImGui in-game overlay */
+// Actions posted by the tool windows; the main loop runs them between frames.
+static std::deque<GuiAction> g_posted_gui_actions;
+void post_gui_action(GuiAction a) { if (a != GUI_NONE) g_posted_gui_actions.push_back(a); }
 
 // Direct control native symbol addresses
 uint64_t g_vaddr_StartMovingToDirection = 0;
@@ -897,7 +902,7 @@ static uint64_t g_lua_console_pending_addr = 0;   // Guest addr of pending flag
 static uint64_t g_lua_console_status_addr = 0;    // Guest addr of status (0=idle,1=ok,2=err)
 static uint64_t g_lua_console_print_addr = 0;     // Guest addr of captured print() output
 static bool     g_lua_console_ready = false;       // true when all addrs resolved
-// NOTE: console open state + history now owned by SwordfareGUI (draw_lua_console)
+// NOTE: the Lua console is a tool window now (tool_windows_extra.cpp); SwordfareGUI keeps the backend.
 static uint64_t g_sre_game_notification_addr = 0;
 static uint64_t g_sre_game_notification_pending_addr = 0;
 
@@ -905,10 +910,7 @@ static bool should_block_keyboard() {
     if (g_graphics_api != GraphicsAPI::OPENGL) return false;
     if (ImGui::GetCurrentContext() == nullptr) return false;
     ImGuiIO& io = ImGui::GetIO();
-    return io.WantCaptureKeyboard || 
-           g_swordfare_gui.is_mod_overlay_visible() ||
-           g_swordfare_gui.is_visible() ||
-           g_swordfare_gui.is_lua_console_open();
+    return io.WantCaptureKeyboard;
 }
 
 // SRE lua_resume error monitoring — guest addresses
@@ -1171,7 +1173,7 @@ static uint64_t g_fw_sendKeyDown = 0;       // Caver::FWKeyboard::SendKeyDownEve
 static uint64_t g_fw_sendKeyUp = 0;         // Caver::FWKeyboard::SendKeyUpEvent(uint, uint, double)
 static uint64_t g_fw_sendKeyChar = 0;       // Caver::FWKeyboard::SendKeyCharEvent(uint, double)
 static uint64_t g_fw_handleMenuBtn = 0;     // Java_com_touchfoo_swordigo_Native_handleMenuButtonPress
-static bool g_typing_mode = false;          // F6 toggle: keyboard sends FWKeyboard events
+static bool g_typing_mode = false;          // typing mode: the keyboard sends FWKeyboard events
 
 // Text input system — game calls startTextInput/stopTextInput via JNI,
 // we route SDL text events back to the game via textInputTextDidChange/textInputDidFinish
@@ -1188,11 +1190,10 @@ extern int g_death_detected_countdown;  // Defined in jni_bridge.cpp
 // Check state for toggle items in the native menu bar.
 bool menu_check_state(GuiAction a) {
     switch (a) {
-        case GUI_TOGGLE_MOD_HUB:             return g_swordfare_gui.is_mod_overlay_visible();
-        case GUI_TOGGLE_GRAPHICS_OPTIONS:    return g_swordfare_gui.is_graphics_options_visible();
         case GUI_TOGGLE_VIDEO_BG:            return g_video_background_enabled;
         case GUI_TOGGLE_TOUCH_CONTROLS:      return !g_gl_hide_hud;
-        case GUI_TOGGLE_SCENE_TOOLBOX:       return g_swordfare_gui.is_scene_toolbox_visible();
+        case GUI_TOGGLE_TYPING_MODE:         return g_typing_mode;
+        case GUI_TOGGLE_CAM_POV:             return g_cam_pov_mode;
         default:                             return false;
     }
 }
@@ -1563,6 +1564,95 @@ uint64_t setup_jni_env_arm64(uint8_t* memory) {
 
 static bool arm64_mod_quick_action(GuiAction a);  // defined next to the ARM64 hero roots
 
+// Day -> Afternoon -> Night -> Day: PostFX look plus background brightness.
+static void cycle_time_of_day() {
+    // 0=Day, 1=Afternoon, 2=Night
+    static int time_of_day = 0;
+    time_of_day = (time_of_day + 1) % 3;
+
+    // Start from current PostFX preset
+    postfx_apply_preset(g_postfx, g_postfx_preset);
+
+    if (time_of_day == 0) {
+        // === DAY (default) ===
+        // Restore background brightness
+        if (bg_brightness_addr) {
+            *(float*)(g_guest_memory + bg_brightness_addr) = 1.0f;
+        }
+        mod_toast("Day", 1.5f);
+        std::cout << "[TimeOfDay] Day — default" << std::endl;
+
+    } else if (time_of_day == 1) {
+        // === AFTERNOON (1PM warm light) ===
+        // No background filter — keep BG bright and warm
+        if (bg_brightness_addr) {
+            *(float*)(g_guest_memory + bg_brightness_addr) = 1.1f;
+        }
+        g_postfx.enabled = true;
+        // Warm vibrant color grading
+        g_postfx.color_adjust = true;
+        g_postfx.warmth = 0.35f;        // warm golden tone
+        g_postfx.brightness = 0.05f;    // slightly brighter
+        g_postfx.contrast = 1.1f;       // punchy contrast
+        g_postfx.saturation = 1.2f;     // vivid colors
+        // Strong god rays — intense afternoon sun
+        g_postfx.god_rays = true;
+        g_postfx.god_rays_intensity = 0.8f;
+        g_postfx.god_rays_decay = 0.97f;
+        g_postfx.sun_x = 0.75f;         // sun to the right
+        g_postfx.sun_y = 0.7f;          // lower in sky
+        // Strong SSAO — harsh afternoon shadows
+        g_postfx.ssao = true;
+        g_postfx.ssao_radius = 0.03f;
+        g_postfx.ssao_intensity = 1.5f;
+        // Bloom — bright sun reflections
+        g_postfx.bloom = true;
+        g_postfx.bloom_threshold = 0.55f;
+        g_postfx.bloom_intensity = 0.35f;
+        // Shadows — strong directional
+        g_postfx.shadows = true;
+        g_postfx.shadow_intensity = 0.55f;
+        g_postfx.shadow_light_x = 0.5f;
+        g_postfx.shadow_light_y = -0.6f;
+        // Subtle vignette
+        g_postfx.vignette = true;
+        g_postfx.vignette_intensity = 0.15f;
+        mod_toast("Afternoon", 1.5f);
+        std::cout << "[TimeOfDay] Afternoon — warm, bright, strong shadows" << std::endl;
+
+    } else {
+        // === NIGHT ===
+        // Dim the SRE background renderer
+        if (bg_brightness_addr) {
+            *(float*)(g_guest_memory + bg_brightness_addr) = 0.3f;
+        }
+        g_postfx.enabled = true;
+        // Cool blue desaturated tint
+        g_postfx.color_adjust = true;
+        g_postfx.brightness = -0.12f;    // dim overall
+        g_postfx.contrast = 0.9f;        // softer contrast
+        g_postfx.saturation = 0.6f;      // desaturate
+        g_postfx.warmth = -0.25f;        // cool blue shift
+        // Heavy vignette — darkness at edges
+        g_postfx.vignette = true;
+        g_postfx.vignette_intensity = 0.55f;
+        // SSAO for dark corners
+        g_postfx.ssao = true;
+        g_postfx.ssao_radius = 0.03f;
+        g_postfx.ssao_intensity = 1.6f;
+        // No god rays at night — moonlight bloom instead
+        g_postfx.god_rays = false;
+        g_postfx.bloom = true;
+        g_postfx.bloom_threshold = 0.5f;
+        g_postfx.bloom_intensity = 0.4f;
+        // Film grain for atmosphere
+        g_postfx.film_grain = true;
+        g_postfx.grain_intensity = 0.03f;
+        mod_toast("Night", 1.5f);
+        std::cout << "[TimeOfDay] Night — dim, cool, atmospheric" << std::endl;
+    }
+}
+
 // Switches between windowed mode and borderless fullscreen. SDL remembers the
 // windowed size and position and restores both when fullscreen ends; the native
 // menu bar is hidden while fullscreen.
@@ -1601,8 +1691,7 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             std::cout << "[GUI] Emulation " << (g_game_paused ? "PAUSED" : "RESUMED") << std::endl;
             break;
         case GUI_CUSTOMIZE_CONTROLS:
-            g_input_config.set_editing(true);
-            std::cout << "[GUI] Controls editor opened" << std::endl;
+            tool_windows::toggle(tool_windows::CONTROLS);
             break;
         case GUI_SAVE_STATE:
             std::cout << "[GUI] Save State requested" << std::endl;
@@ -1819,7 +1908,7 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             g_gui.mod_infinite_jump = !g_gui.mod_infinite_jump;
             break;
         case GUI_OPEN_PHYSICS_EDITOR:
-            g_swordfare_gui.open_physics_editor();
+            tool_windows::show(tool_windows::CHEATS);
             break;
         case GUI_TOGGLE_MENU_BAR:
             win32_menu::set_visible(!win32_menu::visible());
@@ -1827,11 +1916,11 @@ void process_gui_action(GuiAction gui_action, bool& running) {
         case GUI_STEP_FRAME:
             mod_step_frame();
             break;
-        case GUI_TOGGLE_MOD_HUB:
-            g_swordfare_gui.toggle_mod_overlay();
+        case GUI_TOGGLE_CHEATS:
+            tool_windows::toggle(tool_windows::CHEATS);
             break;
         case GUI_TOGGLE_GRAPHICS_OPTIONS:
-            g_swordfare_gui.toggle_graphics_options();
+            tool_windows::toggle(tool_windows::GRAPHICS);
             break;
         case GUI_TOGGLE_VIDEO_BG:
             g_video_background_enabled = !g_video_background_enabled;
@@ -1840,17 +1929,102 @@ void process_gui_action(GuiAction gui_action, bool& running) {
         case GUI_TOGGLE_TOUCH_CONTROLS:
             g_gl_hide_hud = !g_gl_hide_hud;
             break;
-        case GUI_TOGGLE_SCENE_TOOLBOX:
-            g_swordfare_gui.toggle_scene_toolbox();
+        case GUI_TOGGLE_SCENE_SELECT:
+            tool_windows::toggle(tool_windows::SCENE_SELECT);
+            break;
+        case GUI_TOGGLE_LUA_CONSOLE:
+            tool_windows::toggle(tool_windows::LUA_CONSOLE);
+            break;
+        case GUI_TOGGLE_LUA_SCRIPTS:
+            tool_windows::toggle(tool_windows::LUA_SCRIPTS);
+            break;
+        case GUI_TOGGLE_ERROR_LOG:
+            tool_windows::toggle(tool_windows::ERROR_LOG);
+            break;
+        case GUI_CYCLE_TIME_OF_DAY:
+            cycle_time_of_day();
+            break;
+        case GUI_TOGGLE_CAM_POV:
+            if (g_cam_active) {
+                g_cam_pov_mode = !g_cam_pov_mode;
+                if (!g_cam_pov_mode) {
+                    // Leaving POV: clear free-look so the next
+                    // entry returns to legacy ±45° facing.
+                    g_cam_yaw = 0.0f;
+                    g_cam_pitch = 0.0f;
+                    g_cam_roll = 0.0f;
+                }
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Camera POV: %s", g_cam_pov_mode ? "ON (drag to look)" : "OFF");
+                mod_toast(msg, 1.5f);
+                cam_write_to_guest();
+            }
+            break;
+        case GUI_CAM_FOV_DOWN:
+            if (g_cam_active) {
+                extern void cam_set_fov(float fov_rad);
+                float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
+                cam_set_fov(std::max(0.35f, cur - 0.05f));
+            }
+            break;
+        case GUI_CAM_FOV_UP:
+            if (g_cam_active) {
+                extern void cam_set_fov(float fov_rad);
+                float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
+                cam_set_fov(std::min(1.4f, cur + 0.05f));
+            }
+            break;
+        case GUI_TOGGLE_TYPING_MODE: {
+            extern Display* g_display_ptr;
+            g_typing_mode = !g_typing_mode;
+            if (g_typing_mode) {
+                if (g_display_ptr) SDL_StartTextInput(g_display_ptr->get_window());
+                std::cout << "[Keyboard] Typing mode ON" << std::endl;
+            } else {
+                if (g_display_ptr) SDL_StopTextInput(g_display_ptr->get_window());
+                std::cout << "[Keyboard] Typing mode OFF" << std::endl;
+            }
+            break;
+        }
+        case GUI_RELOAD_POSTFX:
+            std::cout << "[PostFX] Reloading custom postfx config..." << std::endl;
+            if (postfx_load_custom_json(g_postfx)) {
+                std::cout << "[PostFX] Successfully loaded custom config!" << std::endl;
+            } else {
+                std::cout << "[PostFX] Failed to load custom config, generating default template." << std::endl;
+                postfx_save_default_json();
+                postfx_load_custom_json(g_postfx);
+            }
             break;
         case GUI_KEYBINDS:
-            g_swordfare_gui.open_help();
+            tool_windows::toggle(tool_windows::HOTKEYS);
             break;
         case GUI_ABOUT:
-            g_swordfare_gui.open_about();
+            tool_windows::toggle(tool_windows::ABOUT);
             break;
         default: break;
     }
+}
+
+static void run_posted_gui_actions(bool& running) {
+    while (!g_posted_gui_actions.empty()) {
+        const GuiAction a = g_posted_gui_actions.front();
+        g_posted_gui_actions.pop_front();
+        process_gui_action(a, running);
+    }
+}
+
+// Keyboard shortcuts: one table (hotkeys.cpp), one dispatcher. While typing mode
+// sends the keyboard to the game, only F1-F12 and the typing-mode key stay shortcuts.
+static bool run_hotkey(const SDL_KeyboardEvent& key, bool& running) {
+    if (key.repeat) return false;
+    if (key.mod & SDL_KMOD_ALT) return false;  // Alt+F4, Alt+Enter and menu accelerators are not hotkeys
+    const bool fkey = key.scancode >= SDL_SCANCODE_F1 && key.scancode <= SDL_SCANCODE_F12;
+    if (g_typing_mode && !fkey && key.key != SDLK_BACKSLASH) return false;
+    const GuiAction a = hotkey_lookup(key.key, (key.mod & SDL_KMOD_CTRL) != 0, (key.mod & SDL_KMOD_SHIFT) != 0, g_cam_active);
+    if (a == GUI_NONE) return false;
+    process_gui_action(a, running);
+    return true;
 }
 
 void load_and_boot() {
@@ -2142,6 +2316,7 @@ void load_and_boot() {
         bool gui_visible = false;  // GUI hidden by default
         extern Display* g_display_ptr;
         if (g_display_ptr) win32_menu::install(g_display_ptr->get_window());
+        if (g_display_ptr) tool_windows::set_owner(g_display_ptr->get_window());
         bool hint_shown = false;  // One-time "Press F1" hint
         Uint64 hint_start_time = SDL_GetTicks();  // Show hint for first 5 seconds
         float fps = 0.0f;
@@ -2470,7 +2645,7 @@ void load_and_boot() {
 
                 snprintf(dbg, sizeof(dbg), "Speed: %s  %s", mod_speed_label(), g_game_paused ? "|| PAUSED" : "");
                 g_gui.draw_string(dbg, 20, g_win_h - 185, 1.2f, 255, 180, 50, 255);
-                snprintf(dbg, sizeof(dbg), "F1:GUI F2:Ctrl F3:Dbg F4:Scale F5:Cam F6:Graphics F7:Video \\\\:Type F10:HUD");
+                snprintf(dbg, sizeof(dbg), "F1:Menu F2:Ctrl F3:Dbg F4:Cheats F5:Cam F6:Graphics F10:HUD F11:Scenes");
                 g_gui.draw_string(dbg, 20, g_win_h - 202, 1.1f, 100, 100, 120, 200);
                 if (g_typing_mode) {
                     g_gui.draw_string("TYPING MODE ACTIVE", 20, g_win_h - 218, 1.2f, 255, 100, 100, 255);
@@ -2565,7 +2740,7 @@ void load_and_boot() {
                 glVertex2f(cx - 280, cy - 15); glVertex2f(cx + 280, cy - 15);
                 glVertex2f(cx + 280, cy + 15); glVertex2f(cx - 280, cy + 15);
                 glEnd();
-                g_gui.draw_string("WASD:Move  Arrows:Camera  +/-:Speed  F5:Cam  F11:Inventory  F12:Fullscreen", cx - 340, cy - 7, 1.1f, 0, 200, 255, 255);
+                g_gui.draw_string("WASD:Move  Arrows:Camera  +/-:Speed  F5:Cam  F11:Scenes  F12:Fullscreen", cx - 340, cy - 7, 1.1f, 0, 200, 255, 255);
                 glPopMatrix();
                 glMatrixMode(GL_PROJECTION);
                 glPopMatrix();
@@ -2624,12 +2799,8 @@ void load_and_boot() {
                     g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr, overlays_ptr, globally_hidden);
                 }
                 process_gui_action(win32_menu::take_action(), running);
-                g_swordfare_gui.draw_menu_windows();
-                g_swordfare_gui.draw_lua_console();
-                g_swordfare_gui.draw_lua_script_editor();
-                g_swordfare_gui.draw_lua_script_manager();
-                g_swordfare_gui.draw_mod_overlay(g_save_dir);
-                g_swordfare_gui.draw_graphics_options_modal(g_postfx);
+                run_posted_gui_actions(running);
+                tool_windows::tick();
                 g_swordfare_gui.end_frame();
             }
 
@@ -2779,122 +2950,7 @@ void load_and_boot() {
                                 bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
                                 if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
                             }
-                            if (event.key.key == SDLK_F1 && !event.key.repeat) {
-                                // F1 shows or hides the native menu bar; the legacy overlay is Vulkan-only.
-                                if (g_graphics_api == GraphicsAPI::OPENGL) win32_menu::set_visible(!win32_menu::visible());
-                                else gui_visible = !gui_visible;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F4 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_mod_overlay();
-                                std::cout << "[ModOverlay] " << (g_swordfare_gui.is_mod_overlay_visible() ? "ON" : "OFF") << std::endl;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F2 && !event.key.repeat) {
-                                g_input_config.toggle_editor();
-                                if (!g_input_config.is_editing()) {
-                                    g_input_config.save(g_save_dir + "/controls.ini");
-                                    std::cout << "[Input] Controls config saved" << std::endl;
-                                }
-                                std::cout << "[Controls Editor] " << (g_input_config.is_editing() ? "ON" : "OFF") << std::endl;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F3 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_visible();
-                                std::cout << "[Debug] " << (g_swordfare_gui.is_visible() ? "ON" : "OFF") << std::endl;
-                                break;
-                            }
-                            if (event.key.key == SDLK_D && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
-                                trigger_toggle_collision_shapes();
-                                break;
-                            }
-                            if (event.key.key == SDLK_W && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
-                                trigger_toggle_combat_wireframe();
-                                break;
-                            }
-                            if (event.key.key == SDLK_F12 && !event.key.repeat) {
-                                toggle_fullscreen();
-                                break;
-                            }
-                            if (event.key.key == SDLK_F5 && !event.key.repeat) {
-                                cam_toggle();
-                                break;
-                            }
-                            if (event.key.key == SDLK_M && !event.key.repeat) {
-                                if (g_cam_active) {
-                                    g_cam_pov_mode = !g_cam_pov_mode;
-                                    char msg[64];
-                                    snprintf(msg, sizeof(msg), "Camera POV: %s", g_cam_pov_mode ? "ON" : "OFF");
-                                    mod_toast(msg, 1.5f);
-                                    cam_write_to_guest();
-                                }
-                                break;
-                            }
-                            if (event.key.key == SDLK_F6 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_graphics_options();
-                                break;
-                            }
-                            if (event.key.key == SDLK_R && !event.key.repeat) {
-                                std::cout << "[PostFX] Reloading custom postfx config..." << std::endl;
-                                if (postfx_load_custom_json(g_postfx)) {
-                                    std::cout << "[PostFX] Successfully loaded custom config!" << std::endl;
-                                } else {
-                                    std::cout << "[PostFX] Failed to load custom config, generating default template." << std::endl;
-                                    postfx_save_default_json();
-                                    postfx_load_custom_json(g_postfx);
-                                }
-                                break;
-                            }
-                            if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
-                                g_typing_mode = !g_typing_mode;
-                                if (g_typing_mode) {
-                                    SDL_StartTextInput(g_display_ptr->get_window());
-                                    std::cout << "[Keyboard] Typing mode ON — keyboard sends FWKeyboard events" << std::endl;
-                                } else {
-                                    SDL_StopTextInput(g_display_ptr->get_window());
-                                    std::cout << "[Keyboard] Typing mode OFF — keyboard sends touch events" << std::endl;
-                                }
-                                break;
-                            }
-                            if (event.key.key == SDLK_F7 && !event.key.repeat) {
-                                if (!g_video_background_enabled) {
-                                    if (!ffmpeg_dyn_available() && !ffmpeg_dyn_init()) {
-                                        std::cout << "[VideoBackground] Cannot enable video background: FFmpeg runtime libraries not found on this system." << std::endl;
-                                        break;
-                                    }
-                                }
-                                g_video_background_enabled = !g_video_background_enabled;
-                                std::cout << "[VideoBackground] Video playback: " << (g_video_background_enabled ? "ENABLED" : "DISABLED") << std::endl;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F10 && !event.key.repeat) {
-                                // Toggle host-side touch HUD visibility
-                                // (paints over button areas instead of calling handleMenuButtonPress
-                                //  which would open the game's settings menu)
-                                g_gl_hide_hud = !g_gl_hide_hud;
-                                std::cout << "[Keyboard] Touch HUD: " << (g_gl_hide_hud ? "HIDDEN" : "VISIBLE") << std::endl;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F8 && !event.key.repeat) {
-                                mod_toggle_pause();
-                                break;
-                            }
-                            if (event.key.key == SDLK_F9 && !event.key.repeat) {
-                                mod_step_frame();
-                                break;
-                            }
-                            if (event.key.key == SDLK_EQUALS && !event.key.repeat) {
-                                mod_speed_up();
-                                break;
-                            }
-                            if (event.key.key == SDLK_MINUS && !event.key.repeat) {
-                                mod_speed_down();
-                                break;
-                            }
-                            if (event.key.key == SDLK_0 && !event.key.repeat) {
-                                mod_speed_reset();
-                                break;
-                            }
+                            if (run_hotkey(event.key, running)) break;
                         case SDL_EVENT_KEY_UP: {
                             if (should_block_keyboard()) {
                                 bool is_toggle = (event.key.key == SDLK_F1 || event.key.key == SDLK_F2 || event.key.key == SDLK_F3 || event.key.key == SDLK_F4 || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE);
@@ -5618,7 +5674,7 @@ void load_and_boot_arm64() {
                         g_lua_console_pending_addr,
                         g_lua_console_status_addr,
                         g_lua_console_print_addr);
-                    std::cout << "[SRE] Lua console ready — backtick (`) to open ImGui terminal" << std::endl;
+                    std::cout << "[SRE] Lua console ready — backtick (`) opens the Lua Console window" << std::endl;
                     // Debug aid: auto-start the TCP Lua console when SWORDFARE_TCP_PORT is set
                     // (lets the agent probe the guest Lua state without manual `openport`).
                     if (const char* tcp_env = getenv("SWORDFARE_TCP_PORT")) {
@@ -6745,6 +6801,7 @@ void load_and_boot_arm64() {
         bool gui_visible = false;
         extern Display* g_display_ptr;
         if (g_display_ptr) win32_menu::install(g_display_ptr->get_window());
+        if (g_display_ptr) tool_windows::set_owner(g_display_ptr->get_window());
         bool hint_shown = false;
         Uint64 hint_start_time = SDL_GetTicks();
         float fps = 0.0f;
@@ -6961,7 +7018,7 @@ void load_and_boot_arm64() {
             if (g_sre_z_walk_axis_addr && g_guest_memory) {
                 extern bool g_sre_overlay_blocking;
                 const bool z_input_blocked = g_sre_overlay_blocking || g_typing_mode ||
-                    g_swordfare_gui.is_lua_console_open() || g_text_input_active ||
+                    g_text_input_active ||
                     g_sre_controls_disabled;
                 const bool* held_keys = SDL_GetKeyboardState(nullptr);
                 if (z_input_blocked || !held_keys) {
@@ -6978,7 +7035,7 @@ void load_and_boot_arm64() {
             if (g_sre_x_walk_axis_addr && g_guest_memory) {
                 extern bool g_sre_overlay_blocking;
                 const bool x_input_blocked = g_sre_overlay_blocking || g_typing_mode ||
-                    g_swordfare_gui.is_lua_console_open() || g_text_input_active ||
+                    g_text_input_active ||
                     g_sre_controls_disabled;
                 const bool* held_keys = SDL_GetKeyboardState(nullptr);
                 bool key_x_left  = false;
@@ -6998,7 +7055,7 @@ void load_and_boot_arm64() {
             if (g_sre_zwalk_f5l_addr && g_guest_memory) {
                 extern bool g_sre_overlay_blocking;
                 const bool key_blocked = g_sre_overlay_blocking || g_typing_mode ||
-                    g_swordfare_gui.is_lua_console_open() || g_text_input_active ||
+                    g_text_input_active ||
                     g_sre_controls_disabled;
                 const bool* held_keys = SDL_GetKeyboardState(nullptr);
                 bool l_down = false;
@@ -8063,8 +8120,7 @@ void load_and_boot_arm64() {
                                 char arg1_buf[512] = {0};
                                 memcpy(arg1_buf, g_guest_memory + sre_lni_arg1_addr, 511);
                                 if (strcmp(arg1_buf, "overlay:") == 0 || strcmp(arg1_buf, "overlay") == 0) {
-                                    g_swordfare_gui.set_mod_overlay_visible(true);
-                                    std::cout << "[SRE-LNI] Mod requested opening overlay menu." << std::endl;
+                                    std::cout << "[SRE-LNI] A mod asked for the old overlay menu; it no longer exists." << std::endl;
                                 }
                             }
                             
@@ -8076,7 +8132,7 @@ void load_and_boot_arm64() {
 
                     // Sync overlay state with guest controls_hidden
                     if (sre_controls_hidden_addr && g_guest_memory) {
-                        int state = g_swordfare_gui.is_mod_overlay_visible() ? 1 : 0;
+                        int state = 0;  // no overlay hides the controls any more
                         memcpy(g_guest_memory + sre_controls_hidden_addr, &state, 4);
                     }
                 }
@@ -8282,8 +8338,8 @@ void load_and_boot_arm64() {
 
                 // ── Hotkey legend ──
                 y -= 2;
-                g_gui.draw_string("F1:GUI F2:Ctrl F3:Debug F4:Scale F5:Cam F6:Graphics", x, y, 1.0f, 80, 80, 100, 180); y -= 14;
-                g_gui.draw_string("\\\\:Type F8:Pause F10:HUD F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
+                g_gui.draw_string("F1:Menu F2:Ctrl F3:Debug F4:Cheats F5:Cam F6:Graphics", x, y, 1.0f, 80, 80, 100, 180); y -= 14;
+                g_gui.draw_string("F8:Pause F10:HUD F11:Scenes F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
 
                 if (g_typing_mode) {
                     g_gui.draw_string("TYPING MODE", 350, g_win_h - 30, 1.2f, 255, 80, 80, 255);
@@ -8402,13 +8458,8 @@ void load_and_boot_arm64() {
                     g_swordfare_gui.draw_buttons(g_guest_memory + sre_btn_array_addr, overlays_ptr, globally_hidden);
                 }
                 process_gui_action(win32_menu::take_action(), running);
-                g_swordfare_gui.draw_menu_windows();
-                g_swordfare_gui.draw_lua_console();
-                g_swordfare_gui.draw_lua_script_editor();
-                g_swordfare_gui.draw_lua_script_manager();
-                g_swordfare_gui.draw_mod_overlay(g_save_dir);
-                g_swordfare_gui.draw_graphics_options_modal(g_postfx);
-                g_swordfare_gui.draw_controls_editor(g_input_config);
+                run_posted_gui_actions(running);
+                tool_windows::tick();
                 g_swordfare_gui.end_frame();
             }
             
@@ -8583,201 +8634,11 @@ void load_and_boot_arm64() {
                                 if (!(event.key.scancode >= SDL_SCANCODE_F1 && event.key.scancode <= SDL_SCANCODE_F12)) break;
                             }
                             if (should_block_keyboard()) {
-                                // F-keys stay hotkeys while an ImGui window has focus (F6 must close Graphics Options)
+                                // F-keys stay hotkeys while an ImGui text field has focus
                                 bool is_toggle = (event.key.scancode >= SDL_SCANCODE_F1 && event.key.scancode <= SDL_SCANCODE_F12) || event.key.key == SDLK_GRAVE || event.key.key == SDLK_ESCAPE;
                                 if (!is_toggle && !(event.key.mod & SDL_KMOD_CTRL)) break;
                             }
-                            if (event.key.key == SDLK_F1 && !event.key.repeat) {
-                                // F1 shows or hides the native menu bar; the legacy overlay is Vulkan-only.
-                                if (g_graphics_api == GraphicsAPI::OPENGL) win32_menu::set_visible(!win32_menu::visible());
-                                else gui_visible = !gui_visible;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F4 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_mod_overlay();
-                                std::cout << "[ModOverlay] " << (g_swordfare_gui.is_mod_overlay_visible() ? "ON" : "OFF") << std::endl;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F2 && !event.key.repeat) {
-                                g_input_config.toggle_editor();
-                                if (!g_input_config.is_editing()) g_input_config.save(g_save_dir + "/controls_arm64.ini");
-                                break;
-                            }
-                            if (event.key.key == SDLK_F3 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_visible();
-                                break;
-                            }
-                            if (event.key.key == SDLK_D && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
-                                trigger_toggle_collision_shapes();
-                                break;
-                            }
-                            if (event.key.key == SDLK_W && !event.key.repeat && (event.key.mod & SDL_KMOD_CTRL) && (event.key.mod & SDL_KMOD_SHIFT)) {
-                                trigger_toggle_combat_wireframe();
-                                break;
-                            }
-                            if (event.key.key == SDLK_F5 && !event.key.repeat) { cam_toggle(); break; }
-                            if (event.key.key == SDLK_M && !event.key.repeat) {
-                                if (g_cam_active) {
-                                    g_cam_pov_mode = !g_cam_pov_mode;
-                                    if (!g_cam_pov_mode) {
-                                        // Leaving POV: clear free-look so the next
-                                        // entry returns to legacy ±45° facing.
-                                        g_cam_yaw = 0.0f;
-                                        g_cam_pitch = 0.0f;
-                                        g_cam_roll = 0.0f;
-                                    }
-                                    char msg[64];
-                                    snprintf(msg, sizeof(msg), "Camera POV: %s", g_cam_pov_mode ? "ON (drag to look)" : "OFF");
-                                    mod_toast(msg, 1.5f);
-                                    cam_write_to_guest();
-                                }
-                                break;
-                            }
-                            if (event.key.key == SDLK_F7 && !event.key.repeat && g_cam_active) {  // FOV only with camera override (F5); otherwise F7 keeps its own function
-                                extern void cam_set_fov(float fov_rad);
-                                float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
-                                cam_set_fov(std::max(0.35f, cur - 0.05f));
-                                break;
-                            }
-                            if (event.key.key == SDLK_F8 && !event.key.repeat && g_cam_active) {  // FOV only with camera override (F5); otherwise F8 keeps its own function
-                                extern void cam_set_fov(float fov_rad);
-                                float cur = g_cam_fov > 0.0f ? g_cam_fov : 0.78539816f;
-                                cam_set_fov(std::min(1.4f, cur + 0.05f));
-                                break;
-                            }
-                            if (event.key.key == SDLK_F6 && !event.key.repeat) {
-                                g_swordfare_gui.toggle_graphics_options();
-                                break;
-                            }
-                            if (event.key.key == SDLK_R && !event.key.repeat) {
-                                std::cout << "[PostFX] Reloading custom postfx config..." << std::endl;
-                                if (postfx_load_custom_json(g_postfx)) {
-                                    std::cout << "[PostFX] Successfully loaded custom config!" << std::endl;
-                                } else {
-                                    std::cout << "[PostFX] Failed to load custom config, generating default template." << std::endl;
-                                    postfx_save_default_json();
-                                    postfx_load_custom_json(g_postfx);
-                                }
-                                break;
-                            }
-                            if (event.key.key == SDLK_BACKSLASH && !event.key.repeat) {
-                                g_typing_mode = !g_typing_mode;
-                                if (g_typing_mode) {
-                                    SDL_StartTextInput(g_display_ptr->get_window());
-                                    std::cout << "[Keyboard] Typing mode ON" << std::endl;
-                                } else {
-                                    SDL_StopTextInput(g_display_ptr->get_window());
-                                    std::cout << "[Keyboard] Typing mode OFF" << std::endl;
-                                }
-                                break;
-                            }
-                            if (event.key.key == SDLK_F8 && !event.key.repeat) { mod_toggle_pause(); break; }
-                            if (event.key.key == SDLK_F9 && !event.key.repeat) { mod_step_frame(); break; }
-                            if (event.key.key == SDLK_F10 && !event.key.repeat) {
-                                g_gl_hide_hud = !g_gl_hide_hud;
-                                break;
-                            }
-                            if (event.key.key == SDLK_F12 && !event.key.repeat) {
-                                toggle_fullscreen();
-                                break;
-                            }
-                            // N — Time of Day cycle: Day → Afternoon → Night → Day
-                            if (event.key.key == SDLK_N && !event.key.repeat && !g_typing_mode && !g_swordfare_gui.is_lua_console_open()) {
-                                // 0=Day, 1=Afternoon, 2=Night
-                                static int time_of_day = 0;
-                                time_of_day = (time_of_day + 1) % 3;
-                                
-                                // Start from current PostFX preset
-                                postfx_apply_preset(g_postfx, g_postfx_preset);
-                                
-                                if (time_of_day == 0) {
-                                    // === DAY (default) ===
-                                    // Restore background brightness
-                                    if (bg_brightness_addr) {
-                                        *(float*)(g_guest_memory + bg_brightness_addr) = 1.0f;
-                                    }
-                                    mod_toast("Day", 1.5f);
-                                    std::cout << "[TimeOfDay] Day — default" << std::endl;
-                                    
-                                } else if (time_of_day == 1) {
-                                    // === AFTERNOON (1PM warm light) ===
-                                    // No background filter — keep BG bright and warm
-                                    if (bg_brightness_addr) {
-                                        *(float*)(g_guest_memory + bg_brightness_addr) = 1.1f;
-                                    }
-                                    g_postfx.enabled = true;
-                                    // Warm vibrant color grading
-                                    g_postfx.color_adjust = true;
-                                    g_postfx.warmth = 0.35f;        // warm golden tone
-                                    g_postfx.brightness = 0.05f;    // slightly brighter
-                                    g_postfx.contrast = 1.1f;       // punchy contrast
-                                    g_postfx.saturation = 1.2f;     // vivid colors
-                                    // Strong god rays — intense afternoon sun
-                                    g_postfx.god_rays = true;
-                                    g_postfx.god_rays_intensity = 0.8f;
-                                    g_postfx.god_rays_decay = 0.97f;
-                                    g_postfx.sun_x = 0.75f;         // sun to the right
-                                    g_postfx.sun_y = 0.7f;          // lower in sky
-                                    // Strong SSAO — harsh afternoon shadows
-                                    g_postfx.ssao = true;
-                                    g_postfx.ssao_radius = 0.03f;
-                                    g_postfx.ssao_intensity = 1.5f;
-                                    // Bloom — bright sun reflections
-                                    g_postfx.bloom = true;
-                                    g_postfx.bloom_threshold = 0.55f;
-                                    g_postfx.bloom_intensity = 0.35f;
-                                    // Shadows — strong directional
-                                    g_postfx.shadows = true;
-                                    g_postfx.shadow_intensity = 0.55f;
-                                    g_postfx.shadow_light_x = 0.5f;
-                                    g_postfx.shadow_light_y = -0.6f;
-                                    // Subtle vignette
-                                    g_postfx.vignette = true;
-                                    g_postfx.vignette_intensity = 0.15f;
-                                    mod_toast("Afternoon", 1.5f);
-                                    std::cout << "[TimeOfDay] Afternoon — warm, bright, strong shadows" << std::endl;
-                                    
-                                } else {
-                                    // === NIGHT ===
-                                    // Dim the SRE background renderer
-                                    if (bg_brightness_addr) {
-                                        *(float*)(g_guest_memory + bg_brightness_addr) = 0.3f;
-                                    }
-                                    g_postfx.enabled = true;
-                                    // Cool blue desaturated tint
-                                    g_postfx.color_adjust = true;
-                                    g_postfx.brightness = -0.12f;    // dim overall
-                                    g_postfx.contrast = 0.9f;        // softer contrast
-                                    g_postfx.saturation = 0.6f;      // desaturate
-                                    g_postfx.warmth = -0.25f;        // cool blue shift
-                                    // Heavy vignette — darkness at edges
-                                    g_postfx.vignette = true;
-                                    g_postfx.vignette_intensity = 0.55f;
-                                    // SSAO for dark corners
-                                    g_postfx.ssao = true;
-                                    g_postfx.ssao_radius = 0.03f;
-                                    g_postfx.ssao_intensity = 1.6f;
-                                    // No god rays at night — moonlight bloom instead
-                                    g_postfx.god_rays = false;
-                                    g_postfx.bloom = true;
-                                    g_postfx.bloom_threshold = 0.5f;
-                                    g_postfx.bloom_intensity = 0.4f;
-                                    // Film grain for atmosphere
-                                    g_postfx.film_grain = true;
-                                    g_postfx.grain_intensity = 0.03f;
-                                    mod_toast("Night", 1.5f);
-                                    std::cout << "[TimeOfDay] Night — dim, cool, atmospheric" << std::endl;
-                                }
-                                break;
-                            }
-                            // ---- Lua Console: backtick toggles, feed keys when open ----
-                            if (event.key.key == SDLK_GRAVE && !event.key.repeat && g_lua_console_ready) {
-                                g_swordfare_gui.toggle_lua_console();
-                                break;
-                            }
-                            if (event.key.key == SDLK_EQUALS && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT)) { mod_speed_up(); break; }
-                            if (event.key.key == SDLK_MINUS && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT)) { mod_speed_down(); break; }
-                            if (event.key.key == SDLK_0 && !event.key.repeat) { mod_speed_reset(); break; }
+                            if (run_hotkey(event.key, running)) break;
                             // fall through
                         case SDL_EVENT_KEY_UP: {
                             if (g_text_input_active) {
@@ -8897,9 +8758,7 @@ void load_and_boot_arm64() {
                         // --- Text input events ---
                         case SDL_EVENT_TEXT_INPUT: {
                             const char* text = event.text.text;
-                            if (g_swordfare_gui.is_lua_console_open()) {
-                                // ImGui handles text input now, do nothing here.
-                            } else if (g_text_input_active) {
+                            if (g_text_input_active) {
                                 g_text_input_buffer += text;
                                 call_text_change_64(g_text_input_buffer);
                                 if (g_vaddr_sre_text_input_init_val && g_guest_memory) {
@@ -9042,7 +8901,7 @@ void load_and_boot_arm64() {
                 // Keyboard→touch button dispatch (game buttons like WASD, space, etc.)
                 {
                     extern bool g_sre_overlay_blocking;
-                    bool input_blocked = g_sre_overlay_blocking || g_typing_mode || g_swordfare_gui.is_lua_console_open() || g_text_input_active;
+                    bool input_blocked = g_sre_overlay_blocking || g_typing_mode || g_text_input_active;
                     // Merge real SDL keyboard state with pod-injected keys. A
                     // hidden-window pod never feeds real keys into SDL, so the
                     // loop must consult g_pod_key_state for control buttons.
@@ -9803,6 +9662,7 @@ int main(int argc, char* argv[]) {
         } else
 #endif
         {
+            tool_windows::shutdown();
             g_swordfare_gui.shutdown();
             fbo_destroy();
         }
