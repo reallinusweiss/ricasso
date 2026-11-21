@@ -136,6 +136,10 @@ static float TOUCH_SCALE_Y = (float)GAME_H / 544.0f;   // ~1.985
 // of pod::PodMsg records read by a dedicated control thread.
 // =========================================================================
 static bool     g_pod_enabled  = false;   // --pod-preview mode active
+// Game time passed to the last ARM64 guest update, and a counter of those
+// updates. The F3 overlay uses both to derive the hero's velocity.
+static float    g_last_guest_dt      = 0.0f;
+static uint64_t g_guest_update_count = 0;
 static bool     g_pod_paused   = false;   // freeze button (skips update+draw)
 static int      g_pod_w = 1280;           // requested preview resolution
 static int      g_pod_h = 720;
@@ -1216,7 +1220,10 @@ bool menu_item_enabled(GuiAction a) {
         case GUI_TAS_STOP_MOVIE:
         case GUI_TAS_SAVE_MOVIE:
         case GUI_TAS_FAST_FORWARD:
+        case GUI_TAS_REROLL_RNG:
         case GUI_TAS_OPEN_FOLDER:
+        case GUI_TAS_NEW_RECORDING:
+        case GUI_TOGGLE_TAS_STUDIO:
             return tas::enabled();
         case GUI_TAS_RESTART:
         case GUI_GAME_SPEED_UP:
@@ -1715,6 +1722,31 @@ static bool g_restart_in_tas = false;
 
 static void tas_needed_toast() { mod_toast("Savestates need TAS mode: File > Restart in TAS Mode", 2.5f); }
 
+// TAS: a bound key went down; counts presses between two frames (tas::note_press).
+static void tas_note_key(int scancode) {
+    if (!tas::enabled() || g_input_config.is_editing()) return;
+    extern bool g_sre_overlay_blocking;
+    if (g_sre_overlay_blocking || g_typing_mode || g_text_input_active) return;
+    const bool arrow = scancode == SDL_SCANCODE_LEFT || scancode == SDL_SCANCODE_RIGHT || scancode == SDL_SCANCODE_UP || scancode == SDL_SCANCODE_DOWN;
+    for (int bi = 0; bi < g_input_config.button_count(); bi++) {
+        const TouchButton* b = g_input_config.get_button(bi);
+        if (!b || (g_cam_active && arrow)) continue;
+        if ((b->sdl_scancode > 0 && b->sdl_scancode == scancode) || (b->sdl_scancode_alt > 0 && b->sdl_scancode_alt == scancode)) tas::note_press(bi);
+    }
+    if (scancode == SDL_SCANCODE_RETURN || scancode == SDL_SCANCODE_KP_ENTER) tas::note_press(tas::kButtonEnter);
+}
+
+// TAS: a gamepad button went down; counts presses between two frames (tas::note_press).
+static void tas_note_gamepad_button(int button) {
+    if (!tas::enabled() || g_input_config.is_editing()) return;
+    extern bool g_sre_overlay_blocking;
+    if (g_sre_overlay_blocking || g_typing_mode || g_text_input_active) return;
+    for (int bi = 0; bi < g_input_config.button_count(); bi++) {
+        const TouchButton* b = g_input_config.get_button(bi);
+        if (b && b->gamepad_button == button) tas::note_press(bi);
+    }
+}
+
 // Creates the TAS folder (states and movies) and opens it in Explorer.
 static void open_tas_folder() {
     const std::string dir = tas::directory();
@@ -1824,6 +1856,14 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             if (tas::enabled()) tas::toggle_record();
             else tas_needed_toast();
             break;
+        case GUI_TAS_NEW_RECORDING:
+            if (tas::enabled()) tas::new_recording();
+            else tas_needed_toast();
+            break;
+        case GUI_TOGGLE_TAS_STUDIO:
+            if (tas::enabled()) tool_windows::toggle(tool_windows::TAS_STUDIO);
+            else tas_needed_toast();
+            break;
         case GUI_TAS_PLAY:
             if (tas::enabled()) tas::toggle_play();
             else tas_needed_toast();
@@ -1838,6 +1878,10 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             break;
         case GUI_TAS_FAST_FORWARD:
             if (tas::enabled()) tas::toggle_fast_forward();
+            else tas_needed_toast();
+            break;
+        case GUI_TAS_REROLL_RNG:
+            if (tas::enabled()) tas::reroll_rng();
             else tas_needed_toast();
             break;
         case GUI_TAS_OPEN_FOLDER:
@@ -3700,6 +3744,22 @@ static bool hero_full_mana(uint64_t mc, int32_t* out) {
     if (a < 0 || b < 0 || full <= 0 || full > 100000) return false;
     *out = full;
     return true;
+}
+
+// TAS: a movie frame asks for new random numbers. Item drops, particles and
+// most other chance in the game come from Caver::fastrandom(), a generator
+// inside the game library; its own seed function resets it.
+static void tas_seed_game_rng(uint32_t seed) {
+    static uint64_t s_fn = 0;
+    static bool s_missing = false;
+    if (!s_fn && !s_missing && g_loader_64) {
+        s_fn = g_loader_64->get_symbol_vaddr(&g_main_mod_64, "_ZN5Caver15seed_fastrandomEi");
+        if (!s_fn) {
+            s_missing = true;
+            std::cerr << "[TAS] Caver::seed_fastrandom not found: the game's random numbers cannot be changed" << std::endl;
+        }
+    }
+    if (s_fn && g_emulator_64) g_emulator_64->call(s_fn, {static_cast<uint64_t>(seed)});
 }
 
 // XP the game requires for `level`, computed by the game itself
@@ -7306,7 +7366,9 @@ void load_and_boot_arm64() {
             uint32_t dt_hex;
             memcpy(&dt_hex, &game_dt, 4);
 
-            if (!g_game_paused || g_step_one_frame) {
+            // TAS: the frame counter and the guest must advance together. A seek
+            // runs frames while the game is paused, so ask TAS, not the pause flag.
+            if (tas::enabled() ? tas::frame_runs() : (!g_game_paused || g_step_one_frame)) {
                 // Advance virtual clock for gettimeofday/clock_gettime hooks
                 advance_guest_virtual_clock(game_dt);
 
@@ -7389,6 +7451,8 @@ void load_and_boot_arm64() {
                     }
 
                     g_emulator_64->set_sreg(0, game_dt);
+                    g_last_guest_dt = game_dt;
+                    ++g_guest_update_count;
                     uint64_t update_ticks_before = 0;
                     uint64_t update_ticks_after = 0;
 
@@ -8662,6 +8726,36 @@ void load_and_boot_arm64() {
                     st.hero_y        = g_sre_hero_pos_y_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_y_addr) : 0.0f;
                     st.hero_z        = g_sre_hero_pos_z_addr ? *(float*)(g_guest_memory + g_sre_hero_pos_z_addr) : 0.0f;
                     st.cam_active    = g_cam_active;
+                    {
+                        // Hero velocity from the position change per guest update
+                        // (units per second of game time), lightly smoothed.
+                        static uint64_t s_vel_count = 0;
+                        static float s_prev_x = 0.0f, s_prev_y = 0.0f;
+                        static float s_vel_x = 0.0f, s_vel_y = 0.0f;
+                        static bool  s_vel_valid = false;
+                        if (g_guest_update_count != s_vel_count) {
+                            uint64_t steps = g_guest_update_count - s_vel_count;
+                            s_vel_count = g_guest_update_count;
+                            float dx = st.hero_x - s_prev_x;
+                            float dy = st.hero_y - s_prev_y;
+                            float span = g_last_guest_dt * (float)steps;
+                            // Faster than 5000 units/s means a teleport or scene change.
+                            if (!s_vel_valid || span <= 0.0f ||
+                                std::fabs(dx) > 5000.0f * span || std::fabs(dy) > 5000.0f * span) {
+                                // First sample, paused update or teleport/scene change.
+                                if (span > 0.0f || !s_vel_valid) { s_vel_x = 0.0f; s_vel_y = 0.0f; }
+                            } else {
+                                const float a = 0.35f;
+                                s_vel_x += a * (dx / span - s_vel_x);
+                                s_vel_y += a * (dy / span - s_vel_y);
+                            }
+                            s_prev_x = st.hero_x; s_prev_y = st.hero_y;
+                            s_vel_valid = true;
+                        }
+                        st.hero_vel_x = s_vel_x;
+                        st.hero_vel_y = s_vel_y;
+                        st.hero_vel_valid = g_sre_hero_pos_x_addr != 0;
+                    }
                     st.typing_mode   = g_typing_mode;
                     st.game_paused   = g_game_paused;
                     st.postfx_on     = g_postfx.enabled;
@@ -8716,6 +8810,22 @@ void load_and_boot_arm64() {
                 // deltas to 16.6ms, making everything move ~8x faster.
                 // Target 60fps for smooth gameplay at correct speed.
                 // In HARD MODE this is bypassed — entities run at full uncapped speed.
+                // TAS fast-forward and seeks: VSync would hold them at the
+                // display rate, so it is off while they run.
+                if (tas::enabled() && SDL_GL_GetCurrentContext()) {
+                    static bool s_ff_novsync = false;
+                    static int s_saved_interval = 1;
+                    const bool ff = tas::fast_forward();
+                    if (ff != s_ff_novsync) {
+                        if (ff) {
+                            if (!SDL_GL_GetSwapInterval(&s_saved_interval)) s_saved_interval = 1;
+                            SDL_GL_SetSwapInterval(0);
+                        } else {
+                            SDL_GL_SetSwapInterval(s_saved_interval);
+                        }
+                        s_ff_novsync = ff;
+                    }
+                }
                 {
                     bool hardmode = false;
                     if (sre_hardmode_addr) {
@@ -8880,6 +8990,7 @@ void load_and_boot_arm64() {
                             }
                             bool is_down = (event.type == SDL_EVENT_KEY_DOWN);
                             int scancode = event.key.scancode;
+                            if (is_down && !event.key.repeat) tas_note_key(scancode);
 
                             // Use the original modal confirmation handler. Enter
                             // maps to its Control action; jump/attack bindings remain valid.
@@ -8999,6 +9110,7 @@ void load_and_boot_arm64() {
                             break;
                         }
                         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                            tas_note_gamepad_button(event.gbutton.button);
                             if (g_input_config.is_editing()) g_input_config.editor_handle_gamepad_button(event.gbutton.button);
                             break;
                         case SDL_EVENT_MOUSE_WHEEL:
@@ -9209,6 +9321,7 @@ void load_and_boot_arm64() {
                         }
                         if (tas::enabled()) is_down = tas::apply_button(bi, is_down);
 
+                        auto apply_state = [&](bool is_down) {
                         // Resolve player's GameSceneController / listener safely
                         uint64_t gamesceneview = 0;
                         if (g_vaddr_sre_gamesceneview_ptr && g_guest_memory) {
@@ -9238,14 +9351,14 @@ void load_and_boot_arm64() {
                             if (is_down && !btn->is_pressed && !dispatch_gameover_key(0x1b))
                                 g_emulator_64->call(handleBackButtonPress, {env_ptr, 0});
                             btn->is_pressed = is_down;
-                            continue;
+                            return;
                         }
 
                         if (is_down && !btn->is_pressed) {
                             btn->is_pressed = true;
                             
                             if ((btn->name == "jump" || btn->name == "attack") &&
-                                dispatch_gameover_key(btn->name == "jump" ? 0x26 : 0x11)) continue;
+                                dispatch_gameover_key(btn->name == "jump" ? 0x26 : 0x11)) return;
                             if (use_native) {
                                 dispatch_gameplay_button(btn->name, true);
                             } else if (btn->is_macro && btn->macro_open_touch_id >= 0) {
@@ -9285,6 +9398,14 @@ void load_and_boot_arm64() {
                                     btn->game_x, btn->game_y, btn->game_x, btn->game_y, 0);
                             }
                         }
+                        };
+                        if (tas::enabled()) {
+                            bool seq[2 * tas::kMaxExtra + 4];
+                            const int n = tas::press_sequence(btn->is_pressed, is_down, tas::extra_presses(bi), seq, (int)(sizeof seq / sizeof seq[0]));
+                            for (int k = 0; k < n; k++) apply_state(seq[k]);
+                        } else {
+                            apply_state(is_down);
+                        }
                     }
                     
                     // Process pending macro step 2 (delayed spell slot tap)
@@ -9301,7 +9422,14 @@ void load_and_boot_arm64() {
                         const bool enter_dev = ks && (ks[SDL_SCANCODE_RETURN] || ks[SDL_SCANCODE_KP_ENTER]);
                         const bool enter_now = tas::apply_enter(enter_dev);
                         const bool enter_was = ((tas::previous_input().buttons >> tas::kButtonEnter) & 1) != 0;
-                        if (enter_now != enter_was) dispatch_enter_key(enter_now);
+                        bool enter_seq[2 * tas::kMaxExtra + 4];
+                        const int enter_n = tas::press_sequence(enter_was, enter_now, tas::extra_presses(tas::kButtonEnter), enter_seq, (int)(sizeof enter_seq / sizeof enter_seq[0]));
+                        bool enter_state = enter_was;
+                        for (int k = 0; k < enter_n; k++) {
+                            if (enter_seq[k] == enter_state) continue;
+                            dispatch_enter_key(enter_seq[k]);
+                            enter_state = enter_seq[k];
+                        }
                         tas::apply_mouse(tas_mouse_down, tas_mouse_x, tas_mouse_y);
                         const tas::Input& in = tas::input();
                         const tas::Input& pv = tas::previous_input();
@@ -9914,6 +10042,7 @@ int main(int argc, char* argv[]) {
     tas::set_guest_memory(g_guest_memory, 0x100000000ULL);
     tas::register_state("loop", tas_loop_state_save, tas_loop_state_load);
     tas::register_reset(tas_loop_reset);
+    tas::set_reseed_hook(tas_seed_game_rng);
 
     // Detect architecture from binary ELF header
     {

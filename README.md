@@ -63,10 +63,15 @@ TAS mode turns the game into a tool-assisted speedrun setup, similar to BizHawk:
 | N | Advance one frame (hold to repeat) |
 | Tab (hold) | Fast-forward |
 | Ctrl+S | Write the movie to `%APPDATA%\ricasso\tas\movie.rtas` (a text file: a start frame, then one line per frame) |
+| R | New random numbers from the next frame on (also *Emulation → Reroll Random Numbers*) |
 
 The other windows stay reachable through the menu bar (Graphics, for example, which is F6 outside TAS mode). Game speed is fixed in TAS mode.
 
+R gives the game new random numbers from the next frame on: it seeds the game's own random generator (item drops, particles and other chance) with a new 32-bit value. The value is stored in the movie at that frame, so playback reproduces it. A typical use: save a state, reroll, advance, load and reroll again until the wanted outcome happens; each reroll is kept in the movie. TAS Studio has an RNG column that shows the stored values; its right-click menu rerolls, sets or removes them. Movies written by this version use the format `RicassoTAS 3`; older movies still load.
+
 `--tas-movie=FILE` records into that file from the first frame, or plays it back when it exists (its start state `FILE.start.rsav` is restored first); `--tas-load=SLOT` restores a slot at start. The frame counter, the slot and the held inputs are shown at the top left.
+
+*Tools → TAS Studio* opens a piano roll like BizHawk's TAStudio: one row per frame, one column per control button (plus Enter and the mouse). A filled cell is held, `×N` means N presses in that frame. Click toggles a cell, drag paints, and the right-click menu sets the press count, inserts or deletes frames, or goes to a frame. Double-click a row or click its frame number to go there (it replays from the movie start when needed, then pauses). Record (F9) during playback or after the movie ends continues the recording from the current frame. *File → Movie → New Recording* starts over; the old movie stays as `movie.rtas.bak`. A movie line may have an optional fourth field `i:n,...` that lists the extra presses of buttons in that frame.
 
 Limits: savestates hold the whole game memory and the game's textures (about 60 MB per file), but not the sound mixer, so sounds are not rewound. States saved by a build from before the textures were included still load, but can show wrong textures when loaded in another area. The game's own save files are not rolled back. Typing mode input is not recorded. Savestates need Windows.
 

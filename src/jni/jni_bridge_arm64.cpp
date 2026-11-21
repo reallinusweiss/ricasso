@@ -10892,6 +10892,17 @@ static bool tas_bridge_state_load(tas::Reader& r) {
     n = r.u32();
     g_tracked_allocs.clear();
     for (uint32_t i = 0; i < n && r.ok; i++) g_tracked_allocs.insert(r.u32());
+    {
+        // Bring the Redstell GC table in line with the restored heap; otherwise
+        // every reused address is reported as a "zombie" allocation.
+        std::vector<std::pair<uint64_t, size_t>> blocks;
+        blocks.reserve(g_tracked_allocs.size());
+        for (uint32_t a : g_tracked_allocs) {
+            auto it = g_guest_allocs.find(a);
+            if (it != g_guest_allocs.end()) blocks.emplace_back(a, it->second);
+        }
+        RedstellGC::instance().reset_allocations(blocks);
+    }
     n = r.u32();
     g_deferred_free_list.clear();
     for (uint32_t i = 0; i < n && r.ok; i++) {

@@ -60,6 +60,7 @@ ToolDialog* build_scene_select();
 ToolDialog* build_lua_console();
 ToolDialog* build_lua_scripts();
 ToolDialog* build_error_log();
+ToolDialog* build_tas_studio();
 
 }  // namespace tool_windows
 

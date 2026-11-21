@@ -1233,6 +1233,15 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
     snprintf(buf, sizeof(buf), "Block: %d  %d  %d", (int)st.hero_x, (int)st.hero_y, (int)st.hero_z);
     draw_left(buf, IM_COL32(210, 210, 210, 255));
 
+    if (st.hero_vel_valid) {
+        float speed = std::sqrt(st.hero_vel_x * st.hero_vel_x + st.hero_vel_y * st.hero_vel_y);
+        snprintf(buf, sizeof(buf), "Velocity: X %+.2f  Y %+.2f  Total %.2f u/s",
+                 st.hero_vel_x, st.hero_vel_y, speed);
+    } else {
+        snprintf(buf, sizeof(buf), "Velocity: n/a");
+    }
+    draw_left(buf, IM_COL32(210, 210, 210, 255));
+
     snprintf(buf, sizeof(buf), "Camera: (%.1f, %.1f, %.1f) zoom: %.2fx  focus: %s",
              st.cam_x, st.cam_y, st.cam_z, st.cam_zoom,
              st.cam_active ? "Overridden" : "Hero Follow");

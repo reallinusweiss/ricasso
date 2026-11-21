@@ -60,6 +60,8 @@ struct SwordfareDebugStats {
     float   cam_x         = 0.0f, cam_y = 0.0f, cam_z = 0.0f;
     float   cam_zoom      = 1.0f;
     float   hero_x        = 0.0f, hero_y = 0.0f, hero_z = 0.0f;
+    float   hero_vel_x    = 0.0f, hero_vel_y = 0.0f;   // units/s of game time
+    bool    hero_vel_valid = false;
     bool    cam_active    = false;
     bool    typing_mode   = false;
     bool    game_paused   = false;

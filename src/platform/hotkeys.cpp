@@ -20,6 +20,7 @@ const std::vector<Hotkey>& hotkey_table() {
         {GUI_STEP_FRAME, SDLK_N, false, false, HK_TAS, "N", "Frame advance; hold to repeat (TAS)"},
         {GUI_TAS_FAST_FORWARD, 0, false, false, HK_TAS, "Tab", "Fast-forward while held (TAS)"},
         {GUI_TAS_SAVE_MOVIE, SDLK_S, true, false, HK_TAS, "Ctrl+S", "Write the movie file (TAS)"},
+        {GUI_TAS_REROLL_RNG, SDLK_R, false, false, HK_TAS, "R", "New random numbers from the next frame on (TAS)"},
         {GUI_TOGGLE_MENU_BAR, SDLK_F1, false, false, HK_ALWAYS, "F1", "Show or hide the menu bar"},
         {GUI_CUSTOMIZE_CONTROLS, SDLK_F2, false, false, HK_ALWAYS, "F2", "Controls window"},
         {GUI_TOGGLE_DEBUG_OVERLAY, SDLK_F3, false, false, HK_ALWAYS, "F3", "Debug overlay"},

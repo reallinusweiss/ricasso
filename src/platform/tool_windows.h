@@ -7,7 +7,7 @@ struct SDL_Window;
 // Windows style (Qt Widgets), owned by the game window. Main thread only.
 namespace tool_windows {
 
-enum Id { CONTROLS, GRAPHICS, CHEATS, SCENE_SELECT, LUA_CONSOLE, LUA_SCRIPTS, ERROR_LOG, HOTKEYS, ABOUT, COUNT };
+enum Id { CONTROLS, GRAPHICS, CHEATS, SCENE_SELECT, LUA_CONSOLE, LUA_SCRIPTS, ERROR_LOG, HOTKEYS, ABOUT, TAS_STUDIO, COUNT };
 
 void set_owner(SDL_Window* game_window);  // call once the game window exists
 void show(Id id);                         // open the window and bring it to the front

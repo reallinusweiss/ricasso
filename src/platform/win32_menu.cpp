@@ -128,6 +128,7 @@ HMENU build() {
     HMENU movie = CreatePopupMenu();
     s_movie_menu = movie;
     add(movie, GUI_TAS_RECORD, L"&Record");
+    add(movie, GUI_TAS_NEW_RECORDING, L"&New Recording");
     add(movie, GUI_TAS_PLAY, L"&Play from Start");
     add(movie, GUI_TAS_STOP_MOVIE, L"&Stop");
     separator(movie);
@@ -144,6 +145,7 @@ HMENU build() {
     add(emu, GUI_PAUSE, L"&Pause");
     add(emu, GUI_STEP_FRAME, L"&Frame Advance");
     add(emu, GUI_TAS_FAST_FORWARD, L"Fast-&Forward");
+    add(emu, GUI_TAS_REROLL_RNG, L"&Reroll Random Numbers");
     separator(emu);
     add(emu, GUI_GAME_SPEED_UP, L"Speed &Up");
     add(emu, GUI_GAME_SPEED_DOWN, L"Speed &Down");
@@ -200,6 +202,8 @@ HMENU build() {
     add(tools, GUI_TOGGLE_LUA_CONSOLE, L"&Lua Console...");
     add(tools, GUI_TOGGLE_LUA_SCRIPTS, L"Lua Scr&ipts...");
     add(tools, GUI_TOGGLE_ERROR_LOG, L"Lua &Error Log...");
+    separator(tools);
+    add(tools, GUI_TOGGLE_TAS_STUDIO, L"TAS &Studio...");
     popup(bar, tools, L"&Tools");
 
     HMENU help = CreatePopupMenu();
@@ -272,6 +276,7 @@ void refresh_checks() {
     gray_submenu(s_file_menu, s_movie_menu, tas::enabled());
     for (GuiAction a : {GUI_SAVE_STATE, GUI_LOAD_STATE, GUI_TAS_PREV_SLOT, GUI_TAS_NEXT_SLOT, GUI_TAS_RECORD, GUI_TAS_PLAY, GUI_TAS_STOP_MOVIE,
                         GUI_TAS_SAVE_MOVIE, GUI_TAS_FAST_FORWARD, GUI_TAS_OPEN_FOLDER, GUI_TAS_RESTART,
+                        GUI_TAS_NEW_RECORDING, GUI_TOGGLE_TAS_STUDIO, GUI_TAS_REROLL_RNG,
                         GUI_GAME_SPEED_UP, GUI_GAME_SPEED_DOWN, GUI_GAME_SPEED_RESET})
         EnableMenuItem(s_menu, kIdBase + a, MF_BYCOMMAND | (menu_item_enabled(a) ? MF_ENABLED : MF_GRAYED));
     for (const RenderItem& r : kRenderItems) check_id(kIdRender + r.preset, g_render_preset == r.preset);

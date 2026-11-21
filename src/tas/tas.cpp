@@ -21,6 +21,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <mutex>
 #include <sstream>
 
@@ -88,6 +89,8 @@ bool s_watch_ok = false;
 
 uint64_t s_frame = 0;
 uint64_t s_rng = 0;
+ReseedFn s_reseed_hook = nullptr;  // seeds the game's own generator
+uint64_t s_pending_rng = 0;  // reroll queued for the next frame that runs (Live/Record)
 Mode s_mode = Mode::Live;
 std::vector<Input> s_movie;
 Input s_cur, s_prev;
@@ -109,6 +112,16 @@ std::shared_ptr<Snapshot> s_movie_start;
 bool s_movie_start_pending = false;  // take the start state at the next begin_frame
 bool s_boot_movie_start = false;     // --tas-movie playback: restore the start state on the first frame
 bool s_pending_play = false;         // F10: restore the start state and play at the next begin_frame
+
+// Press edges per button since the last frame that ran (note_press), and the
+// movie edit state that the TAS Studio window follows.
+std::array<int, 64> s_edges{};
+bool s_movie_dirty = false;          // the movie differs from the file
+uint64_t s_version = 0;              // changes whenever the movie's content changes
+uint64_t s_stale_from = UINT64_MAX;  // lowest edited frame behind the current one
+uint64_t s_seek_target = UINT64_MAX;
+bool s_seek_restore = false;         // the seek goes back to the start state first
+int s_pending_record = 0;            // 1: continue the movie here, 2: new movie (at the next begin_frame)
 
 std::vector<StateHooks> s_hooks;
 std::vector<ResetFn> s_resets;
@@ -133,6 +146,13 @@ void say(const std::string& msg, float seconds = 2.0f) {
     s_last_message = msg;
     std::cout << "[TAS] " << msg << std::endl;
     mod_toast(msg, seconds);
+}
+
+// The movie changed at frame f (edits and truncations).
+void touched(uint64_t f) {
+    s_version++;
+    s_movie_dirty = true;
+    if (f < s_frame) s_stale_from = std::min(s_stale_from, f);
 }
 
 std::string tas_dir() {
@@ -168,6 +188,7 @@ uint64_t splitmix(uint64_t& state) {
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
     return z ^ (z >> 31);
 }
+
 
 // --- Guest memory tracking --------------------------------------------------
 
@@ -434,7 +455,7 @@ bool write_movie(const std::string& path) {
         say("Cannot write movie " + path);
         return false;
     }
-    f << "RicassoTAS 1\n";
+    f << "RicassoTAS 3\n";
     f << "library " << s_lib_id << "\n";
     f << "seed " << s_seed << "\n";
     f << "buttons";
@@ -449,11 +470,29 @@ bool write_movie(const std::string& path) {
     char line[64];
     for (size_t i = start; i < s_movie.size(); i++) {
         const Input& in = s_movie[i];
-        snprintf(line, sizeof line, "|%llx|%d,%d,%d|\n", (unsigned long long)in.buttons, (int)in.mouse_x,
+        snprintf(line, sizeof line, "|%llx|%d,%d,%d|", (unsigned long long)in.buttons, (int)in.mouse_x,
                  (int)in.mouse_y, (int)in.mouse_down);
-        f << line;
+        std::string text = line;
+        // Version 2: extra presses as "i:n,i:n|" after the mouse field.
+        // Version 3: random generator state as "hex|" after that field.
+        int extras = 0;
+        for (int k = 0; k < 64; k++) {
+            if (in.extra[k] == 0) continue;
+            if (extras++) text += ',';
+            text += std::to_string(k) + ':' + std::to_string(in.extra[k]);
+        }
+        if (extras || in.rng != 0) text += '|';
+        if (in.rng != 0) {
+            char rng_hex[32];
+            snprintf(rng_hex, sizeof rng_hex, "%llx", (unsigned long long)in.rng);
+            text += rng_hex;
+            text += '|';
+        }
+        f << text << "\n";
     }
-    return (bool)f;
+    const bool ok = (bool)f;
+    if (ok) s_movie_dirty = false;
+    return ok;
 }
 
 bool read_movie(const std::string& path) {
@@ -478,6 +517,25 @@ bool read_movie(const std::string& path) {
             in.mouse_x = (int16_t)mx;
             in.mouse_y = (int16_t)my;
             in.mouse_down = (uint8_t)(down != 0);
+            // Version 2: extra presses as "i:n,i:n|" after the third '|'.
+            // Version 3: random generator state as "hex|" after the fourth '|'.
+            const size_t bar2 = line.find('|', 1);
+            const size_t bar3 = bar2 == std::string::npos ? std::string::npos : line.find('|', bar2 + 1);
+            if (bar3 != std::string::npos) {
+                const char* q = line.c_str() + bar3 + 1;
+                while (*q && *q != '|') {
+                    unsigned idx = 0, n = 0;
+                    int used = 0;
+                    if (sscanf(q, "%u:%u%n", &idx, &n, &used) != 2 || used <= 0) break;
+                    if (idx < 64) in.extra[idx] = (uint8_t)std::min<unsigned>(n, kMaxExtra);
+                    q += used;
+                    if (*q != ',') break;
+                    q++;
+                }
+                const size_t bar4 = line.find('|', bar3 + 1);
+                if (bar4 != std::string::npos && bar4 + 1 < line.size())
+                    in.rng = strtoull(line.c_str() + bar4 + 1, nullptr, 16) & 0xffffffffull;
+            }
             frames.push_back(in);
             continue;
         }
@@ -493,6 +551,8 @@ bool read_movie(const std::string& path) {
     }
     s_movie.assign(start, Input());
     s_movie.insert(s_movie.end(), frames.begin(), frames.end());
+    s_version++;
+    s_movie_dirty = false;
     return true;
 }
 
@@ -506,6 +566,7 @@ const char* mode_name(Mode m) {
 
 void set_mode(Mode m) {
     if (s_mode == Mode::Record && m != Mode::Record) write_movie(movie_path());
+    else if (s_mode == Mode::Play && m != Mode::Play && s_movie_dirty) write_movie(movie_path());
     if (m == Mode::Record && s_mode != Mode::Record) {
         s_movie_start.reset();
         s_movie_start_pending = true;
@@ -553,8 +614,12 @@ void do_load(int slot) {
         say("Could not restore state " + std::to_string(slot));
         return;
     }
+    s_pending_rng = 0;
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    if (s_mode == Mode::Record && s_movie.size() > s_frame) s_movie.resize((size_t)s_frame);
+    if (s_mode == Mode::Record && s_movie.size() > s_frame) {
+        s_movie.resize((size_t)s_frame);
+        touched(s_frame);
+    }
     if (s_mode == Mode::Play && s_frame > s_movie.size()) {
         say("Movie ends before this state; switching to live input");
         s_mode = Mode::Live;
@@ -738,6 +803,25 @@ void set_library_id(const std::string& id) {
 
 // --- Frame flow ---------------------------------------------------------------
 
+int press_sequence(bool was_held, bool held, int extra, bool* out, int cap) {
+    const int n = std::clamp(extra, 0, kMaxExtra) + ((!was_held && held) ? 1 : 0);
+    int count = 0;
+    auto emit = [&](bool v) {
+        if (count < cap) out[count] = v;
+        if (count < cap) count++;
+    };
+    if (n == 0) {
+        if (was_held && !held) emit(false);
+        return count;
+    }
+    if (was_held) emit(false);
+    for (int j = 1; j <= n; j++) {
+        emit(true);
+        if (j < n || !held) emit(false);
+    }
+    return count;
+}
+
 void begin_frame() {
     if (!s_enabled) return;
     if (s_boot_movie_start) {
@@ -767,6 +851,44 @@ void begin_frame() {
             say("Could not restore the movie's start state");
         }
     }
+    if (s_seek_restore) {
+        s_seek_restore = false;
+        if (s_movie_start && restore_snapshot(*s_movie_start)) {
+            s_stale_from = UINT64_MAX;
+            s_mode = Mode::Play;
+        } else {
+            say("Could not restore the movie's start state");
+            s_seek_target = UINT64_MAX;
+        }
+    }
+    if (s_pending_record == 1) {
+        s_movie.resize((size_t)s_frame);
+        s_mode = Mode::Record;
+        touched(s_frame);
+        std::string msg = "Recording continues at frame " + std::to_string(s_frame);
+        if (s_stale_from < s_frame) msg += " (edited frames before it were not replayed)";
+        say(msg);
+    } else if (s_pending_record == 2) {
+        // The previous movie files are kept as .bak before anything overwrites them.
+        for (auto& f : s_writers) f.wait();
+        s_writers.clear();
+        const std::string files[2] = {movie_path(), movie_start_path()};
+        bool backed_up = false;
+        for (const std::string& p : files) {
+            std::error_code ec;
+            if (std::filesystem::exists(p, ec) &&
+                std::filesystem::copy_file(p, p + ".bak", std::filesystem::copy_options::overwrite_existing, ec))
+                backed_up = true;
+        }
+        s_movie.assign((size_t)s_frame, Input());
+        s_movie_start.reset();
+        s_stale_from = UINT64_MAX;
+        s_mode = Mode::Record;
+        s_movie_start_pending = true;
+        touched(s_frame);
+        say("Recording from frame " + std::to_string(s_frame) + (backed_up ? " (previous movie kept as .bak)" : ""));
+    }
+    s_pending_record = 0;
     if (s_movie_start_pending && s_mode == Mode::Record) {
         s_movie_start_pending = false;
         if (s_watch_ok) {
@@ -776,25 +898,49 @@ void begin_frame() {
                                            std::shared_ptr<const Snapshot>(s_movie_start)));
         }
     }
-    run_selftest_step();
-    s_frame_runs = !g_game_paused || g_step_one_frame;
-    if (s_mode == Mode::Play) {
-        if (s_frame < s_movie.size()) {
-            s_cur = s_movie[(size_t)s_frame];
-        } else {
-            say("Movie finished at frame " + std::to_string(s_frame));
-            s_mode = Mode::Live;
+    if (s_seek_target != UINT64_MAX) {
+        s_mode = Mode::Play;
+        if (s_frame >= s_seek_target) {
+            s_seek_target = UINT64_MAX;
+            g_game_paused = true;
+            g_step_one_frame = false;
+            say("At frame " + std::to_string(s_frame), 1.5f);
         }
     }
+    run_selftest_step();
+    if (s_mode == Mode::Play) {
+        if (s_frame >= s_movie.size()) {
+            s_mode = Mode::Live;
+            g_game_paused = true;
+            g_step_one_frame = false;
+            s_seek_target = UINT64_MAX;
+            say("Movie finished at frame " + std::to_string(s_frame) +
+                " (paused). Record (F9) continues it from here", 4.0f);
+        } else {
+            s_cur = s_movie[(size_t)s_frame];
+        }
+    }
+    s_frame_runs = s_seek_target != UINT64_MAX || !g_game_paused || g_step_one_frame;
     if (s_mode != Mode::Play) {
         s_cur.buttons = 0;
         s_cur.mouse_down = 0;
+        s_cur.extra.fill(0);
+        s_cur.rng = s_frame_runs ? s_pending_rng : 0;
         // mouse_x/y keep the last known position
+    } else {
+        s_edges.fill(0);
+    }
+    if (s_frame_runs) {
+        if (s_cur.rng != 0) {
+            s_rng = s_cur.rng;
+            if (s_reseed_hook) s_reseed_hook((uint32_t)s_cur.rng);
+        }
+        s_pending_rng = 0;
     }
 }
 
 bool frame_runs() { return s_enabled && s_frame_runs; }
-bool fast_forward() { return s_fast_forward || s_ff_latched; }
+bool fast_forward() { return s_fast_forward || s_ff_latched || s_seek_target != UINT64_MAX; }
 bool wants_exit() { return s_wants_exit; }
 
 bool apply_button(int index, bool device_down) {
@@ -802,6 +948,9 @@ bool apply_button(int index, bool device_down) {
     const uint64_t mask = 1ull << index;
     if (s_mode == Mode::Play) return (s_cur.buttons & mask) != 0;
     if (device_down) s_cur.buttons |= mask;
+    const bool was = ((s_prev.buttons >> index) & 1) != 0;
+    const int implied = (!was && device_down) ? 1 : 0;
+    s_cur.extra[index] = (uint8_t)std::clamp(s_edges[index] - implied, 0, kMaxExtra);
     return device_down;
 }
 
@@ -809,8 +958,18 @@ bool apply_enter(bool device_down) {
     const uint64_t mask = 1ull << kButtonEnter;
     if (s_mode == Mode::Play) return (s_cur.buttons & mask) != 0;
     if (device_down) s_cur.buttons |= mask;
+    const bool was = ((s_prev.buttons >> kButtonEnter) & 1) != 0;
+    const int implied = (!was && device_down) ? 1 : 0;
+    s_cur.extra[kButtonEnter] = (uint8_t)std::clamp(s_edges[kButtonEnter] - implied, 0, kMaxExtra);
     return device_down;
 }
+
+void note_press(int index) {
+    if (!s_enabled || s_mode == Mode::Play || index < 0 || index >= 64) return;
+    if (s_edges[index] < 255) s_edges[index]++;
+}
+
+int extra_presses(int index) { return (index >= 0 && index < 64) ? s_cur.extra[index] : 0; }
 
 void apply_mouse(bool device_down, float game_x, float game_y) {
     if (s_mode == Mode::Play) return;
@@ -829,9 +988,12 @@ void end_frame() {
         // started stay empty, frames after it (rerecording) are dropped.
         s_movie.resize((size_t)s_frame);
         s_movie.push_back(s_cur);
+        s_version++;
+        s_movie_dirty = true;
     }
     s_prev = s_cur;
     s_frame++;
+    s_edges.fill(0);
 }
 
 // --- Hotkeys ------------------------------------------------------------------
@@ -863,10 +1025,36 @@ void toggle_record() {
     if (s_mode == Mode::Record) {
         set_mode(Mode::Live);
         say("Recording stopped; movie written to " + movie_path());
-    } else {
-        set_mode(Mode::Record);
-        say("Recording from frame " + std::to_string(s_frame));
+        return;
     }
+    if (s_movie.empty()) {
+        read_movie(movie_path());  // silently ok if the file is missing
+        if (!s_movie_start) {
+            std::error_code ec;
+            if (std::filesystem::exists(movie_start_path(), ec)) s_movie_start = read_snapshot_file(movie_start_path());
+        }
+    }
+    if (s_movie.empty()) {
+        s_pending_record = 2;  // begin_frame reports it
+        return;
+    }
+    const bool can_continue =
+        s_frame <= s_movie.size() && (s_mode == Mode::Play || (s_movie_start && s_frame >= s_movie_start->frame));
+    if (can_continue) {
+        s_pending_record = 1;
+    } else {
+        const uint64_t first = s_movie_start ? s_movie_start->frame : 0;
+        say("Frame " + std::to_string(s_frame) + " is outside the movie (frames " + std::to_string(first) + "-" +
+                std::to_string(s_movie.size()) +
+                "). Play it (F10) and press F9 where it should go on, or use File > Movie > New Recording.",
+            5.0f);
+    }
+}
+
+void new_recording() {
+    if (!s_enabled) return;
+    if (s_mode == Mode::Record) set_mode(Mode::Live);  // writes the movie
+    s_pending_record = 2;
 }
 
 void toggle_play() {
@@ -945,6 +1133,32 @@ bool fast_forward_latched() { return s_ff_latched; }
 
 std::string directory() { return tas_dir(); }
 
+void set_reseed_hook(ReseedFn fn) { s_reseed_hook = fn; }
+
+uint64_t new_rng_value() {
+    // Seeded once from the host; the sequence is only used to pick movie values.
+    static uint64_t state = std::random_device{}() ^
+                            (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    uint64_t v = 0;
+    while (v == 0) v = splitmix(state) >> 32;  // 32 bits: the game seeds its generator from an int
+    return v;
+}
+
+void reroll_rng() {
+    if (!s_enabled) return;
+    const uint64_t v = new_rng_value();
+    if (s_mode == Mode::Play && s_frame < s_movie.size()) {
+        Input copy = s_movie[(size_t)s_frame];
+        copy.rng = v;
+        set_movie_frame(s_frame, copy);
+    } else {
+        s_pending_rng = v;
+    }
+    char hex[32];
+    snprintf(hex, sizeof hex, "%08llx", (unsigned long long)v);
+    say("RNG for frame " + std::to_string(s_frame) + " set to " + hex);
+}
+
 // Tab fast-forwards while it is held. The other TAS keys are menu items and
 // hotkeys (platform/hotkeys.cpp), not handled here.
 bool consume_key(const SDL_KeyboardEvent& key) {
@@ -971,7 +1185,88 @@ uint64_t realtime_ns() {
     return kEpochSeconds * 1000000000ull + (s_frame * 1000000000ull) / 60ull;
 }
 
-uint32_t next_rand() { return (uint32_t)(splitmix(s_rng) >> 32); }
+uint32_t next_rand() {
+    // RICASSO_TAS_TRACE_RNG=1: log the frames on which the game draws random numbers.
+    static const bool trace = getenv("RICASSO_TAS_TRACE_RNG") != nullptr;
+    if (trace) {
+        static uint64_t last_frame = UINT64_MAX, calls = 0;
+        calls++;
+        if (s_frame != last_frame) {
+            last_frame = s_frame;
+            std::cout << "[TAS/rng] frame " << s_frame << ": call " << calls << std::endl;
+        }
+    }
+    return (uint32_t)(splitmix(s_rng) >> 32);
+}
+
+// --- Movie editing --------------------------------------------------------------
+
+MovieInfo movie_info() {
+    MovieInfo info;
+    info.first = s_movie_start ? s_movie_start->frame : 0;
+    info.length = s_movie.size();
+    info.current = s_frame;
+    info.stale_from = s_stale_from;
+    info.seek_target = s_seek_target;
+    info.version = s_version;
+    info.mode = s_mode;
+    info.has_start = s_movie_start != nullptr;
+    return info;
+}
+
+Input movie_frame(uint64_t frame) { return frame < s_movie.size() ? s_movie[(size_t)frame] : Input(); }
+
+bool editable(uint64_t frame) {
+    const uint64_t first = s_movie_start ? s_movie_start->frame : 0;
+    return s_enabled && (!s_movie.empty() || s_movie_start != nullptr) && frame >= first &&
+           !(s_mode == Mode::Record && frame >= s_frame);
+}
+
+bool set_movie_frame(uint64_t frame, const Input& in) {
+    if (!editable(frame)) return false;
+    Input v = in;
+    for (auto& e : v.extra) e = (uint8_t)std::min<int>(e, kMaxExtra);
+    v.rng &= 0xffffffffull;
+    const bool grow = frame >= s_movie.size();
+    if (grow) s_movie.resize((size_t)frame + 1);
+    if (!grow && s_movie[(size_t)frame] == v) return true;
+    s_movie[(size_t)frame] = v;
+    touched(frame);
+    return true;
+}
+
+bool insert_movie_frames(uint64_t frame, uint64_t count) {
+    if (s_mode == Mode::Record || !editable(frame) || frame > s_movie.size() || count == 0) return false;
+    s_movie.insert(s_movie.begin() + (std::ptrdiff_t)frame, (size_t)count, Input());
+    touched(frame);
+    return true;
+}
+
+bool delete_movie_frames(uint64_t frame, uint64_t count) {
+    if (s_mode == Mode::Record || !editable(frame) || frame >= s_movie.size()) return false;
+    const uint64_t n = std::min<uint64_t>(count, s_movie.size() - frame);
+    s_movie.erase(s_movie.begin() + (std::ptrdiff_t)frame, s_movie.begin() + (std::ptrdiff_t)(frame + n));
+    touched(frame);
+    return true;
+}
+
+void seek(uint64_t target) {
+    if (!s_enabled) return;
+    if (s_movie.empty()) {
+        say("No movie to seek in");
+        return;
+    }
+    target = std::min<uint64_t>(target, s_movie.size());
+    const bool need_restore = !(s_mode == Mode::Play && target >= s_frame && s_stale_from >= s_frame);
+    if (need_restore && !s_movie_start) {
+        say("The movie has no start state; cannot go back");
+        return;
+    }
+    if (!need_restore && target == s_frame) return;
+    if (s_mode == Mode::Record) set_mode(Mode::Live);  // writes the movie
+    s_seek_target = target;
+    s_seek_restore = need_restore;
+}
 
 // --- Overlay ------------------------------------------------------------------
 
@@ -981,19 +1276,26 @@ void render_overlay(GuiRenderer& gui, int win_w, int win_h) {
     char line[256];
     float y = (float)win_h - 18.0f;
     const float x = 8.0f;
-    snprintf(line, sizeof line, "TAS  frame %llu  %s  slot %d%s%s%s", (unsigned long long)s_frame, mode_name(s_mode),
+    char seek[64] = "";
+    if (s_seek_target != UINT64_MAX)
+        snprintf(seek, sizeof seek, "  SEEK %llu", (unsigned long long)s_seek_target);
+    snprintf(line, sizeof line, "TAS  frame %llu  %s  slot %d%s%s%s%s", (unsigned long long)s_frame, mode_name(s_mode),
              s_slot, s_slots[s_slot] ? "" : " (empty)", g_game_paused ? "  PAUSED" : "",
-             s_fast_forward ? "  >>" : "");
+             s_fast_forward ? "  >>" : "", seek);
     gui.draw_string(line, x, y, 1.2f, 255, 230, 120, 255);
     y -= 16.0f;
     std::string held;
     for (int i = 0; i < g_input_config.button_count() && i < 63; i++) {
-        if (!((s_prev.buttons >> i) & 1)) continue;
+        if (!((s_prev.buttons >> i) & 1) && s_prev.extra[i] == 0) continue;
         const TouchButton* b = g_input_config.get_button(i);
         if (!held.empty()) held += ' ';
         held += b ? b->name : std::string("?");
+        if (s_prev.extra[i] > 0) held += " +" + std::to_string(s_prev.extra[i]);
     }
-    if ((s_prev.buttons >> kButtonEnter) & 1) held += held.empty() ? "enter" : " enter";
+    if ((s_prev.buttons >> kButtonEnter) & 1) {
+        held += held.empty() ? "enter" : " enter";
+        if (s_prev.extra[kButtonEnter] > 0) held += " +" + std::to_string(s_prev.extra[kButtonEnter]);
+    }
     if (s_prev.mouse_down) {
         snprintf(line, sizeof line, "%s%smouse %d,%d", held.c_str(), held.empty() ? "" : "  ", (int)s_prev.mouse_x,
                  (int)s_prev.mouse_y);
@@ -1002,6 +1304,11 @@ void render_overlay(GuiRenderer& gui, int win_w, int win_h) {
     }
     gui.draw_string(line, x, y, 1.1f, 160, 220, 255, 255);
     y -= 15.0f;
+    if (s_pending_rng != 0) {
+        snprintf(line, sizeof line, "rng %08llx queued for the next frame", (unsigned long long)s_pending_rng);
+        gui.draw_string(line, x, y, 1.0f, 150, 150, 170, 220);
+        y -= 14.0f;
+    }
     if (s_mode == Mode::Play || !s_movie.empty()) {
         if (s_movie_start)
             snprintf(line, sizeof line, "movie frames %llu-%zu", (unsigned long long)s_movie_start->frame,
@@ -1015,7 +1322,7 @@ void render_overlay(GuiRenderer& gui, int win_w, int win_h) {
 
 void shutdown() {
     if (!s_enabled) return;
-    if (s_mode == Mode::Record) write_movie(movie_path());
+    if (s_mode == Mode::Record || s_movie_dirty) write_movie(movie_path());
     for (auto& f : s_writers) f.wait();
     s_writers.clear();
 }

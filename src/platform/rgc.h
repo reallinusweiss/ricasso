@@ -101,6 +101,10 @@ public:
     void track_alloc(uint64_t addr, size_t size, uint64_t lr, const char* reason = nullptr, RgcResourceType type = RgcResourceType::MEMORY);
     void track_free(uint64_t addr, uint64_t lr = 0);
     bool is_tracked(uint64_t addr);
+    // Replaces the allocation table with the given (address, size) blocks and
+    // drops queued events. A TAS savestate load rewinds the guest heap, so the
+    // old table no longer matches it. Main thread only.
+    void reset_allocations(const std::vector<std::pair<uint64_t, size_t>>& blocks);
 
     // Resource reference tracking API
     void track_resource(uint64_t addr, RgcResourceType type, const char* name);

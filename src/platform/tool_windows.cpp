@@ -138,6 +138,7 @@ ToolDialog* build(Id id) {
     case LUA_CONSOLE: return build_lua_console();
     case LUA_SCRIPTS: return build_lua_scripts();
     case ERROR_LOG: return build_error_log();
+    case TAS_STUDIO: return build_tas_studio();
     default: return nullptr;
     }
 }

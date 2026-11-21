@@ -10,6 +10,7 @@ swordigo_library(swordfare
     ${SRC_DIR}/platform/win32_menu.cpp
     ${SRC_DIR}/platform/tool_windows.cpp
     ${SRC_DIR}/platform/tool_windows_extra.cpp
+    ${SRC_DIR}/platform/tool_windows_tas.cpp
     ${SRC_DIR}/platform/hotkeys.cpp
     ${SRC_DIR}/launcher/launcher_theme.cpp
     ${SRC_DIR}/launcher/profile_manager.cpp

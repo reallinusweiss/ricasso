@@ -8,6 +8,7 @@
  *  safe reclamation.
  * ============================================================================
  */
+#include <climits>
 #include "rgc.h"
 #include "loader/elf_loader_arm64.h"
 #include "loader/elf_loader.h"
@@ -294,6 +295,33 @@ void RedstellGC::track_free(uint64_t addr, uint64_t lr) {
     }
 }
 
+void RedstellGC::reset_allocations(const std::vector<std::pair<uint64_t, size_t>>& blocks) {
+    tl_write_queue.clear();
+    {
+        std::lock_guard<std::mutex> qlock(m_queue_swap_mutex);
+        m_write_queue.clear();
+    }
+    std::unique_lock<std::shared_mutex> lock(m_allocs_mutex);
+    m_allocs.clear();
+    const uint64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - m_boot_time).count();
+    size_t total = 0;
+    for (const auto& b : blocks) {
+        RgcAllocInfo info;
+        info.address = b.first;
+        info.size = b.second;
+        info.timestamp = now;
+        info.type = RgcResourceType::MEMORY;
+        info.subsystem = "Game Engine";
+        info.thread_id = 0;
+        info.reason = "restored by TAS state";
+        info.callsite = 0;
+        m_allocs[b.first] = info;
+        total += b.second;
+    }
+    m_current_ram = total;
+}
+
 bool RedstellGC::is_tracked(uint64_t addr) {
     if (g_sre_mod.base_addr == 0) return false;
     std::shared_lock<std::shared_mutex> lock(m_allocs_mutex);
@@ -320,7 +348,22 @@ void RedstellGC::process_event_queue() {
     for (const auto& ev : local_queue) {
         if (ev.type == RgcEvent::ALLOC) {
             if (m_allocs.count(ev.addr)) {
-                log("[Redstell GC] Warning: Zombie allocation detected at 0x%lx (Size %zu was not freed)", ev.addr, m_allocs[ev.addr].size);
+                // Rate-limited: printing every one to a console window can take
+                // seconds while this thread holds m_allocs_mutex, which stalls
+                // readers on the main thread (the F3 overlay).
+                static uint64_t s_zombies_suppressed = 0;
+                static int64_t s_last_zombie_log_us = INT64_MIN / 2;
+                const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (now_us - s_last_zombie_log_us > 5000000) {
+                    s_last_zombie_log_us = now_us;
+                    log("[Redstell GC] Warning: Zombie allocation detected at 0x%lx (Size %zu was not freed; %llu more not shown)",
+                        ev.addr, m_allocs[ev.addr].size, (unsigned long long)s_zombies_suppressed);
+                    s_zombies_suppressed = 0;
+                } else {
+                    s_zombies_suppressed++;
+                }
+                m_current_ram -= m_allocs[ev.addr].size;
             }
 
             RgcAllocInfo info;
