@@ -286,6 +286,18 @@ void refresh_checks() {
     if (s_window) SDL_GetWindowSize(s_window, &w, &h);
     for (UINT i = 0; i < sizeof(kWindowSizes) / sizeof(kWindowSizes[0]); i++)
         check_id(kIdWindowSize + i, kWindowSizes[i].w == w && kWindowSizes[i].h == h);
+    // The restart item offers the other mode; only rewrite its text when the mode changes.
+    static int s_restart_text_mode = -1;
+    const int mode = tas::enabled() ? 1 : 0;
+    if (mode != s_restart_text_mode) {
+        s_restart_text_mode = mode;
+        const std::wstring text = mode ? L"Restart in &Normal Mode" : L"Restart in &TAS Mode";
+        MENUITEMINFOW mi{};
+        mi.cbSize = sizeof(mi);
+        mi.fMask = MIIM_STRING;
+        mi.dwTypeData = const_cast<wchar_t*>(text.c_str());
+        SetMenuItemInfoW(s_menu, kIdBase + GUI_TAS_RESTART, FALSE, &mi);
+    }
 }
 
 // In-memory dialog template for "Custom..." (no .rc file needed).

@@ -11,11 +11,10 @@ static int find(InputConfig& config, const std::string& name) {
         if (config.get_button(i)->name==name) return i;
     return -1;
 }
-static void rebind(InputConfig& config, const std::string& name, int key) {
-    auto* button=config.get_button(find(config,name));
+// Same path as the Controls window: choose a binding slot, then press a key.
+static void rebind(InputConfig& config, const std::string& name, int key, int slot = 0) {
     config.set_editing(true);
-    config.set_editor_mode(EDITOR_REBIND);
-    config.editor_mouse_down(button->game_x,button->game_y);
+    config.begin_capture(find(config,name),slot);
     config.editor_handle_key(key);
 }
 int main() {
@@ -25,7 +24,7 @@ int main() {
     current.load(path.u8string()); // No existing file or parent directory.
     rebind(current,"attack",SDL_SCANCODE_DELETE);
     rebind(current,"magic",SDL_SCANCODE_END);
-    rebind(current,"jump",SDL_SCANCODE_W);
+    rebind(current,"jump",SDL_SCANCODE_W,1);
     // No F2 close, explicit save, or destructor: a new reader must already see
     // all three edits, including the formerly discarded W binding.
     InputConfig restart; restart.load(path.u8string());

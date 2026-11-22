@@ -16,7 +16,7 @@ Ricasso is a fan project. It is not made, endorsed or supported by Touch Foo, an
 
 | | |
 | --- | --- |
-| Stage | 2.0.0 |
+| Stage | 3.0.0 |
 | Game versions | Swordigo 1.4.13 (recommended) and 1.4.12, 64-bit (arm64-v8a) |
 | Windows | Built and tested on Windows 11 x64. Windows 10 should work but is untested. |
 | Testing | Automated client and package tests pass. Gameplay is tested with Swordigo 1.4.13 (keyboard and controller); 1.4.12 is not yet tested in play. |
@@ -42,7 +42,7 @@ The file can be an `.apkm`, `.apks`, `.xapk`, `.apk`, several split APKs or a fo
 | Game menu | Escape | Start |
 | Menus and dialogs | Mouse | Right stick moves the pointer, RT clicks |
 
-Every function is in the menu bar at the top of the window; F1 shows or hides it. The tool windows are ordinary Windows dialogs that stay open beside the game: F2 Controls (double-click a binding, then press a key or controller button), F4 Cheats, F6 Graphics, F11 Scene Select. F3 shows the performance overlay and F12 switches fullscreen. *Help → Hotkeys* lists all of them.
+Every function is in the menu bar at the top of the window; F1 shows or hides it. The tool windows are ordinary Windows dialogs that stay open beside the game: F2 Controls (double-click a binding, then press a key or controller button), F4 Cheats, F6 Graphics, F11 Scene Select. F3 shows the performance overlay (with the hero's position and velocity) and F12 switches fullscreen. *Help → Hotkeys* lists all of them.
 
 ### Updating and uninstalling
 
@@ -51,7 +51,7 @@ Every function is in the menu bar at the top of the window; F1 shows or hides it
 
 ### TAS mode
 
-TAS mode turns the game into a tool-assisted speedrun setup, similar to BizHawk: a fixed 60 fps timestep, a virtual clock and a seeded random generator (`--tas-seed=N`, default 0), so the same inputs always give the same result. Start it with `Ricasso.exe --tas`, or choose *File → Restart in TAS Mode*. Savestates are under *File* (*Save State*, *Load State*, *Savestate Slot*), the input recording under *File → Movie*, and Pause, Frame Advance and Fast-Forward under *Emulation*. *Help → Hotkeys* lists the keys; in TAS mode these replace the normal use of the same keys:
+TAS mode turns the game into a tool-assisted speedrun setup, similar to BizHawk: a fixed 60 fps timestep, a virtual clock and a seeded random generator (`--tas-seed=N`, default 0), so the same inputs always give the same result. Start it with *Play in TAS mode* in `Ricasso.exe` (or `Ricasso.exe --tas`), or choose *File → Restart in TAS Mode* while playing; *File → Restart in Normal Mode* switches back. Both modes use the same saves. Savestates are under *File* (*Save State*, *Load State*, *Savestate Slot*), the input recording under *File → Movie*, and Pause, Frame Advance and Fast-Forward under *Emulation*. *Help → Hotkeys* lists the keys; in TAS mode these replace the normal use of the same keys:
 
 | Key | Action |
 | --- | --- |

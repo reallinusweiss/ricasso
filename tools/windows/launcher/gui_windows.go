@@ -60,7 +60,7 @@ const (
 // Logical layout at 96 dpi.
 const (
 	clientW = 600
-	clientH = 440
+	clientH = 490
 )
 
 var dropRect = rect{24, 150, 576, 258}
@@ -94,6 +94,7 @@ type app struct {
 	exeDir  string
 	appDir  string
 	extra   []string
+	playTAS bool // mode of the last start, used by "Try again"
 	mutex   windows.Handle
 
 	controls []*control
@@ -125,13 +126,13 @@ type app struct {
 	newRelease  update.Release // newer Ricasso release on GitHub, if any
 
 	// Controls
-	title, subtitle, footer                                                     *control
-	intro, cmdChoose, cmdHelp, cmdPrev, btnSetupBack                            *control
-	busyLbl, busyBar, busyMarquee, busyDetail                                   *control
-	status, cmdPlay, controlsLbl, btnShortcut, btnSaves, btnLog, btnRe, warnLbl *control
-	btnUpdate, btnUninstall                                                     *control
-	errTitle, errHint, errLog, btnRetry, btnOpenLog, btnErrBack                 *control
-	helpText, btnHelpChoose, btnHelpBack                                        *control
+	title, subtitle, footer                                                             *control
+	intro, cmdChoose, cmdHelp, cmdPrev, btnSetupBack                                    *control
+	busyLbl, busyBar, busyMarquee, busyDetail                                           *control
+	status, cmdPlay, cmdTAS, controlsLbl, btnShortcut, btnSaves, btnLog, btnRe, warnLbl *control
+	btnUpdate, btnUninstall                                                             *control
+	errTitle, errHint, errLog, btnRetry, btnOpenLog, btnErrBack                         *control
+	helpText, btnHelpChoose, btnHelpBack                                                *control
 }
 
 var theApp *app
@@ -178,7 +179,7 @@ func (a *app) createControls() {
 	a.title = a.label("Ricasso", 24, 16, 552, 40, all, fTitle)
 	a.subtitle = a.label("", 24, 56, 552, 22, all, fNormal)
 	a.subtitle.color = grey
-	a.footer = a.label("Unofficial fan project, not made by Touch Foo. Swordigo © Touch Foo – game files are not included.", 24, 414, 552, 18, all, fSmall)
+	a.footer = a.label("Unofficial fan project, not made by Touch Foo. Swordigo © Touch Foo – game files are not included.", 24, 464, 552, 18, all, fSmall)
 	a.footer.color = rgb(120, 120, 120)
 
 	// Setup
@@ -204,20 +205,21 @@ func (a *app) createControls() {
 	// Ready
 	a.status = a.label("", 24, 88, 552, 24, pgReady, fBold)
 	a.status.color = rgb(24, 120, 48)
-	a.cmdPlay = a.cmdLink("Play", "", 24, 120, 552, 74, pgReady, a.play)
+	a.cmdPlay = a.cmdLink("Play", "", 24, 120, 552, 60, pgReady, func() { a.startGame(false) })
+	a.cmdTAS = a.cmdLink("Play in TAS mode", "Savestates, input recording and playback, frame advance and a fixed random seed.", 24, 184, 552, 60, pgReady, func() { a.startGame(true) })
 	a.controlsLbl = a.label("Keyboard: A / D or arrow keys: move  ·  Space or W: jump  ·  attack/magic: see F2\r\n"+
 		"Controller: stick or D-pad: move  ·  A: jump  ·  X: attack  ·  Y: magic  ·  B: item\r\n"+
 		"Start: menu  ·  in menus the right stick moves the pointer and RT clicks\r\n"+
-		"F1: menu  ·  F2: change keys (R = rebind, F2 = save)  ·  F3: performance overlay",
-		24, 200, 552, 76, pgReady, fNormal)
-	a.btnShortcut = a.button("Desktop shortcut", 24, 284, 132, 32, pgReady, a.createShortcuts)
-	a.btnSaves = a.button("Saves", 164, 284, 132, 32, pgReady, a.openSaves)
-	a.btnLog = a.button("Log", 304, 284, 132, 32, pgReady, a.openLog)
-	a.btnRe = a.button("Set up again…", 444, 284, 132, 32, pgReady, func() { a.showPage(pgSetup) })
-	a.btnUpdate = a.button("", 24, 324, 412, 32, pgReady, a.openRelease)
+		"F1: menu bar  ·  F2: controls  ·  F3: performance overlay  ·  all keys: Help > Hotkeys",
+		24, 252, 552, 76, pgReady, fNormal)
+	a.btnShortcut = a.button("Desktop shortcut", 24, 336, 132, 32, pgReady, a.createShortcuts)
+	a.btnSaves = a.button("Saves", 164, 336, 132, 32, pgReady, a.openSaves)
+	a.btnLog = a.button("Log", 304, 336, 132, 32, pgReady, a.openLog)
+	a.btnRe = a.button("Set up again…", 444, 336, 132, 32, pgReady, func() { a.showPage(pgSetup) })
+	a.btnUpdate = a.button("", 24, 376, 412, 32, pgReady, a.openRelease)
 	a.btnUpdate.hidden = true
-	a.btnUninstall = a.button("Uninstall…", 444, 324, 132, 32, pgReady, a.uninstall)
-	a.warnLbl = a.label("", 24, 364, 552, 46, pgReady, fNormal)
+	a.btnUninstall = a.button("Uninstall…", 444, 376, 132, 32, pgReady, a.uninstall)
+	a.warnLbl = a.label("", 24, 416, 552, 46, pgReady, fNormal)
 	a.warnLbl.color = rgb(150, 90, 0)
 
 	// Error while playing
@@ -225,7 +227,7 @@ func (a *app) createControls() {
 	a.errTitle.color = rgb(176, 32, 32)
 	a.errHint = a.label("", 24, 114, 552, 66, pgError, fNormal)
 	a.errLog = a.add("EDIT", "", esMultiline|esReadOnly|esAutoVScroll|wsVScroll|wsTabStop, wsExClientEdge, 24, 184, 552, 162, pgError, fMono)
-	a.btnRetry = a.button("Try again", 24, 358, 170, 34, pgError, a.play)
+	a.btnRetry = a.button("Try again", 24, 358, 170, 34, pgError, func() { a.startGame(a.playTAS) })
 	a.btnOpenLog = a.button("Open log", 204, 358, 170, 34, pgError, a.openLog)
 	a.btnErrBack = a.button("Back", 436, 358, 140, 34, pgError, func() { a.refresh() })
 
@@ -461,10 +463,11 @@ func (a *app) onImportDone() {
 
 // ---------------------------------------------------------------- Play
 
-func (a *app) play() {
+func (a *app) startGame(tas bool) {
 	if a.busy {
 		return
 	}
+	a.playTAS = tas
 	if missing := importer.MissingClientFiles(a.appDir); len(missing) > 0 {
 		messageBox(a.hwnd, "Program files missing",
 			"These program files are missing:\n\n"+strings.Join(missing, "\n")+
@@ -479,7 +482,11 @@ func (a *app) play() {
 		a.showPage(pgSetup)
 		return
 	}
-	a.setBusy("Starting Swordigo…", "Checking the game files…")
+	busyText := "Starting Swordigo…"
+	if tas {
+		busyText = "Starting Swordigo in TAS mode…"
+	}
+	a.setBusy(busyText, "Checking the game files…")
 	st := a.installed
 	go func() {
 		defer func() {
@@ -490,7 +497,7 @@ func (a *app) play() {
 				postMessage(a.hwnd, msgGameFailed, 0, 0)
 			}
 		}()
-		a.runGame(st)
+		a.runGame(st, tas)
 	}()
 }
 
@@ -618,9 +625,9 @@ func (a *app) primaryAction() {
 	case pgSetup:
 		a.chooseFile()
 	case pgReady:
-		a.play()
+		a.startGame(false)
 	case pgError:
-		a.play()
+		a.startGame(a.playTAS)
 	case pgHelp:
 		a.showPage(pgSetup)
 	}

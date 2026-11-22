@@ -620,7 +620,7 @@ ToolDialog* build_hotkeys() {
     table->resizeColumnToContents(0);
     root->addWidget(table);
     if (!hotkeys_tas_mode()) {
-        root->addWidget(text_label(QStringLiteral("Savestate and movie keys (F5-F10, P, N, Tab, Ctrl+S) work in TAS mode: File > Restart in TAS Mode.")));
+        root->addWidget(text_label(QStringLiteral("Savestate and movie keys (F5-F10, P, N, Tab, Ctrl+S) work in TAS mode: File > Restart in TAS Mode (and back with File > Restart in Normal Mode).")));
     }
     root->addWidget(button_box(d, QString(), nullptr));
     d->resize(440, 520);

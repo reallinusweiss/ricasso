@@ -774,7 +774,7 @@ void set_guest_memory(uint8_t* base, uint64_t size) {
     // A short buffer only limits what comes back; the call fails (with
     // ERROR_INVALID_PARAMETER) when the region has no write watch.
     s_watch_ok = GetWriteWatch(0, s_mem, (SIZE_T)s_mem_size, &probe, &count, &granularity) == 0;
-    if (!s_watch_ok) std::cerr << "[TAS] guest memory has no write watch; savestates are off" << std::endl;
+    if (!s_watch_ok && s_enabled) std::cerr << "[TAS] guest memory has no write watch; savestates are off" << std::endl;
 #else
     s_watch_ok = false;
     std::cerr << "[TAS] savestates need Windows (MEM_WRITE_WATCH)" << std::endl;

@@ -1225,7 +1225,6 @@ bool menu_item_enabled(GuiAction a) {
         case GUI_TAS_NEW_RECORDING:
         case GUI_TOGGLE_TAS_STUDIO:
             return tas::enabled();
-        case GUI_TAS_RESTART:
         case GUI_GAME_SPEED_UP:
         case GUI_GAME_SPEED_DOWN:
         case GUI_GAME_SPEED_RESET:
@@ -1717,8 +1716,8 @@ void toggle_fullscreen() {
               << " (drawable: " << g_draw_w << "x" << g_draw_h << ")" << std::endl;
 }
 
-// Set by File > Restart in TAS Mode; main() starts a new process with --tas.
-static bool g_restart_in_tas = false;
+// Set by File > Restart in TAS Mode / Restart in Normal Mode; main() then starts a new process in the other mode.
+static bool g_restart_mode_switch = false;
 
 static void tas_needed_toast() { mod_toast("Savestates need TAS mode: File > Restart in TAS Mode", 2.5f); }
 
@@ -1761,10 +1760,34 @@ static void open_tas_folder() {
 #endif
 }
 
-// Starts this exe again with --tas; the current process exits right after.
-static void relaunch_with_tas() {
+// Quotes one argument for the Windows command line (MSVCRT / CommandLineToArgvW rules).
+static std::wstring quote_win_arg(const std::wstring& arg) {
+    if (!arg.empty() && arg.find_first_of(L" \t\"") == std::wstring::npos) return arg;
+    std::wstring out = L"\"";
+    for (size_t i = 0; i < arg.size(); i++) {
+        size_t backslashes = 0;
+        while (i < arg.size() && arg[i] == L'\\') { backslashes++; i++; }
+        if (i == arg.size()) {
+            out.append(backslashes * 2, L'\\');
+            break;
+        }
+        if (arg[i] == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out.push_back(L'"');
+        } else {
+            out.append(backslashes, L'\\');
+            out.push_back(arg[i]);
+        }
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+// Starts this exe again in the other TAS mode (--tas is added or removed); the current process exits right after.
+static void relaunch_switching_mode() {
 #ifdef _WIN32
-    std::cout << "[TAS] Restarting in TAS mode" << std::endl;
+    const bool was_tas = tas::enabled();
+    std::cout << (was_tas ? "[TAS] Restarting in normal mode" : "[TAS] Restarting in TAS mode") << std::endl;
     std::cout.flush();
     std::cerr.flush();
     wchar_t exe[MAX_PATH];
@@ -1772,8 +1795,25 @@ static void relaunch_with_tas() {
         std::cerr << "[TAS] Restart failed: GetModuleFileNameW error " << GetLastError() << std::endl;
         return;
     }
-    std::wstring cmd = GetCommandLineW();
-    cmd += L" --tas";
+    std::wstring cmd;
+    if (!was_tas) {
+        cmd = GetCommandLineW();
+        cmd += L" --tas";
+    } else {
+        int argc = 0;
+        wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (!argv) {
+            std::cerr << "[TAS] Restart failed: CommandLineToArgvW error " << GetLastError() << std::endl;
+            return;
+        }
+        for (int i = 0; i < argc; i++) {
+            const std::wstring arg = argv[i];
+            if (i > 0 && (arg == L"--tas" || arg.rfind(L"--tas-", 0) == 0)) continue;
+            if (!cmd.empty()) cmd += L" ";
+            cmd += quote_win_arg(arg);
+        }
+        LocalFree(argv);
+    }
     std::vector<wchar_t> buf(cmd.begin(), cmd.end());
     buf.push_back(L'\0');
     STARTUPINFOW si{};
@@ -1888,10 +1928,8 @@ void process_gui_action(GuiAction gui_action, bool& running) {
             open_tas_folder();
             break;
         case GUI_TAS_RESTART:
-            if (!tas::enabled()) {
-                g_restart_in_tas = true;
-                running = false;
-            }
+            g_restart_mode_switch = true;
+            running = false;
             break;
         case GUI_TOGGLE_CAM:
             cam_toggle();
@@ -10089,7 +10127,7 @@ int main(int argc, char* argv[]) {
     }
     
     std::cout << "[Main] Swordigo — session complete." << std::endl;
-    if (g_restart_in_tas) relaunch_with_tas();
+    if (g_restart_mode_switch) relaunch_switching_mode();
 
     /*
      * The guest loader owns a large amount of state whose lifetime extends

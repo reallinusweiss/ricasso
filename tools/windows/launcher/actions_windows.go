@@ -88,7 +88,7 @@ func gameEnv(appDir string) []string {
 	return append(env, "SWORDIGO_DATA_DIR="+strings.TrimRight(appDir, `\/`)+`\`)
 }
 
-func (a *app) runGame(st importer.Installed) {
+func (a *app) runGame(st importer.Installed, tas bool) {
 	exe := filepath.Join(a.appDir, "swordfare.exe")
 	logPath := logFilePath()
 	os.MkdirAll(filepath.Dir(logPath), 0o755)
@@ -159,7 +159,18 @@ func (a *app) runGame(st importer.Installed) {
 	}
 
 	// 2. Start the game
-	args := append(importer.GameArgs(st), a.extra...)
+	args := append(append([]string{}, importer.GameArgs(st)...), a.extra...)
+	if tas {
+		hasTAS := false
+		for _, arg := range args {
+			if arg == "--tas" {
+				hasTAS = true
+			}
+		}
+		if !hasTAS {
+			args = append(args, "--tas")
+		}
+	}
 	fmt.Fprintf(out, "[Starter] Starting: swordfare.exe %s\r\n", strings.Join(args, " "))
 	game := newCmd(nil, args)
 	if err := game.Start(); err != nil {
